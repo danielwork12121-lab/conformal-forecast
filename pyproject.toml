@@ -1,0 +1,8 @@
+[project]
+name = "conformal-forecast"
+version = "0.1.0"
+description = "Time-series forecasting with calibrated, verified uncertainty intervals via split conformal prediction."
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

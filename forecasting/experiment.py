@@ -1,8 +1,8 @@
 """End-to-end experiment: load data -> window -> fit models -> evaluate.
 
 This is the one place that wires data.py + models.py + conformal.py +
-metrics.py together, so both the CLI and the test suite exercise the
-exact same code path a user would run.
+adaptive.py + metrics.py together, so both the CLI and the test suite
+exercise the exact same code path a user would run.
 """
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from forecasting.adaptive import AdaptiveConformalForecaster, evaluate_adaptive_coverage
 from forecasting.conformal import SplitConformalForecaster, evaluate_coverage
 from forecasting.data import Normalizer, chronological_split, load_dataset, make_windows
 from forecasting.metrics import mae, mape, rmse
@@ -32,13 +33,25 @@ class ModelResult:
     y_true: np.ndarray | None = None
 
 
-def run_experiment(
+@dataclass
+class AdaptiveComparison:
+    dataset: str
+    alpha: float
+    gamma: float
+    static: dict  # evaluate_coverage() output for static split conformal
+    adaptive: dict  # evaluate_adaptive_coverage() output for ACI
+    alpha_t: np.ndarray  # (n_test,) -- ACI's adapted alpha_t over the test window
+
+
+def _prepare_split(
     dataset: str,
-    alpha: float = 0.1,
-    lookback: int | None = None,
-    period: int | None = None,
-    seed: int = 0,
-) -> list[ModelResult]:
+    lookback: int | None,
+    period: int | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Normalizer, int]:
+    """Shared data-prep path for both `run_experiment` and
+    `run_adaptive_comparison`, so the two can never silently drift apart on
+    how a dataset gets split/windowed/normalized.
+    """
     series = load_dataset(dataset)
     lookback = lookback or DEFAULT_LOOKBACKS.get(dataset, 12)
     period = period or DEFAULT_PERIODS.get(dataset, 12)
@@ -67,6 +80,18 @@ def run_experiment(
             f"Not enough windows for dataset={dataset} lookback={lookback}: "
             f"train={len(X_train)} cal={len(X_cal)} test={len(X_test)}"
         )
+
+    return X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period
+
+
+def run_experiment(
+    dataset: str,
+    alpha: float = 0.1,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> list[ModelResult]:
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
 
     results = []
     model_factories = {
@@ -121,4 +146,61 @@ def format_results_table(dataset: str, alpha: float, results: list[ModelResult])
             f"| {r.name} | {r.mae:.3f} | {r.rmse:.3f} | {r.mape:.2f} | "
             f"{r.coverage['empirical_coverage'] * 100:.1f}% | {r.coverage['mean_interval_width']:.3f} |"
         )
+    return "\n".join(lines)
+
+
+def run_adaptive_comparison(
+    dataset: str,
+    alpha: float = 0.1,
+    gamma: float = 0.05,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> AdaptiveComparison:
+    """Run the LSTM (delta) model -- the one model in the benchmark that
+    static split conformal under-covers on -- through both static split
+    conformal and Adaptive Conformal Inference on the *same* fit, split, and
+    test window, so the two are a fair, apples-to-apples comparison of the
+    calibration method only, not of a different model or a different split.
+    """
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+
+    model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    static = SplitConformalForecaster(model, alpha=alpha).fit(X_train, y_train, X_cal, y_cal)
+    static_pred = static.predict(X_test)
+    static_result = evaluate_coverage(static_pred, y_test)
+
+    # A second, freshly-initialized model instance for ACI, fit identically,
+    # so ACI's result isn't contaminated by any state the static run left on
+    # a *shared* model object (there isn't any today, but keeping the two
+    # runs fully independent is the honest way to compare them).
+    adaptive_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    adaptive = AdaptiveConformalForecaster(adaptive_model, alpha=alpha, gamma=gamma).fit(X_train, y_train, X_cal, y_cal)
+    adaptive_pred = adaptive.predict_sequential(X_test, y_test.reshape(-1))
+    adaptive_result = evaluate_adaptive_coverage(adaptive_pred, y_test)
+
+    return AdaptiveComparison(
+        dataset=dataset,
+        alpha=alpha,
+        gamma=gamma,
+        static=static_result,
+        adaptive=adaptive_result,
+        alpha_t=adaptive_pred.alpha_t,
+    )
+
+
+def format_adaptive_comparison(comparison: AdaptiveComparison) -> str:
+    nominal_pct = int(round((1 - comparison.alpha) * 100))
+    s, a = comparison.static, comparison.adaptive
+    lines = [
+        f"### {comparison.dataset}: static split conformal vs. Adaptive Conformal Inference "
+        f"(LSTM (delta), nominal {nominal_pct}%, gamma={comparison.gamma})",
+        "",
+        "| Method | Empirical coverage | Coverage gap | Mean interval width |",
+        "|---|---|---|---|",
+        f"| Static split conformal | {s['empirical_coverage'] * 100:.1f}% | "
+        f"{s['coverage_gap'] * 100:+.1f}pp | {s['mean_interval_width']:.3f} |",
+        f"| Adaptive Conformal Inference | {a['empirical_coverage'] * 100:.1f}% | "
+        f"{a['coverage_gap'] * 100:+.1f}pp | {a['mean_interval_width']:.3f} |",
+    ]
     return "\n".join(lines)

@@ -10,7 +10,11 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from forecasting.adaptive import AdaptiveConformalForecaster, evaluate_adaptive_coverage
+from forecasting.adaptive import (
+    AdaptiveConformalForecaster,
+    SlidingWindowAdaptiveConformalForecaster,
+    evaluate_adaptive_coverage,
+)
 from forecasting.conformal import SplitConformalForecaster, evaluate_coverage
 from forecasting.data import Normalizer, chronological_split, load_dataset, make_windows
 from forecasting.metrics import mae, mape, rmse
@@ -202,5 +206,94 @@ def format_adaptive_comparison(comparison: AdaptiveComparison) -> str:
         f"{s['coverage_gap'] * 100:+.1f}pp | {s['mean_interval_width']:.3f} |",
         f"| Adaptive Conformal Inference | {a['empirical_coverage'] * 100:.1f}% | "
         f"{a['coverage_gap'] * 100:+.1f}pp | {a['mean_interval_width']:.3f} |",
+    ]
+    return "\n".join(lines)
+
+
+@dataclass
+class SlidingWindowComparison:
+    dataset: str
+    alpha: float
+    gamma: float
+    window: int | None  # None = unbounded growing buffer
+    static: dict  # evaluate_coverage() output for static split conformal
+    fixed_pool: dict  # evaluate_adaptive_coverage() output for fixed-pool ACI
+    sliding: dict  # evaluate_adaptive_coverage() output for the sliding/growing-pool variant
+    pool_size: np.ndarray  # (n_test,) -- sliding variant's pool size at each step
+
+
+def run_sliding_window_comparison(
+    dataset: str,
+    alpha: float = 0.1,
+    gamma: float = 0.05,
+    window: int | None = None,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> SlidingWindowComparison:
+    """Three-way, same-fit comparison: static split conformal, fixed-pool ACI,
+    and the sliding/growing-pool ACI variant -- all on the same fitted LSTM
+    and the same test window, so any difference is attributable to the
+    calibration method alone.
+
+    This is the direct follow-up to `run_adaptive_comparison`'s own airline
+    finding: fixed-pool ACI barely moved the airline number because the
+    calibration pool's own maximum residual puts a hard ceiling on how wide
+    an interval it can ever propose. Folding each step's *observed* residual
+    into the pool (this function's `sliding` result) removes that ceiling.
+    Whether that actually helps on real data -- and by how much -- is
+    measured here, not assumed; see the README for the honest numbers.
+    """
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+
+    static_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    static = SplitConformalForecaster(static_model, alpha=alpha).fit(X_train, y_train, X_cal, y_cal)
+    static_result = evaluate_coverage(static.predict(X_test), y_test)
+
+    # Three independently-initialized model instances, fit identically, so
+    # none of the three runs can be contaminated by state a *shared* model
+    # object left over from another run (there isn't any today, but keeping
+    # them fully independent is the honest way to compare calibration methods
+    # rather than accidentally comparing side effects of object reuse).
+    fixed_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    fixed = AdaptiveConformalForecaster(fixed_model, alpha=alpha, gamma=gamma).fit(X_train, y_train, X_cal, y_cal)
+    fixed_pred = fixed.predict_sequential(X_test, y_test.reshape(-1))
+    fixed_result = evaluate_adaptive_coverage(fixed_pred, y_test)
+
+    sliding_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    sliding = SlidingWindowAdaptiveConformalForecaster(sliding_model, alpha=alpha, gamma=gamma, window=window).fit(
+        X_train, y_train, X_cal, y_cal
+    )
+    sliding_pred = sliding.predict_sequential(X_test, y_test.reshape(-1))
+    sliding_result = evaluate_adaptive_coverage(sliding_pred, y_test)
+
+    return SlidingWindowComparison(
+        dataset=dataset,
+        alpha=alpha,
+        gamma=gamma,
+        window=window,
+        static=static_result,
+        fixed_pool=fixed_result,
+        sliding=sliding_result,
+        pool_size=sliding_pred.pool_size,
+    )
+
+
+def format_sliding_window_comparison(comparison: SlidingWindowComparison) -> str:
+    nominal_pct = int(round((1 - comparison.alpha) * 100))
+    window_desc = "unbounded (growing buffer)" if comparison.window is None else f"{comparison.window} (sliding)"
+    s, f, w = comparison.static, comparison.fixed_pool, comparison.sliding
+    lines = [
+        f"### {comparison.dataset}: static vs. fixed-pool ACI vs. sliding/growing-pool ACI "
+        f"(LSTM (delta), nominal {nominal_pct}%, gamma={comparison.gamma}, window={window_desc})",
+        "",
+        "| Method | Empirical coverage | Coverage gap | Mean interval width |",
+        "|---|---|---|---|",
+        f"| Static split conformal | {s['empirical_coverage'] * 100:.1f}% | "
+        f"{s['coverage_gap'] * 100:+.1f}pp | {s['mean_interval_width']:.3f} |",
+        f"| Fixed-pool ACI | {f['empirical_coverage'] * 100:.1f}% | "
+        f"{f['coverage_gap'] * 100:+.1f}pp | {f['mean_interval_width']:.3f} |",
+        f"| Sliding/growing-pool ACI | {w['empirical_coverage'] * 100:.1f}% | "
+        f"{w['coverage_gap'] * 100:+.1f}pp | {w['mean_interval_width']:.3f} |",
     ]
     return "\n".join(lines)

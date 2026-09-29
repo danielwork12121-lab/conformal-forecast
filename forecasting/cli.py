@@ -16,6 +16,13 @@ LSTM model (the one the plain benchmark shows under-covering) and save a
 plot of how ACI's alpha_t adapts over the test window:
 
     python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png
+
+Compare static split conformal, fixed-pool ACI, and the sliding/growing-pool
+ACI variant (which folds each step's own residual into the pool instead of
+staying frozen at the calibration set) and save a plot of the pool growing
+over the test window:
+
+    python -m forecasting.cli sliding-window --dataset airline --plot results/airline_sliding_window.png
 """
 from __future__ import annotations
 
@@ -24,8 +31,10 @@ import argparse
 from forecasting.experiment import (
     format_adaptive_comparison,
     format_results_table,
+    format_sliding_window_comparison,
     run_adaptive_comparison,
     run_experiment,
+    run_sliding_window_comparison,
 )
 
 
@@ -89,6 +98,34 @@ def _plot_adaptive(dataset: str, comparison, path: str) -> None:
     plt.close(fig)
 
 
+def _plot_sliding_window(dataset: str, comparison, path: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pool_size = comparison.pool_size
+    x = range(len(pool_size))
+
+    fig, ax1 = plt.subplots(figsize=(9, 4.5))
+    ax1.plot(x, pool_size, color="#2ca02c", linewidth=1.5, label="residual pool size")
+    ax1.set_xlabel("test-set time step")
+    ax1.set_ylabel("pool size (# residuals)", color="#2ca02c")
+    ax1.tick_params(axis="y", labelcolor="#2ca02c")
+    window_desc = "unbounded" if comparison.window is None else str(comparison.window)
+    s, f, w = comparison.static, comparison.fixed_pool, comparison.sliding
+    ax1.set_title(
+        f"{dataset}: sliding-pool ACI's residual pool size over the test window (window={window_desc})\n"
+        f"coverage -- static {s['empirical_coverage'] * 100:.1f}%, fixed-pool ACI {f['empirical_coverage'] * 100:.1f}%, "
+        f"sliding-pool ACI {w['empirical_coverage'] * 100:.1f}% (nominal {int(round((1 - comparison.alpha) * 100))}%)",
+        fontsize=10,
+    )
+    ax1.legend(loc="upper left")
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="conformal-forecast benchmark runner")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -113,6 +150,22 @@ def main() -> None:
     adaptive.add_argument("--plot", type=str, default=None, help="save a plot of alpha_t over the test window")
     adaptive.add_argument("--seed", type=int, default=0)
 
+    sliding = sub.add_parser(
+        "sliding-window",
+        help="compare static split conformal, fixed-pool ACI, and sliding/growing-pool ACI on the LSTM model",
+    )
+    sliding.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    sliding.add_argument("--alpha", type=float, default=0.1)
+    sliding.add_argument("--gamma", type=float, default=0.05, help="ACI step size")
+    sliding.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        help="max residual-pool size (default: unbounded growing buffer)",
+    )
+    sliding.add_argument("--plot", type=str, default=None, help="save a plot of the residual pool size over the test window")
+    sliding.add_argument("--seed", type=int, default=0)
+
     args = parser.parse_args()
 
     if args.command == "benchmark":
@@ -132,6 +185,15 @@ def main() -> None:
         print()
         if args.plot:
             _plot_adaptive(args.dataset, comparison, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "sliding-window":
+        comparison = run_sliding_window_comparison(
+            args.dataset, alpha=args.alpha, gamma=args.gamma, window=args.window, seed=args.seed
+        )
+        print(format_sliding_window_comparison(comparison))
+        print()
+        if args.plot:
+            _plot_sliding_window(args.dataset, comparison, args.plot)
             print(f"Saved plot to {args.plot}")
 
 

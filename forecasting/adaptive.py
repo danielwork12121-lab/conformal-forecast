@@ -260,6 +260,7 @@ class SlidingWindowAdaptiveConformalForecaster(AdaptiveConformalForecaster):
             alpha_t=alphas,
             alpha=self.alpha,
             gamma=self.gamma,
+            errs=errs,
             pool_size=pool_sizes,
         )
 

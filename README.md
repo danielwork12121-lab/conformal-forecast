@@ -35,12 +35,23 @@ hand-wavy confidence score.
   benchmarked honestly against static split conformal — including the real
   case where it doesn't help much (see "Adaptive Conformal Inference"
   below).
+- **A sliding/growing-pool ACI variant** (`forecasting/adaptive.py`,
+  `SlidingWindowAdaptiveConformalForecaster`) that fixes exactly the gap the
+  first ACI implementation left open: instead of only re-slicing a frozen
+  calibration pool, it folds each test step's own observed residual into the
+  pool once that step has been scored, removing the "can never propose an
+  interval wider than the calibration set's own max residual" ceiling. This
+  is what actually recovers real coverage on the airline dataset (see
+  "Sliding/growing-pool ACI" below) — the fixed-pool variant alone could not.
 - **A test suite that checks the statistical claim, not just that the code
   runs** (`tests/test_conformal.py`, `tests/test_adaptive.py`,
-  `tests/test_adaptive_experiment.py`): on synthetic data with known noise,
-  it verifies empirical coverage actually tracks the nominal target across
-  multiple seeds and confidence levels, and that ACI measurably reduces a
-  coverage gap under genuine, constructed distribution drift.
+  `tests/test_adaptive_experiment.py`, `tests/test_sliding_window.py`,
+  `tests/test_sliding_window_experiment.py`): on synthetic data with known
+  noise, it verifies empirical coverage actually tracks the nominal target
+  across multiple seeds and confidence levels, and that both ACI variants
+  measurably reduce a coverage gap under genuine, constructed distribution
+  drift — with the sliding/growing-pool variant checked against the
+  fixed-pool variant's own numbers, not just against doing nothing.
 - **Two real, public benchmark datasets** bundled in `data/` (no network
   access needed to reproduce results) plus a synthetic generator for
   controlled calibration testing.
@@ -184,6 +195,64 @@ each miss (widening the interval) and drifts back up during quieter stretches
 — visibly reactive, just capped by how wide the calibration pool ever lets
 the interval get.
 
+## Sliding/growing-pool ACI: closing the airline gap
+
+The fixed-pool variant above is capped by construction: no matter how far
+`alpha_t` drops, `_quantile_with_finite_sample_correction` can never return
+more than the calibration pool's own maximum residual, because that pool
+never changes. `SlidingWindowAdaptiveConformalForecaster` removes that
+ceiling the direct way: after each test step is scored (never before — the
+current step's own residual is folded in strictly *after* its interval is
+computed, so nothing leaks), its observed residual joins the pool for every
+later step. `window=None` keeps every residual ever seen (a growing buffer);
+`window=k` keeps only the most recent `k` (a true sliding window, which can
+also *shrink* the achievable interval back down if the process gets easier
+again later — a growing buffer can't do that once a large residual is in).
+Run head-to-head against both static split conformal and fixed-pool ACI on
+the *same* fitted LSTM and test window via `python -m forecasting.cli
+sliding-window`:
+
+| Dataset | Static coverage | Fixed-pool ACI coverage | Sliding-pool ACI coverage | Static width | Fixed-pool width | Sliding-pool width |
+|---|---|---|---|---|---|---|
+| airline | 63.3% (nominal 90%) | 60.0% | **80.0%** | 4.873 | 4.880 | 5.918 |
+| temperature | 93.0% | 90.0% | 90.0% | 1.929 | 1.774 | 1.785 |
+| synthetic | 63.7% | 81.9% | **86.9%** | 0.471 | 0.663 | 0.803 |
+
+**This is the real result the fixed-pool variant's own "What's next" note
+predicted, verified rather than assumed:** on `airline` — the dataset that
+motivated this whole feature — the coverage gap shrinks from -26.7pp
+(static) and -30.0pp (fixed-pool ACI, which if anything moved the wrong way
+on this particular seed) down to **-10.0pp**, by far the largest single
+improvement in this README. `tests/test_sliding_window_experiment.py`
+checks this exact live result: the sliding-pool gap must be strictly smaller
+than the fixed-pool gap, and smaller than 60% of the static gap, on the real
+airline data. On `synthetic`, it further closes the gap fixed-pool ACI had
+already narrowed (-26.3pp static -> -8.1pp fixed-pool -> **-3.1pp**
+sliding-pool) — checked with the same "aggregate improvement across 6 seeds"
+discipline as the fixed-pool variant's own drift test
+(`tests/test_sliding_window.py::test_sliding_pool_closes_more_of_a_real_coverage_gap_than_fixed_pool`),
+since on any *individual* seed the two variants can occasionally land close
+enough together that the difference is noise (this was checked directly,
+not assumed away — see that test's docstring). On `temperature`, where
+static coverage was already at nominal, there was no real gap left to close,
+and neither ACI variant claims one it didn't find.
+
+**The honest cost, not hidden either:** the sliding-pool variant's intervals
+are visibly *wider* than the fixed-pool variant's on every dataset above —
+recovering coverage by admitting a wider interval is a real, legitimate
+trade (the fixed-pool variant's near-nominal-looking temperature width was
+in part an artifact of not having the option to widen further), not a free
+lunch. A user who cares more about narrow intervals than nominal coverage
+should know that going in.
+
+![Sliding-pool ACI's residual pool size over the airline test window](results/airline_sliding_window.png)
+
+The plot above shows the mechanism directly: the pool grows by exactly one
+residual per test step (28 calibration residuals -> 57 by the end of a
+30-point test window), which is what lets the achievable quantile keep
+rising past the calibration-only ceiling the fixed-pool variant is stuck
+with.
+
 ## Architecture
 
 ```
@@ -192,10 +261,12 @@ forecasting/
   models.py      # Naive, SeasonalNaive, LSTM (PyTorch), DeltaWrapper
   metrics.py     # MAE / RMSE / MAPE, empirical coverage, mean interval width
   conformal.py   # SplitConformalForecaster + evaluate_coverage
-  adaptive.py    # AdaptiveConformalForecaster (ACI) + evaluate_adaptive_coverage
+  adaptive.py    # AdaptiveConformalForecaster (fixed-pool ACI) +
+                 # SlidingWindowAdaptiveConformalForecaster (sliding/growing-pool ACI) +
+                 # evaluate_adaptive_coverage
   experiment.py  # wires the above together end-to-end for a given dataset
-  cli.py         # `python -m forecasting.cli benchmark [...]` / `adaptive [...]`
-tests/           # 43 tests, including the coverage-tracking statistical checks above
+  cli.py         # `python -m forecasting.cli benchmark [...]` / `adaptive [...]` / `sliding-window [...]`
+tests/           # 54 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -204,18 +275,18 @@ results/         # generated plots (checked in so the README renders without rer
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                                    # 43 tests
+python -m pytest                                    # 54 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
-python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. ACI
+python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
+python -m forecasting.cli sliding-window --dataset airline --plot results/airline_sliding_window.png  # + sliding-pool ACI
 ```
 
 ## What's next
 
-- A sliding-window or growing-buffer ACI variant that incorporates new
-  residuals as the test window unfolds, instead of only re-slicing a frozen
-  calibration pool — directly motivated by the airline result above, where
-  the fixed-pool variant implemented here runs out of headroom.
+- Apply the sliding/growing-pool idea to a model that *retrains* as new data
+  arrives, not just one that's fit once upfront — right now the LSTM itself
+  is frozen through the whole test window; only the conformal pool adapts.
 - EnbPI (Xu & Xie, 2021), a different time-series-specific conformal variant
   based on a bootstrap ensemble rather than a single model + adapting alpha.
 - More model families (N-BEATS-style block architecture, a small
@@ -224,6 +295,11 @@ python -m forecasting.cli adaptive --dataset airline --plot results/airline_adap
   scale.
 - A minimal FastAPI serving layer exposing `/forecast` with both the point
   prediction and the calibrated interval.
+- Tune/sweep `window` on the sliding (non-`None`) variant — only the
+  unbounded growing-buffer case has been benchmarked here; a bounded window
+  might trade some of this run's coverage recovery for the ability to
+  re-tighten if a process's error shrinks back down later (see the module's
+  own docstring).
 
 ## License
 

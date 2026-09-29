@@ -24,16 +24,31 @@ how the underlying data (or a model's error pattern) shifts over time -- a
 distribution-free guarantee that split conformal's exchangeability-based
 guarantee cannot offer.
 
-This implementation is the "fixed calibration pool" variant (see e.g.
-Zaffran et al. 2022, "Adaptive Conformal Predictions for Time Series"):
-rather than maintaining a growing/sliding buffer of nonconformity scores, it
-reuses the same calibration-residual pool from `SplitConformalForecaster`
-and only lets alpha_t (and therefore which quantile of that fixed pool is
-used) move each step. This keeps the implementation a small, honest
-extension of the existing split-conformal machinery rather than a separate
-system, at the cost of not adapting to a genuinely shifting *residual scale*
-mid-test the way a sliding-window variant would -- a reasonable next step,
-not implemented here (see README).
+This module ships two variants:
+
+- `AdaptiveConformalForecaster` -- the "fixed calibration pool" variant (see
+  e.g. Zaffran et al. 2022, "Adaptive Conformal Predictions for Time
+  Series"): only alpha_t moves each step; the residual pool used to look up
+  a quantile is always the original calibration-window residuals. Simple and
+  a small extension of `SplitConformalForecaster`, at the cost of a hard
+  ceiling: it can never propose an interval wider than the *calibration
+  pool's own maximum residual*, no matter how badly the test-time error has
+  grown. That ceiling is exactly why this variant barely moves the needle on
+  the airline benchmark (see its own docstring and the README): with only 28
+  calibration windows, the finite-sample-corrected quantile at alpha=0.1 is
+  already within ~2 residuals of that ceiling, so there's almost no headroom
+  left to adapt into.
+- `SlidingWindowAdaptiveConformalForecaster` (new) -- folds each step's own
+  *observed* residual into the pool after scoring that step, so later
+  quantile lookups see residuals from the test period itself, including any
+  that are larger than anything seen during calibration. `window=None` keeps
+  every observed residual forever (a "growing buffer"); `window=k` keeps
+  only the most recent `k` (a true "sliding window", bounded memory, and
+  better suited to a genuinely non-stationary process whose error scale
+  might shrink again later, not just grow). This is a direct, honest attempt
+  to remove the fixed-pool ceiling responsible for the airline shortfall --
+  see `forecasting/experiment.py`'s `run_sliding_window_comparison` and the
+  README for whether it actually does, measured on real data, not assumed.
 
 This module ships `evaluate_adaptive_coverage`, matching the "don't trust
 the guarantee, measure it" discipline of `forecasting/conformal.py`.
@@ -60,6 +75,11 @@ class AdaptiveConformalPrediction:
     alpha: float  # nominal target, fixed
     gamma: float
     errs: np.ndarray  # (n,) -- 1.0 if that step's interval missed, else 0.0
+
+
+@dataclass
+class SlidingWindowAdaptivePrediction(AdaptiveConformalPrediction):
+    pool_size: np.ndarray = None  # (n,) -- size of the residual pool used *at* each step
 
 
 class AdaptiveConformalForecaster:
@@ -146,6 +166,101 @@ class AdaptiveConformalForecaster:
             alpha=self.alpha,
             gamma=self.gamma,
             errs=errs,
+        )
+
+
+class SlidingWindowAdaptiveConformalForecaster(AdaptiveConformalForecaster):
+    """ACI whose residual pool is updated online with each step's own
+    observed residual, instead of staying frozen at the calibration set.
+
+    `window=None` (default): a *growing buffer* -- every observed residual
+    (calibration + all test steps seen so far) stays in the pool forever, so
+    the pool can only ever grow and the achievable quantile can only ever
+    rise to match the largest residual actually observed anywhere so far.
+
+    `window=k` (positive int): a true *sliding window* of the most recent
+    `k` residuals (calibration residuals seed it, then test residuals push
+    the oldest ones out once the pool reaches size `k`). This additionally
+    lets the achievable interval *shrink back down* if the process becomes
+    easier again later, which a growing buffer cannot do (once a large
+    residual enters a growing buffer it never leaves).
+
+    Ordering per step, kept strict so no step ever sees its own answer early:
+    1. Compute q_hat / the interval from the pool *as it stood before this
+       step*.
+    2. Score the interval against the true y_test[t] (this is what alpha_t's
+       update already did in the base class).
+    3. Only now fold this step's own residual into the pool, for use by
+       step t+1 onward.
+    """
+
+    def __init__(self, model, alpha: float = 0.1, gamma: float = 0.05, window: int | None = None):
+        super().__init__(model, alpha=alpha, gamma=gamma)
+        if window is not None and window <= 0:
+            raise ValueError("window must be a positive integer, or None for an unbounded growing buffer")
+        self.window = window
+
+    def predict_sequential(self, X_test: np.ndarray, y_test: np.ndarray) -> SlidingWindowAdaptivePrediction:
+        if self._residuals is None:
+            raise RuntimeError(
+                "SlidingWindowAdaptiveConformalForecaster.predict_sequential called before fit()"
+            )
+
+        X_test = np.asarray(X_test)
+        y_test_flat = np.asarray(y_test).reshape(-1)
+        n = X_test.shape[0]
+        if n != len(y_test_flat):
+            raise ValueError("X_test and y_test must have the same length")
+        if n == 0:
+            raise ValueError("Need at least one test point to run ACI sequentially")
+
+        point = self.model.predict(X_test).reshape(-1)
+
+        # A mutable working copy -- the original calibration pool (self._residuals)
+        # is never mutated, so re-running predict_sequential (e.g. from a test)
+        # always starts from the same seed pool.
+        pool: list[float] = list(self._residuals)
+
+        alpha_t = self.alpha
+        alphas = np.empty(n)
+        q_hats = np.empty(n)
+        lower = np.empty(n)
+        upper = np.empty(n)
+        errs = np.empty(n)
+        pool_sizes = np.empty(n, dtype=int)
+
+        for t in range(n):
+            pool_sizes[t] = len(pool)
+            clipped_alpha = min(max(alpha_t, ALPHA_T_CLIP_LOW), ALPHA_T_CLIP_HIGH)
+            q_hat = SplitConformalForecaster._quantile_with_finite_sample_correction(
+                np.asarray(pool), clipped_alpha
+            )
+            lo, hi = point[t] - q_hat, point[t] + q_hat
+            err = 0.0 if (lo <= y_test_flat[t] <= hi) else 1.0
+
+            alphas[t] = clipped_alpha
+            q_hats[t] = q_hat
+            lower[t] = lo
+            upper[t] = hi
+            errs[t] = err
+
+            # Fold this step's own residual in *after* scoring it, so q_hat
+            # at step t never has access to y_test[t] itself.
+            pool.append(float(abs(y_test_flat[t] - point[t])))
+            if self.window is not None and len(pool) > self.window:
+                pool.pop(0)
+
+            alpha_t = min(max(alpha_t + self.gamma * (self.alpha - err), ALPHA_T_CLIP_LOW), ALPHA_T_CLIP_HIGH)
+
+        return SlidingWindowAdaptivePrediction(
+            point=point.reshape(-1, 1),
+            lower=lower.reshape(-1, 1),
+            upper=upper.reshape(-1, 1),
+            q_hat=q_hats,
+            alpha_t=alphas,
+            alpha=self.alpha,
+            gamma=self.gamma,
+            pool_size=pool_sizes,
         )
 
 

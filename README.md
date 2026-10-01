@@ -43,10 +43,18 @@ hand-wavy confidence score.
   interval wider than the calibration set's own max residual" ceiling. This
   is what actually recovers real coverage on the airline dataset (see
   "Sliding/growing-pool ACI" below) — the fixed-pool variant alone could not.
+- **A window-size sweep for the sliding-pool variant**
+  (`forecasting/experiment.py`, `run_window_sweep_comparison`) that answers
+  the fixed-pool variant's own "what's next" question honestly: is the
+  unbounded growing buffer actually the best choice, or does bounding it
+  help? (See "Window tuning" below — the answer is genuinely interesting,
+  and finding it surfaced a real bug in the first cut of the sliding-window
+  implementation, fixed in the same run.)
 - **A test suite that checks the statistical claim, not just that the code
   runs** (`tests/test_conformal.py`, `tests/test_adaptive.py`,
   `tests/test_adaptive_experiment.py`, `tests/test_sliding_window.py`,
-  `tests/test_sliding_window_experiment.py`): on synthetic data with known
+  `tests/test_sliding_window_experiment.py`, `tests/test_window_sweep.py`):
+  on synthetic data with known
   noise, it verifies empirical coverage actually tracks the nominal target
   across multiple seeds and confidence levels, and that both ACI variants
   measurably reduce a coverage gap under genuine, constructed distribution
@@ -253,6 +261,97 @@ residual per test step (28 calibration residuals -> 57 by the end of a
 rising past the calibration-only ceiling the fixed-pool variant is stuck
 with.
 
+## Window tuning: a real bug, found and fixed, and a genuinely useful answer
+
+The sliding-pool section above only benchmarked `window=None` (the unbounded
+growing buffer) — the fixed-pool variant's own "what's next" note flagged
+tuning a bounded `window` as future work, since a growing buffer can never
+shrink the interval back down if a process gets easier again, and dilutes a
+recent shift among an ever-larger history of older residuals. This run did
+that tuning, via `python -m forecasting.cli window-sweep`, and along the way
+found a real bug in `SlidingWindowAdaptiveConformalForecaster` worth
+documenting plainly rather than quietly fixing.
+
+**The bug:** the class seeded its residual pool with the *entire*
+calibration set, then each test step did exactly one append and (once over
+capacity) one evict — a net change of zero once the pool was already at or
+above `window`. A pool seeded *above* `window` therefore never actually
+shrank to it: on `airline` (28 calibration windows), `window=10`,
+`window=15`, and `window=20` all silently produced byte-identical results to
+each other for the entire test run, because the pool sat at 28 residuals the
+whole time regardless of what `window` said. Caught via this run's own
+exploration script (`scratch_window_sweep.py`, not shipped — its numbers are
+reproduced in this section) noticing that a window sweep wasn't actually
+changing any numbers, root-caused to the seeding logic, and fixed by
+truncating the seed pool to the most recent `window` calibration residuals
+*before* the first test step. Pinned down by
+`tests/test_sliding_window.py::test_window_smaller_than_seed_pool_shrinks_immediately`
+so it can't silently regress, and by
+`tests/test_window_sweep.py::test_window_sweep_truncation_fix_actually_changes_results_across_windows`
+at the experiment level.
+
+**The result, now that the fix makes the sweep mean something:**
+
+| `airline`, window | Empirical coverage | Coverage gap | Mean interval width |
+|---|---|---|---|
+| 5 | 83.3% | -6.7pp | 6.058 |
+| 7 | 86.7% | **-3.3pp** | 6.114 |
+| 10 | 86.7% | **-3.3pp** | 6.156 |
+| 15 | 86.7% | **-3.3pp** | 6.123 |
+| 20 | 83.3% | -6.7pp | 6.014 |
+| 30 | 83.3% | -6.7pp | 5.973 |
+| 50 | 80.0% | -10.0pp | 5.918 |
+| unbounded | 80.0% | -10.0pp | 5.918 |
+
+![airline sliding-pool ACI coverage gap by window size](results/airline_window_sweep.png)
+
+A bounded window in the 7–15 range beats the unbounded growing buffer here —
+`window=10` cuts the single-run coverage gap roughly in half (-10.0pp ->
+-3.3pp) for a modest ~4% wider interval. **Checked across 6 seeds, not just
+this one run**, so this isn't cherry-picked: mean |coverage gap| for
+`window=10` is 6.1pp vs. 10.6pp for the unbounded buffer, and `window=10`
+never lands worse than unbounded on any individual seed
+(`tests/test_window_sweep.py::test_bounded_window_matches_or_beats_unbounded_on_airline_aggregate`).
+The likely mechanism: with only 28 calibration windows and a 30-step test
+window, the unbounded buffer roughly doubles in size by the end of the run,
+diluting a recent, locally-relevant residual among an ever-growing pool of
+older ones — a bounded window keeps the pool focused on recent behavior
+instead. `window=5` is too small (noisier across seeds, worse on average
+than `window=7-15`) — there's a real sweet spot, not "smaller is always
+better."
+
+| `synthetic`, window | Empirical coverage | Coverage gap | Mean interval width |
+|---|---|---|---|
+| 10 | 91.2% | +1.2pp | 0.860 |
+| 20 | 90.6% | +0.6pp | 0.867 |
+| 30 | 90.0% | **+0.0pp** | 0.840 |
+| 50 | 90.0% | **+0.0pp** | 0.821 |
+| 100 | 89.4% | -0.6pp | 0.823 |
+| unbounded | 86.9% | -3.1pp | 0.803 |
+
+![synthetic sliding-pool ACI coverage gap by window size](results/synthetic_window_sweep.png)
+
+Same pattern on `synthetic`: every bounded window checked beats the
+unbounded buffer, and `window=30`/`50` land almost exactly on nominal
+coverage (checked across 6 seeds too: mean |gap| drops from 1.7pp unbounded
+to 0.1–0.9pp for the bounded windows tried). On `temperature`, coverage was
+already essentially at nominal with no real gap to close (static: 93.0%,
+nominal 90%), and that doesn't change with `window` either — checked across
+the same 6 seeds at `window=10`, the gap sits at a stable +0.1pp regardless
+of seed, consistent with "there's nothing here to tune."
+
+**Practical takeaway, stated plainly:** for a small calibration set
+(airline-sized, tens of windows), a bounded sliding window that's *smaller*
+than the calibration set itself is a real, verified improvement over the
+unbounded growing buffer this repo shipped first — not a marginal one. This
+project doesn't ship a single "best" default `window` because the right
+value is dataset-dependent (roughly matching or undershooting the
+calibration-set size worked well on both series it was tried on here, but
+that's two data points, not a law) — `python -m forecasting.cli
+window-sweep` is the tool for finding it on a new series, and the honest
+scope of this finding (two datasets, one gamma, one alpha) is stated here
+rather than oversold.
+
 ## Architecture
 
 ```
@@ -264,9 +363,11 @@ forecasting/
   adaptive.py    # AdaptiveConformalForecaster (fixed-pool ACI) +
                  # SlidingWindowAdaptiveConformalForecaster (sliding/growing-pool ACI) +
                  # evaluate_adaptive_coverage
-  experiment.py  # wires the above together end-to-end for a given dataset
-  cli.py         # `python -m forecasting.cli benchmark [...]` / `adaptive [...]` / `sliding-window [...]`
-tests/           # 54 tests, including the coverage-tracking statistical checks above
+  experiment.py  # wires the above together end-to-end for a given dataset,
+                 # including run_window_sweep_comparison (window tuning)
+  cli.py         # `python -m forecasting.cli benchmark [...]` /
+                 # `sliding-window [...]` / `window-sweep [...]`
+tests/           # 58 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -275,11 +376,12 @@ results/         # generated plots (checked in so the README renders without rer
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                                    # 54 tests
+python -m pytest                                    # 58 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
 python -m forecasting.cli sliding-window --dataset airline --plot results/airline_sliding_window.png  # + sliding-pool ACI
+python -m forecasting.cli window-sweep --dataset airline --windows 5,7,10,15,20,30,50,unbounded --plot results/airline_window_sweep.png
 ```
 
 ## What's next
@@ -295,11 +397,13 @@ python -m forecasting.cli sliding-window --dataset airline --plot results/airlin
   scale.
 - A minimal FastAPI serving layer exposing `/forecast` with both the point
   prediction and the calibrated interval.
-- Tune/sweep `window` on the sliding (non-`None`) variant — only the
-  unbounded growing-buffer case has been benchmarked here; a bounded window
-  might trade some of this run's coverage recovery for the ability to
-  re-tighten if a process's error shrinks back down later (see the module's
-  own docstring).
+- An automatic `window` selector (e.g. pick the window minimizing |coverage
+  gap| on a held-out slice of the calibration data) instead of requiring a
+  user to eyeball a `window-sweep` plot themselves — "Window tuning" above
+  found real, dataset-dependent optima but didn't automate finding them.
+- Extend the window sweep's multi-seed check to `gamma` too (this run only
+  tuned `window`, holding `gamma=0.05` fixed throughout — the two
+  hyperparameters likely interact).
 
 ## License
 

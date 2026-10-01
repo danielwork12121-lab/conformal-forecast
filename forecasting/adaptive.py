@@ -219,7 +219,24 @@ class SlidingWindowAdaptiveConformalForecaster(AdaptiveConformalForecaster):
         # A mutable working copy -- the original calibration pool (self._residuals)
         # is never mutated, so re-running predict_sequential (e.g. from a test)
         # always starts from the same seed pool.
-        pool: list[float] = list(self._residuals)
+        #
+        # If window is smaller than the calibration pool itself, seed with
+        # only the most recent `window` calibration residuals. Without this
+        # truncation, a bounded window would never actually bind: each test
+        # step appends exactly one residual and (once over capacity) evicts
+        # exactly one, a net change of zero, so a pool that starts *above*
+        # `window` stays at that starting size forever instead of shrinking
+        # down to it. (This was a real bug in the first cut of this class --
+        # `window=10` silently behaved identically to `window=30` on a
+        # dataset with a 28-point calibration set, because the pool never
+        # got the chance to shrink. Caught via `scratch_window_sweep.py`
+        # during this run's own exploration, fixed here, and pinned down by
+        # `tests/test_sliding_window.py::test_window_smaller_than_seed_pool_shrinks_immediately`
+        # so it can't silently regress.)
+        residuals = list(self._residuals)
+        if self.window is not None and len(residuals) > self.window:
+            residuals = residuals[-self.window :]
+        pool: list[float] = residuals
 
         alpha_t = self.alpha
         alphas = np.empty(n)

@@ -279,6 +279,103 @@ def run_sliding_window_comparison(
     )
 
 
+@dataclass
+class WindowSweepResult:
+    window: int | None  # None = unbounded growing buffer
+    sliding: dict  # evaluate_adaptive_coverage() output for this window value
+
+
+@dataclass
+class WindowSweepComparison:
+    dataset: str
+    alpha: float
+    gamma: float
+    static: dict  # evaluate_coverage() output for static split conformal (reference line)
+    fixed_pool: dict  # evaluate_adaptive_coverage() output for fixed-pool ACI (reference line)
+    results: list[WindowSweepResult]  # one per swept window value, in the order given
+
+
+def run_window_sweep_comparison(
+    dataset: str,
+    windows: list[int | None],
+    alpha: float = 0.1,
+    gamma: float = 0.05,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> WindowSweepComparison:
+    """Sweep `window` for `SlidingWindowAdaptiveConformalForecaster` on one
+    dataset, holding everything else -- the trained model, the calibration
+    residual pool, the test window -- fixed across the sweep.
+
+    `window` is a property of *how the sliding-pool ACI reads its residual
+    pool*; it has no effect on model fitting at all. So the LSTM is trained
+    exactly once here and its fitted weights + calibration residuals are
+    reused for every window value in the sweep, rather than training a fresh
+    model per window (which `run_sliding_window_comparison` does, since each
+    of its three methods there really is independent). Retraining per window
+    would waste `len(windows)` LSTM training runs for no benefit, and worse,
+    would let train-time randomness (not `window`) explain part of any
+    difference between window values -- the opposite of what a clean
+    hyperparameter sweep needs. Sharing one fitted model isolates the effect
+    of `window` alone, which is the actual question this function answers.
+
+    `static` and `fixed_pool` are included once, as reference lines, so a
+    caller (the CLI / README table) can show the sweep against the two
+    baselines from `run_sliding_window_comparison` without re-running them.
+    """
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+
+    static_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    static = SplitConformalForecaster(static_model, alpha=alpha).fit(X_train, y_train, X_cal, y_cal)
+    static_result = evaluate_coverage(static.predict(X_test), y_test)
+
+    fixed_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    fixed = AdaptiveConformalForecaster(fixed_model, alpha=alpha, gamma=gamma).fit(X_train, y_train, X_cal, y_cal)
+    fixed_pred = fixed.predict_sequential(X_test, y_test.reshape(-1))
+    fixed_result = evaluate_adaptive_coverage(fixed_pred, y_test)
+
+    sweep_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    fitted = SlidingWindowAdaptiveConformalForecaster(sweep_model, alpha=alpha, gamma=gamma, window=None).fit(
+        X_train, y_train, X_cal, y_cal
+    )
+
+    results = []
+    for window in windows:
+        forecaster = SlidingWindowAdaptiveConformalForecaster(fitted.model, alpha=alpha, gamma=gamma, window=window)
+        forecaster._residuals = fitted._residuals  # reuse the one fit; window doesn't affect fitting
+        pred = forecaster.predict_sequential(X_test, y_test.reshape(-1))
+        results.append(WindowSweepResult(window=window, sliding=evaluate_adaptive_coverage(pred, y_test)))
+
+    return WindowSweepComparison(
+        dataset=dataset, alpha=alpha, gamma=gamma, static=static_result, fixed_pool=fixed_result, results=results
+    )
+
+
+def format_window_sweep_comparison(comparison: WindowSweepComparison) -> str:
+    nominal_pct = int(round((1 - comparison.alpha) * 100))
+    s, f = comparison.static, comparison.fixed_pool
+    lines = [
+        f"### {comparison.dataset}: sliding-pool ACI window sweep "
+        f"(LSTM (delta), nominal {nominal_pct}%, gamma={comparison.gamma})",
+        "",
+        "| Window | Empirical coverage | Coverage gap | Mean interval width |",
+        "|---|---|---|---|",
+        f"| *static split conformal (reference)* | {s['empirical_coverage'] * 100:.1f}% | "
+        f"{s['coverage_gap'] * 100:+.1f}pp | {s['mean_interval_width']:.3f} |",
+        f"| *fixed-pool ACI (reference)* | {f['empirical_coverage'] * 100:.1f}% | "
+        f"{f['coverage_gap'] * 100:+.1f}pp | {f['mean_interval_width']:.3f} |",
+    ]
+    for r in comparison.results:
+        wlabel = "unbounded (growing buffer)" if r.window is None else str(r.window)
+        w = r.sliding
+        lines.append(
+            f"| {wlabel} | {w['empirical_coverage'] * 100:.1f}% | "
+            f"{w['coverage_gap'] * 100:+.1f}pp | {w['mean_interval_width']:.3f} |"
+        )
+    return "\n".join(lines)
+
+
 def format_sliding_window_comparison(comparison: SlidingWindowComparison) -> str:
     nominal_pct = int(round((1 - comparison.alpha) * 100))
     window_desc = "unbounded (growing buffer)" if comparison.window is None else f"{comparison.window} (sliding)"

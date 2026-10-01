@@ -101,6 +101,55 @@ def test_pool_size_caps_at_window_when_sliding():
     assert pred.pool_size.max() == window
 
 
+def test_window_smaller_than_seed_pool_shrinks_immediately():
+    """Regression test for a real bug found and fixed in this run (v0.4):
+    if `window` is smaller than the calibration pool it's seeded from, the
+    pool must be truncated down to `window` *before* the first test step,
+    not left to `predict_sequential`'s per-step append/evict loop to shrink
+    it over time.
+
+    Before the fix, each test step did exactly one append + (if over
+    capacity) one evict -- a net change of zero once the pool was already
+    at or above `window`. A pool seeded above `window` (e.g. 20 calibration
+    residuals with `window=8`) therefore never shrank at all: `pool_size[t]`
+    stayed at 20 for every single test step, and `window=8` silently behaved
+    identically to `window=20` (or to `window=None`) for the entire test
+    run. Caught via `scratch_window_sweep.py` during this run's own
+    exploration (window=10/15/20 all gave byte-identical results on the
+    airline dataset, which has 28 calibration windows), root-caused to this
+    seeding bug, and fixed by truncating the seed pool to the most recent
+    `window` calibration residuals in `predict_sequential` itself.
+    """
+    n_cal, n_test, window = 20, 5, 8
+    X_cal = np.zeros((n_cal, 3))
+    y_cal = np.arange(n_cal, dtype=float).reshape(-1, 1)  # distinct residuals, not all zero
+    forecaster = SlidingWindowAdaptiveConformalForecaster(ConstantModel(0.0), alpha=0.2, window=window).fit(
+        X_cal, y_cal, X_cal, y_cal
+    )
+    X_test = np.zeros((n_test, 3))
+    y_test = np.arange(n_test, dtype=float)
+
+    pred = forecaster.predict_sequential(X_test, y_test)
+
+    # The pool must be at `window`, not `n_cal`, from the very first step --
+    # and must never exceed `window` afterward either.
+    assert pred.pool_size[0] == window
+    assert list(pred.pool_size) == [window] * n_test
+    assert pred.pool_size.max() == window
+
+    # The truncation must keep the *most recent* `window` calibration
+    # residuals (matching a real sliding window's semantics), not an
+    # arbitrary subset: y_cal here is [0..19], so residuals are [0..19]
+    # too (ConstantModel always predicts 0), and the most recent 8 are
+    # [12..19] -- q_hat at step 0 (alpha=0.2, n=8) should reflect that
+    # narrower, larger-valued pool, not the full [0..19] range.
+    from forecasting.conformal import SplitConformalForecaster
+
+    expected_seed_pool = np.arange(12, 20, dtype=float)  # last 8 of [0..19]
+    expected_q_hat_0 = SplitConformalForecaster._quantile_with_finite_sample_correction(expected_seed_pool, 0.2)
+    assert pred.q_hat[0] == pytest.approx(expected_q_hat_0)
+
+
 def test_sliding_pool_hand_computation_matches_fixed_pool_until_pool_changes():
     """Hand-verify the exact quantile computation once the pool has grown,
     using the same deterministic setup as

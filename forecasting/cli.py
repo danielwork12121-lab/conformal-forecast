@@ -23,6 +23,11 @@ staying frozen at the calibration set) and save a plot of the pool growing
 over the test window:
 
     python -m forecasting.cli sliding-window --dataset airline --plot results/airline_sliding_window.png
+
+Sweep the sliding-pool ACI's `window` size and see how coverage gap responds
+(a bounded window can beat the unbounded growing buffer -- see the README):
+
+    python -m forecasting.cli window-sweep --dataset airline --windows 10,15,20,30,50,unbounded --plot results/airline_window_sweep.png
 """
 from __future__ import annotations
 
@@ -32,9 +37,11 @@ from forecasting.experiment import (
     format_adaptive_comparison,
     format_results_table,
     format_sliding_window_comparison,
+    format_window_sweep_comparison,
     run_adaptive_comparison,
     run_experiment,
     run_sliding_window_comparison,
+    run_window_sweep_comparison,
 )
 
 
@@ -126,6 +133,48 @@ def _plot_sliding_window(dataset: str, comparison, path: str) -> None:
     plt.close(fig)
 
 
+def _plot_window_sweep(dataset: str, comparison, path: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    windows = [r.window for r in comparison.results]
+    gaps = [r.sliding["coverage_gap"] * 100 for r in comparison.results]
+    # Plot against an evenly-spaced index, not the raw window values, so an
+    # "unbounded" entry (window=None) doesn't have to pretend to be a number
+    # on the x-axis -- it's drawn as its own labeled tick instead.
+    x = range(len(windows))
+    labels = ["unbounded" if w is None else str(w) for w in windows]
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(x, gaps, color="#2ca02c", linewidth=1.5, marker="o", label="sliding-pool ACI")
+    ax.axhline(
+        comparison.fixed_pool["coverage_gap"] * 100,
+        color="#1f77b4",
+        linewidth=1.2,
+        linestyle="--",
+        label="fixed-pool ACI (window-independent)",
+    )
+    ax.axhline(
+        comparison.static["coverage_gap"] * 100,
+        color="#888888",
+        linewidth=1.0,
+        linestyle=":",
+        label="static split conformal",
+    )
+    ax.axhline(0.0, color="#222222", linewidth=0.8)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels)
+    ax.set_xlabel("window (max residual-pool size)")
+    ax.set_ylabel("coverage gap (pp, closer to 0 is better)")
+    ax.set_title(f"{dataset}: sliding-pool ACI coverage gap by window size")
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="conformal-forecast benchmark runner")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -166,6 +215,22 @@ def main() -> None:
     sliding.add_argument("--plot", type=str, default=None, help="save a plot of the residual pool size over the test window")
     sliding.add_argument("--seed", type=int, default=0)
 
+    sweep = sub.add_parser(
+        "window-sweep",
+        help="sweep the sliding-pool ACI's window size and compare coverage gap across values",
+    )
+    sweep.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    sweep.add_argument("--alpha", type=float, default=0.1)
+    sweep.add_argument("--gamma", type=float, default=0.05, help="ACI step size")
+    sweep.add_argument(
+        "--windows",
+        type=str,
+        default="10,15,20,30,50,unbounded",
+        help="comma-separated list of window sizes to try; include 'unbounded' for the growing buffer",
+    )
+    sweep.add_argument("--plot", type=str, default=None, help="save a plot of coverage gap vs. window size")
+    sweep.add_argument("--seed", type=int, default=0)
+
     args = parser.parse_args()
 
     if args.command == "benchmark":
@@ -194,6 +259,16 @@ def main() -> None:
         print()
         if args.plot:
             _plot_sliding_window(args.dataset, comparison, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "window-sweep":
+        windows = [None if w.strip().lower() == "unbounded" else int(w) for w in args.windows.split(",")]
+        comparison = run_window_sweep_comparison(
+            args.dataset, windows=windows, alpha=args.alpha, gamma=args.gamma, seed=args.seed
+        )
+        print(format_window_sweep_comparison(comparison))
+        print()
+        if args.plot:
+            _plot_window_sweep(args.dataset, comparison, args.plot)
             print(f"Saved plot to {args.plot}")
 
 

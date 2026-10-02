@@ -394,3 +394,230 @@ def format_sliding_window_comparison(comparison: SlidingWindowComparison) -> str
         f"{w['coverage_gap'] * 100:+.1f}pp | {w['mean_interval_width']:.3f} |",
     ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Automatic window selection (v0.5) -- the README's own "What's next" item:
+# "pick the window minimizing |coverage gap| on a held-out slice of the
+# calibration data ... instead of requiring a user to eyeball a window-sweep
+# plot themselves." v0.4 found real, dataset-dependent optima but left
+# finding them to a human. This automates that, and -- per this repo's own
+# "measure, don't assert" discipline -- also checks, honestly, whether the
+# automatic choice actually generalizes to the real test set, rather than
+# just trusting that a held-out-calibration-slice proxy works.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WindowSelectionCandidate:
+    window: int | None  # None = unbounded growing buffer
+    holdout_coverage_gap: float  # signed; measured on the selection-holdout slice ONLY
+    holdout_mean_interval_width: float
+    test_coverage_gap: float  # signed; the REAL test-set gap for this window -- reported
+    # for honest post-hoc comparison only, never used to choose `selected_window`
+
+
+@dataclass
+class AutoWindowResult:
+    dataset: str
+    alpha: float
+    gamma: float
+    holdout_frac: float
+    n_select_cal: int
+    n_select_holdout: int
+    candidates: list[WindowSelectionCandidate]  # one per candidate window, in the order given
+    selected_window: int | None  # chosen using holdout data only
+    best_test_window: int | None  # oracle: smallest |test gap| in hindsight -- comparison only
+    static: dict  # evaluate_coverage() output, reference line (from the real test set)
+    fixed_pool: dict  # evaluate_adaptive_coverage() output, reference line (from the real test set)
+    selected_test_result: dict  # evaluate_adaptive_coverage() output for `selected_window` on the real test set
+
+
+def _select_best_window(
+    windows: list[int | None],
+    gap_by_window: dict,
+    width_by_window: dict | None = None,
+) -> int | None:
+    """Pure selection rule, no model/data dependency at all, so the
+    selection *logic* can be unit-tested directly and fast, separate from
+    the (slow, LSTM-training) integration path that produces the gaps (and
+    widths) it's given.
+
+    Primary criterion: argmin |coverage gap| -- the thing that actually
+    matters (calibration).
+
+    With a holdout slice small enough to only support a handful of distinct
+    outcomes (this repo's own airline/synthetic holdout slices are 8-48
+    points -- see the README), several windows routinely tie exactly on
+    |gap|. This was checked directly during development (not assumed): on
+    `synthetic`, windows 10/20/50/unbounded all tied at the same holdout
+    gap, and picking among them mattered a lot for the real test-set
+    outcome. Two tie-breaks, in order:
+    1. Smaller mean interval width -- the standard efficiency criterion in
+       conformal prediction (among equally-calibrated choices, prefer the
+       sharper one). Only applied when `width_by_window` is given.
+    2. Larger window -- a last-resort, fully deterministic tie-break: fewer
+       residuals makes for a noisier quantile estimate, so prefer the option
+       that discards less information. `None` (unbounded) is "infinitely
+       large" here, the correct direction for this specific tie-break.
+    """
+    if not windows:
+        raise ValueError("Need at least one candidate window to select from")
+
+    def key(w):
+        size = float("inf") if w is None else w
+        width = width_by_window[w] if width_by_window is not None else 0.0
+        return (round(abs(gap_by_window[w]), 10), width, -size)
+
+    return min(windows, key=key)
+
+
+def run_auto_window_selection(
+    dataset: str,
+    windows: list[int | None],
+    alpha: float = 0.1,
+    gamma: float = 0.05,
+    holdout_frac: float = 0.3,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> AutoWindowResult:
+    """Automatically pick `window` for `SlidingWindowAdaptiveConformalForecaster`.
+
+    Method: the real calibration set (X_cal, y_cal) -- never the test set --
+    is itself split chronologically into a selection-calibration slice (the
+    first `1 - holdout_frac`) and a selection-holdout slice (the last
+    `holdout_frac`). The LSTM is trained once, on X_train only (window
+    selection must not see X_test, and the model doesn't depend on
+    calibration data). For each candidate window, the sliding-pool ACI
+    forecaster is seeded with ONLY the selection-calibration residuals and
+    run sequentially over the selection-holdout slice -- exactly as it would
+    later run over the real test set -- and scored by |coverage gap| there.
+    `_select_best_window` then picks the window with the smallest |gap| on
+    that holdout slice.
+
+    This never touches X_test/y_test to make the selection. X_test is used
+    only afterward, to honestly check (via `run_window_sweep_comparison`,
+    the same tested machinery v0.4 shipped) whether the holdout-based choice
+    actually generalizes -- reported as `test_coverage_gap` per candidate
+    and `best_test_window` (the oracle best-in-hindsight), so this feature's
+    own claim ("holdout selection finds a good window") is itself measured,
+    not assumed, matching every other claim in this repo.
+
+    Once selected, the window is NOT used to retrain the model (window has
+    no effect on model fitting, only on how the residual pool is read --
+    `run_window_sweep_comparison` already documents the same reasoning);
+    `selected_test_result` comes from that function's own run of the
+    selected window against the FULL calibration set (X_cal, not just the
+    selection-calibration slice), so the deployed forecaster isn't left
+    throwing away real calibration data it doesn't need to.
+    """
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+
+    if not (0.0 < holdout_frac < 1.0):
+        raise ValueError("holdout_frac must be in (0, 1)")
+
+    n_cal = len(X_cal)
+    n_select_holdout = int(round(n_cal * holdout_frac))
+    n_select_cal = n_cal - n_select_holdout
+    if n_select_cal < 5 or n_select_holdout < 5:
+        raise ValueError(
+            f"Calibration set too small to hold out a selection slice: n_cal={n_cal}, "
+            f"holdout_frac={holdout_frac} -> select_cal={n_select_cal}, "
+            f"select_holdout={n_select_holdout} (need >= 5 each -- try a smaller holdout_frac "
+            "or a dataset/lookback with a larger calibration set)"
+        )
+    X_select_cal, y_select_cal = X_cal[:n_select_cal], y_cal[:n_select_cal]
+    X_select_holdout, y_select_holdout = X_cal[n_select_cal:], y_cal[n_select_cal:]
+
+    base_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    base_model.fit(X_train, y_train)
+    select_cal_residuals = np.abs(
+        y_select_cal.reshape(-1) - base_model.predict(X_select_cal).reshape(-1)
+    )
+
+    holdout_gap_by_window: dict = {}
+    holdout_width_by_window: dict = {}
+    for window in windows:
+        forecaster = SlidingWindowAdaptiveConformalForecaster(base_model, alpha=alpha, gamma=gamma, window=window)
+        forecaster._residuals = select_cal_residuals
+        pred = forecaster.predict_sequential(X_select_holdout, y_select_holdout.reshape(-1))
+        result = evaluate_adaptive_coverage(pred, y_select_holdout)
+        holdout_gap_by_window[window] = result["coverage_gap"]
+        holdout_width_by_window[window] = result["mean_interval_width"]
+
+    selected_window = _select_best_window(windows, holdout_gap_by_window, holdout_width_by_window)
+
+    # Honest post-hoc check, using the already-tested v0.4 sweep machinery:
+    # the REAL test-set gap for every candidate. X_test plays no role above
+    # -- it's used here only to check, after the fact, whether the
+    # holdout-based choice generalized.
+    sweep = run_window_sweep_comparison(
+        dataset, windows=windows, alpha=alpha, gamma=gamma, lookback=lookback, period=period, seed=seed
+    )
+    test_gap_by_window = {r.window: r.sliding["coverage_gap"] for r in sweep.results}
+    test_width_by_window = {r.window: r.sliding["mean_interval_width"] for r in sweep.results}
+    test_result_by_window = {r.window: r.sliding for r in sweep.results}
+
+    candidates = [
+        WindowSelectionCandidate(
+            window=w,
+            holdout_coverage_gap=holdout_gap_by_window[w],
+            holdout_mean_interval_width=holdout_width_by_window[w],
+            test_coverage_gap=test_gap_by_window[w],
+        )
+        for w in windows
+    ]
+    # Oracle/hindsight best, for comparison only -- same tie-break rule,
+    # applied to the real test-set numbers instead of the holdout ones.
+    best_test_window = _select_best_window(windows, test_gap_by_window, test_width_by_window)
+
+    return AutoWindowResult(
+        dataset=dataset,
+        alpha=alpha,
+        gamma=gamma,
+        holdout_frac=holdout_frac,
+        n_select_cal=n_select_cal,
+        n_select_holdout=n_select_holdout,
+        candidates=candidates,
+        selected_window=selected_window,
+        best_test_window=best_test_window,
+        static=sweep.static,
+        fixed_pool=sweep.fixed_pool,
+        selected_test_result=test_result_by_window[selected_window],
+    )
+
+
+def format_auto_window_selection(result: AutoWindowResult) -> str:
+    nominal_pct = int(round((1 - result.alpha) * 100))
+    s, f = result.static, result.fixed_pool
+    lines = [
+        f"### {result.dataset}: automatic window selection "
+        f"(LSTM (delta), nominal {nominal_pct}%, gamma={result.gamma}, "
+        f"holdout_frac={result.holdout_frac}, n_select_cal={result.n_select_cal}, "
+        f"n_select_holdout={result.n_select_holdout})",
+        "",
+        "| Window | Holdout gap (selection only) | Real test gap (post-hoc check) |",
+        "|---|---|---|",
+    ]
+    for c in result.candidates:
+        wlabel = "unbounded (growing buffer)" if c.window is None else str(c.window)
+        marker = ""
+        if c.window == result.selected_window:
+            marker += " **<- selected**"
+        if c.window == result.best_test_window:
+            marker += " *(best in hindsight)*"
+        lines.append(
+            f"| {wlabel}{marker} | {c.holdout_coverage_gap * 100:+.1f}pp | {c.test_coverage_gap * 100:+.1f}pp |"
+        )
+    lines += [
+        "",
+        f"*Reference, real test set:* static split conformal {s['coverage_gap'] * 100:+.1f}pp, "
+        f"fixed-pool ACI {f['coverage_gap'] * 100:+.1f}pp.",
+        "",
+        f"**Selected window: {('unbounded' if result.selected_window is None else result.selected_window)}** "
+        f"(chosen from the holdout column only) -> real test-set gap "
+        f"{result.selected_test_result['coverage_gap'] * 100:+.1f}pp, mean interval width "
+        f"{result.selected_test_result['mean_interval_width']:.3f}.",
+    ]
+    return "\n".join(lines)

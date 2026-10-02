@@ -28,6 +28,16 @@ Sweep the sliding-pool ACI's `window` size and see how coverage gap responds
 (a bounded window can beat the unbounded growing buffer -- see the README):
 
     python -m forecasting.cli window-sweep --dataset airline --windows 10,15,20,30,50,unbounded --plot results/airline_window_sweep.png
+
+Automatically pick a `window` instead of eyeballing a window-sweep plot: the
+calibration set is itself split into a selection-calibration slice and a
+held-out slice, each candidate window is scored by |coverage gap| on that
+held-out slice only, and the smallest-gap window is selected -- then, as an
+honest post-hoc check (never used for the selection itself), the real
+test-set gap for every candidate is reported too, so you can see whether the
+holdout-based choice actually generalized:
+
+    python -m forecasting.cli auto-window --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --plot results/airline_auto_window.png
 """
 from __future__ import annotations
 
@@ -35,10 +45,12 @@ import argparse
 
 from forecasting.experiment import (
     format_adaptive_comparison,
+    format_auto_window_selection,
     format_results_table,
     format_sliding_window_comparison,
     format_window_sweep_comparison,
     run_adaptive_comparison,
+    run_auto_window_selection,
     run_experiment,
     run_sliding_window_comparison,
     run_window_sweep_comparison,
@@ -175,6 +187,40 @@ def _plot_window_sweep(dataset: str, comparison, path: str) -> None:
     plt.close(fig)
 
 
+def _plot_auto_window_selection(dataset: str, result, path: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    windows = [c.window for c in result.candidates]
+    holdout_gaps = [c.holdout_coverage_gap * 100 for c in result.candidates]
+    test_gaps = [c.test_coverage_gap * 100 for c in result.candidates]
+    x = list(range(len(windows)))
+    labels = ["unbounded" if w is None else str(w) for w in windows]
+    selected_idx = windows.index(result.selected_window)
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(x, holdout_gaps, color="#9467bd", linewidth=1.5, marker="o", label="holdout gap (used to select)")
+    ax.plot(x, test_gaps, color="#2ca02c", linewidth=1.5, marker="s", label="real test-set gap (post-hoc check)")
+    ax.axhline(0.0, color="#222222", linewidth=0.8)
+    ax.axvline(selected_idx, color="#d62728", linewidth=1.0, linestyle="--", label=f"selected (window={labels[selected_idx]})")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_xlabel("window (max residual-pool size)")
+    ax.set_ylabel("coverage gap (pp, closer to 0 is better)")
+    ax.set_title(
+        f"{dataset}: automatic window selection -- holdout-based choice vs. real test-set outcome\n"
+        f"selected window={labels[selected_idx]}, real test-set gap "
+        f"{result.selected_test_result['coverage_gap'] * 100:+.1f}pp",
+        fontsize=10,
+    )
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="conformal-forecast benchmark runner")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -231,6 +277,28 @@ def main() -> None:
     sweep.add_argument("--plot", type=str, default=None, help="save a plot of coverage gap vs. window size")
     sweep.add_argument("--seed", type=int, default=0)
 
+    auto = sub.add_parser(
+        "auto-window",
+        help="automatically select the sliding-pool ACI's window size from a held-out calibration slice",
+    )
+    auto.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    auto.add_argument("--alpha", type=float, default=0.1)
+    auto.add_argument("--gamma", type=float, default=0.05, help="ACI step size")
+    auto.add_argument(
+        "--candidates",
+        type=str,
+        default="5,7,10,15,20,30,50,unbounded",
+        help="comma-separated list of candidate window sizes to select from; include 'unbounded' for the growing buffer",
+    )
+    auto.add_argument(
+        "--holdout-frac",
+        type=float,
+        default=0.3,
+        help="fraction of the calibration set held out (chronologically, from the end) to score each candidate window",
+    )
+    auto.add_argument("--plot", type=str, default=None, help="save a plot comparing holdout gap vs. real test-set gap by window")
+    auto.add_argument("--seed", type=int, default=0)
+
     args = parser.parse_args()
 
     if args.command == "benchmark":
@@ -269,6 +337,21 @@ def main() -> None:
         print()
         if args.plot:
             _plot_window_sweep(args.dataset, comparison, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "auto-window":
+        candidates = [None if w.strip().lower() == "unbounded" else int(w) for w in args.candidates.split(",")]
+        result = run_auto_window_selection(
+            args.dataset,
+            windows=candidates,
+            alpha=args.alpha,
+            gamma=args.gamma,
+            holdout_frac=args.holdout_frac,
+            seed=args.seed,
+        )
+        print(format_auto_window_selection(result))
+        print()
+        if args.plot:
+            _plot_auto_window_selection(args.dataset, result, args.plot)
             print(f"Saved plot to {args.plot}")
 
 

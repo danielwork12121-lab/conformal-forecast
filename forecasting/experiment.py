@@ -621,3 +621,245 @@ def format_auto_window_selection(result: AutoWindowResult) -> str:
         f"{result.selected_test_result['mean_interval_width']:.3f}.",
     ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Rolling-origin cross-validated window selection (v0.6) -- follows up on
+# v0.5's own documented limitation: a single holdout slice is, by
+# construction, drawn entirely from the calibration period, so on a dataset
+# with a small calibration set (airline: 28 windows) every candidate window
+# ties exactly on that one slice's hit/miss outcome (see
+# tests/test_auto_window_selection.py::test_auto_window_selection_on_airline_is_honestly_a_near_tie_across_candidates).
+# Rolling-origin CV does NOT fix that structural problem -- no amount of
+# slicing within the calibration period can see a shift that only happens in
+# the test period -- but a *single* small holdout slice is also a
+# high-variance estimate in its own right: which points happen to land in it
+# (entirely decided by one `holdout_frac` cut point) can flip which window
+# looks best. Averaging the score over several expanding-window folds is the
+# standard time-series fix for exactly that single-split variance. Whether
+# it actually selects better windows than v0.5's one-shot holdout is
+# measured here, across multiple seeds, not assumed -- see the README for
+# the honest (mixed) multi-seed comparison.
+# ---------------------------------------------------------------------------
+
+
+def _make_rolling_folds(n: int, n_folds: int, min_initial: int, min_fold_size: int) -> list[tuple[int, int]] | None:
+    """Pure fold-boundary logic, no data/model dependency, so it's tested
+    directly and fast, separate from the (slow, LSTM-training) integration
+    path that uses it.
+
+    Expanding-window ("blocked", chronological) folds over indices
+    `[0, n)`: fold 0's seed is `[0, min_initial)`, its validation chunk is
+    the next `fold_size` points; fold 1's seed extends to cover fold 0's
+    validation chunk too (expanding, never sliding or shrinking back down --
+    more residuals can only help a quantile estimate), and so on. The last
+    fold's validation chunk absorbs the remainder of `usable // actual_folds`,
+    so every index from `min_initial` to `n` is covered by exactly one
+    fold's validation chunk, with no gap and no overlap.
+
+    Returns a list of `(train_end, test_end)` pairs, or `None` if `n` is too
+    small to form even one fold of at least `min_fold_size` validation
+    points after reserving `min_initial` points for the very first seed.
+    `n_folds` is a request, not a guarantee: if the data can't support that
+    many folds of `min_fold_size` each, as many as it can support are
+    returned instead (always at least 1, or `None`).
+    """
+    if n_folds < 1:
+        raise ValueError("n_folds must be a positive integer")
+    if min_initial < 1 or min_fold_size < 1:
+        raise ValueError("min_initial and min_fold_size must be positive integers")
+
+    usable = n - min_initial
+    if usable < min_fold_size:
+        return None
+
+    actual_folds = min(n_folds, usable // min_fold_size)
+    fold_size = usable // actual_folds
+
+    folds = []
+    start = min_initial
+    for k in range(actual_folds):
+        end = start + fold_size if k < actual_folds - 1 else n
+        folds.append((start, end))
+        start = end
+    return folds
+
+
+@dataclass
+class CVWindowCandidate:
+    window: int | None  # None = unbounded growing buffer
+    mean_abs_fold_gap: float  # mean of |coverage gap| across folds -- used to select
+    mean_fold_gap: float  # mean of SIGNED coverage gap across folds -- display only
+    mean_fold_width: float
+    test_coverage_gap: float  # real test-set gap, honest post-hoc check only
+
+
+@dataclass
+class CVWindowSelectionResult:
+    dataset: str
+    alpha: float
+    gamma: float
+    n_folds: int  # actually achieved; may be less than requested, see _make_rolling_folds
+    fold_bounds: list[tuple[int, int]]  # (train_end, test_end) indices into the calibration set
+    candidates: list[CVWindowCandidate]  # one per candidate window, in the order given
+    selected_window: int | None  # chosen using the fold columns only
+    best_test_window: int | None  # oracle: smallest |test gap| in hindsight -- comparison only
+    static: dict  # evaluate_coverage() output, reference line (from the real test set)
+    fixed_pool: dict  # evaluate_adaptive_coverage() output, reference line (from the real test set)
+    selected_test_result: dict  # evaluate_adaptive_coverage() output for `selected_window` on the real test set
+
+
+def run_cv_window_selection(
+    dataset: str,
+    windows: list[int | None],
+    alpha: float = 0.1,
+    gamma: float = 0.05,
+    n_folds: int = 4,
+    min_initial_frac: float = 0.2,
+    min_fold_frac: float = 0.1,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> CVWindowSelectionResult:
+    """Select `window` for the sliding-pool ACI using rolling-origin
+    cross-validation over the calibration set, instead of
+    `run_auto_window_selection`'s single static holdout slice.
+
+    Method: the LSTM is trained once, on X_train only (identical discipline
+    to `run_auto_window_selection` -- selection must never see X_test, and
+    the model doesn't depend on calibration data at all). The calibration
+    residuals are split into expanding-window folds via
+    `_make_rolling_folds`. For each candidate window, the sliding-pool ACI
+    forecaster is seeded with each fold's "seed" residuals and run
+    sequentially over that fold's validation chunk, scored by |coverage
+    gap| there. The per-window score is the MEAN of |gap| across folds --
+    not the mean of signed gap, so a window that swings over-covered on one
+    fold and under-covered on another doesn't look artificially
+    well-calibrated on average; it has to be *consistently* close to
+    nominal across several different slices of the calibration period to
+    win. `_select_best_window` then picks the smallest mean-|gap| window,
+    tie-broken by mean interval width (same rule as v0.5) and, failing
+    that, the larger window.
+
+    This never touches X_test/y_test to make the selection. X_test is used
+    only afterward, via the already-tested `run_window_sweep_comparison`,
+    to honestly report whether this selection method's choice generalized
+    -- same post-hoc-only discipline as `run_auto_window_selection`.
+
+    Raises ValueError if the calibration set is too small to form even one
+    fold of `min_fold_frac * n_cal` points after reserving
+    `min_initial_frac * n_cal` points for the first fold's seed.
+    """
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+
+    if n_folds < 1:
+        raise ValueError("n_folds must be a positive integer")
+    if not (0.0 < min_initial_frac < 1.0) or not (0.0 < min_fold_frac < 1.0):
+        raise ValueError("min_initial_frac and min_fold_frac must be in (0, 1)")
+
+    n_cal = len(X_cal)
+    min_initial = max(5, round(n_cal * min_initial_frac))
+    min_fold_size = max(3, round(n_cal * min_fold_frac))
+    fold_bounds = _make_rolling_folds(n_cal, n_folds, min_initial, min_fold_size)
+    if fold_bounds is None:
+        raise ValueError(
+            f"Calibration set too small for rolling-origin CV: n_cal={n_cal}, "
+            f"min_initial={min_initial}, min_fold_size={min_fold_size} (from min_initial_frac="
+            f"{min_initial_frac}, min_fold_frac={min_fold_frac}) -- try a smaller n_folds / "
+            "min_initial_frac / min_fold_frac, or a dataset/lookback with a larger calibration set"
+        )
+
+    base_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    base_model.fit(X_train, y_train)
+    cal_residuals = np.abs(y_cal.reshape(-1) - base_model.predict(X_cal).reshape(-1))
+
+    mean_abs_gap_by_window: dict = {}
+    mean_gap_by_window: dict = {}
+    mean_width_by_window: dict = {}
+    for window in windows:
+        abs_gaps, signed_gaps, widths = [], [], []
+        for train_end, test_end in fold_bounds:
+            forecaster = SlidingWindowAdaptiveConformalForecaster(base_model, alpha=alpha, gamma=gamma, window=window)
+            forecaster._residuals = cal_residuals[:train_end]
+            X_fold, y_fold = X_cal[train_end:test_end], y_cal[train_end:test_end]
+            pred = forecaster.predict_sequential(X_fold, y_fold.reshape(-1))
+            result = evaluate_adaptive_coverage(pred, y_fold)
+            abs_gaps.append(abs(result["coverage_gap"]))
+            signed_gaps.append(result["coverage_gap"])
+            widths.append(result["mean_interval_width"])
+        mean_abs_gap_by_window[window] = float(np.mean(abs_gaps))
+        mean_gap_by_window[window] = float(np.mean(signed_gaps))
+        mean_width_by_window[window] = float(np.mean(widths))
+
+    selected_window = _select_best_window(windows, mean_abs_gap_by_window, mean_width_by_window)
+
+    # Honest post-hoc check, using the already-tested v0.4 sweep machinery --
+    # same pattern as run_auto_window_selection.
+    sweep = run_window_sweep_comparison(
+        dataset, windows=windows, alpha=alpha, gamma=gamma, lookback=lookback, period=period, seed=seed
+    )
+    test_gap_by_window = {r.window: r.sliding["coverage_gap"] for r in sweep.results}
+    test_width_by_window = {r.window: r.sliding["mean_interval_width"] for r in sweep.results}
+    test_result_by_window = {r.window: r.sliding for r in sweep.results}
+
+    candidates = [
+        CVWindowCandidate(
+            window=w,
+            mean_abs_fold_gap=mean_abs_gap_by_window[w],
+            mean_fold_gap=mean_gap_by_window[w],
+            mean_fold_width=mean_width_by_window[w],
+            test_coverage_gap=test_gap_by_window[w],
+        )
+        for w in windows
+    ]
+    best_test_window = _select_best_window(windows, test_gap_by_window, test_width_by_window)
+
+    return CVWindowSelectionResult(
+        dataset=dataset,
+        alpha=alpha,
+        gamma=gamma,
+        n_folds=len(fold_bounds),
+        fold_bounds=fold_bounds,
+        candidates=candidates,
+        selected_window=selected_window,
+        best_test_window=best_test_window,
+        static=sweep.static,
+        fixed_pool=sweep.fixed_pool,
+        selected_test_result=test_result_by_window[selected_window],
+    )
+
+
+def format_cv_window_selection(result: CVWindowSelectionResult) -> str:
+    nominal_pct = int(round((1 - result.alpha) * 100))
+    s, f = result.static, result.fixed_pool
+    fold_desc = ", ".join(f"[{a}:{b})" for a, b in result.fold_bounds)
+    lines = [
+        f"### {result.dataset}: rolling-origin CV window selection "
+        f"(LSTM (delta), nominal {nominal_pct}%, gamma={result.gamma}, "
+        f"n_folds={result.n_folds}, folds={fold_desc})",
+        "",
+        "| Window | Mean &#124;fold gap&#124; (used to select) | Mean fold gap (signed) | Real test gap (post-hoc check) |",
+        "|---|---|---|---|",
+    ]
+    for c in result.candidates:
+        wlabel = "unbounded (growing buffer)" if c.window is None else str(c.window)
+        marker = ""
+        if c.window == result.selected_window:
+            marker += " **<- selected**"
+        if c.window == result.best_test_window:
+            marker += " *(best in hindsight)*"
+        lines.append(
+            f"| {wlabel}{marker} | {c.mean_abs_fold_gap * 100:.1f}pp | {c.mean_fold_gap * 100:+.1f}pp | "
+            f"{c.test_coverage_gap * 100:+.1f}pp |"
+        )
+    lines += [
+        "",
+        f"*Reference, real test set:* static split conformal {s['coverage_gap'] * 100:+.1f}pp, "
+        f"fixed-pool ACI {f['coverage_gap'] * 100:+.1f}pp.",
+        "",
+        f"**Selected window: {('unbounded' if result.selected_window is None else result.selected_window)}** "
+        f"(chosen from the {result.n_folds} fold columns only) -> real test-set gap "
+        f"{result.selected_test_result['coverage_gap'] * 100:+.1f}pp, mean interval width "
+        f"{result.selected_test_result['mean_interval_width']:.3f}."
+    ]
+    return "\n".join(lines)

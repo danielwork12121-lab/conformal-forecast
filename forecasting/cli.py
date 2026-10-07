@@ -38,6 +38,17 @@ test-set gap for every candidate is reported too, so you can see whether the
 holdout-based choice actually generalized:
 
     python -m forecasting.cli auto-window --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --plot results/airline_auto_window.png
+
+Select `window` via rolling-origin cross-validation instead of a single
+holdout slice: the calibration set is split into several expanding-window
+folds (fold k's "seed" is every calibration residual before it, its
+"validation chunk" is the next slice), each candidate window is scored by
+the MEAN of |coverage gap| across every fold (not just one slice), and the
+smallest-mean-|gap| window is selected -- then, as with `auto-window`, the
+real test-set gap for every candidate is reported as an honest post-hoc
+check:
+
+    python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --plot results/airline_cv_window_select.png
 """
 from __future__ import annotations
 
@@ -46,11 +57,13 @@ import argparse
 from forecasting.experiment import (
     format_adaptive_comparison,
     format_auto_window_selection,
+    format_cv_window_selection,
     format_results_table,
     format_sliding_window_comparison,
     format_window_sweep_comparison,
     run_adaptive_comparison,
     run_auto_window_selection,
+    run_cv_window_selection,
     run_experiment,
     run_sliding_window_comparison,
     run_window_sweep_comparison,
@@ -221,6 +234,40 @@ def _plot_auto_window_selection(dataset: str, result, path: str) -> None:
     plt.close(fig)
 
 
+def _plot_cv_window_selection(dataset: str, result, path: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    windows = [c.window for c in result.candidates]
+    fold_gaps = [c.mean_abs_fold_gap * 100 for c in result.candidates]
+    test_gaps = [c.test_coverage_gap * 100 for c in result.candidates]
+    x = list(range(len(windows)))
+    labels = ["unbounded" if w is None else str(w) for w in windows]
+    selected_idx = windows.index(result.selected_window)
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(x, fold_gaps, color="#9467bd", linewidth=1.5, marker="o", label=f"mean |gap| across {result.n_folds} folds (used to select)")
+    ax.plot(x, test_gaps, color="#2ca02c", linewidth=1.5, marker="s", label="real test-set gap (post-hoc check)")
+    ax.axhline(0.0, color="#222222", linewidth=0.8)
+    ax.axvline(selected_idx, color="#d62728", linewidth=1.0, linestyle="--", label=f"selected (window={labels[selected_idx]})")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_xlabel("window (max residual-pool size)")
+    ax.set_ylabel("coverage gap (pp; fold column is |gap|, test column is signed)")
+    ax.set_title(
+        f"{dataset}: rolling-origin CV window selection ({result.n_folds} folds) vs. real test-set outcome\n"
+        f"selected window={labels[selected_idx]}, real test-set gap "
+        f"{result.selected_test_result['coverage_gap'] * 100:+.1f}pp",
+        fontsize=10,
+    )
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="conformal-forecast benchmark runner")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -299,6 +346,25 @@ def main() -> None:
     auto.add_argument("--plot", type=str, default=None, help="save a plot comparing holdout gap vs. real test-set gap by window")
     auto.add_argument("--seed", type=int, default=0)
 
+    cv = sub.add_parser(
+        "cv-window-select",
+        help="select the sliding-pool ACI's window size via rolling-origin cross-validation over the calibration set",
+    )
+    cv.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    cv.add_argument("--alpha", type=float, default=0.1)
+    cv.add_argument("--gamma", type=float, default=0.05, help="ACI step size")
+    cv.add_argument(
+        "--candidates",
+        type=str,
+        default="5,7,10,15,20,30,50,unbounded",
+        help="comma-separated list of candidate window sizes to select from; include 'unbounded' for the growing buffer",
+    )
+    cv.add_argument("--n-folds", type=int, default=4, help="requested number of rolling-origin folds (may be fewer if the calibration set is small)")
+    cv.add_argument("--min-initial-frac", type=float, default=0.2, help="fraction of the calibration set reserved as the first fold's seed")
+    cv.add_argument("--min-fold-frac", type=float, default=0.1, help="minimum fraction of the calibration set each fold's validation chunk must have")
+    cv.add_argument("--plot", type=str, default=None, help="save a plot comparing mean fold |gap| vs. real test-set gap by window")
+    cv.add_argument("--seed", type=int, default=0)
+
     args = parser.parse_args()
 
     if args.command == "benchmark":
@@ -352,6 +418,23 @@ def main() -> None:
         print()
         if args.plot:
             _plot_auto_window_selection(args.dataset, result, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "cv-window-select":
+        candidates = [None if w.strip().lower() == "unbounded" else int(w) for w in args.candidates.split(",")]
+        result = run_cv_window_selection(
+            args.dataset,
+            windows=candidates,
+            alpha=args.alpha,
+            gamma=args.gamma,
+            n_folds=args.n_folds,
+            min_initial_frac=args.min_initial_frac,
+            min_fold_frac=args.min_fold_frac,
+            seed=args.seed,
+        )
+        print(format_cv_window_selection(result))
+        print()
+        if args.plot:
+            _plot_cv_window_selection(args.dataset, result, args.plot)
             print(f"Saved plot to {args.plot}")
 
 

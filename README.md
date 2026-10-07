@@ -452,6 +452,114 @@ selection rule. `window-sweep` (manual, uses the real test set) remains the
 right tool on a dataset this small; `auto-window` is for the regime where
 you have enough calibration data to spare a holdout slice.
 
+## Rolling-origin cross-validated window selection: does it help?
+
+"Automatic window selection" above found a real structural limitation: on
+`airline`, every candidate window ties exactly on the single holdout slice,
+because that slice is drawn entirely from the *calibration* period and can't
+see the calibration-to-test shift the sliding-pool variant exists to
+correct for. This adds `python -m forecasting.cli cv-window-select` as a
+second selection method — not a fix for that structural problem (no amount
+of slicing within the calibration period can see a shift that hasn't
+happened yet), but a different question: is a *single* small holdout slice
+also just a noisy estimator in its own right, separate from the structural
+issue? `airline`'s holdout in the single-split method is 8 points, selected
+by one arbitrary `holdout_frac` cut.
+
+Method: the calibration set is split into several expanding-window
+("rolling-origin") folds via `_make_rolling_folds` — fold *k*'s seed is
+every calibration residual before it, its validation chunk is the next
+slice — and each candidate window is scored by the *mean* of |coverage gap|
+across every fold, not just one slice. A window has to be consistently
+close to nominal across several different slices of the calibration period
+to win, instead of winning or losing on wherever one holdout cut happened
+to land. Exactly like `auto-window`, the real test set plays no role in the
+selection — it's used only afterward as an honest post-hoc check.
+
+**Measured across 6 seeds × all 3 datasets, the honest result is mixed —
+not a clean win for either method:**
+
+| Dataset | Mean &#124;test gap&#124;, CV selection | Mean &#124;test gap&#124;, single-holdout | Mean &#124;test gap&#124;, oracle | CV wins / holdout wins / ties (of 6 seeds) |
+|---|---|---|---|---|
+| `airline` (n_cal=28) | **8.3pp** | 10.0pp | 6.1pp | 4 / 1 / 1 |
+| `synthetic` (n_cal=160) | 1.1pp | **0.9pp** | 0.1pp | 1 / 2 / 3 |
+| `temperature` (n_cal=730) | 0.1pp | 0.1pp | 0.0pp | 0 / 0 / 6 |
+
+On `airline` — the dataset with by far the smallest calibration set, and
+therefore the noisiest single 8-point holdout — rolling-origin CV wins on 4
+of 6 seeds and improves the mean |gap| from 10.0pp to 8.3pp (versus a 6.1pp
+oracle ceiling neither method gets anywhere near). On `synthetic`
+(n_cal=160, a holdout slice of 48) the two methods are essentially a
+coin flip, and CV is very slightly *worse* on average. On `temperature`
+(n_cal=730, a 219-point holdout) both methods already have enough data to
+land within 0.1pp of each other and the oracle every single time — there's
+no variance left for averaging over folds to reduce. This is exactly the
+pattern the motivating hypothesis predicts: averaging over several folds
+only helps when the thing it's averaging *out* — single-split variance — is
+actually large, which only happens when the calibration set is small to
+begin with.
+
+Seed=0 on `airline` (the default seed used throughout this README):
+
+| `airline`, window | Mean &#124;fold gap&#124; (4 folds, used to select) | Real test gap (post-hoc check) |
+|---|---|---|
+| 5 (**selected**) | 20.7pp | **-6.7pp** |
+| 7 (best in hindsight) | 20.7pp | -3.3pp |
+| 10 | 20.7pp | -3.3pp |
+| 15 | 20.7pp | -3.3pp |
+| 20 | 20.7pp | -6.7pp |
+| 30 | 20.7pp | -6.7pp |
+| 50 | 20.7pp | -10.0pp |
+| unbounded | 20.7pp | -10.0pp |
+
+![airline rolling-origin CV window selection: mean fold gap vs. real test-set outcome](results/airline_cv_window_select.png)
+
+Every candidate still ties on the fold-averaged metric too (20.7pp for all
+eight) — four folds of a 28-point calibration set are still small, and the
+structural problem (calibration residuals are categorically smaller than
+test residuals) means *no* calibration-period slicing can see the shift
+coming. But the *tie-break* (smaller mean width, then larger window) lands
+on a different, better candidate here (window=5, -6.7pp) than the
+single-holdout method's tie-break did (unbounded, -10.0pp) — the real
+win on this dataset comes from which candidate the tie-break falls through
+to, not from the folds actually discriminating.
+
+Seed=0 on `synthetic` — a case where CV *beats* the single-holdout method
+outright:
+
+| `synthetic`, window | Mean &#124;fold gap&#124; (4 folds, used to select) | Real test gap (post-hoc check) |
+|---|---|---|
+| 5 | 8.8pp | -6.2pp |
+| 7 | 4.8pp | -1.3pp |
+| 10 | 2.7pp | +1.2pp |
+| 15 (**selected**) | 1.9pp | **+0.6pp** |
+| 20 | 2.3pp | +0.6pp |
+| 30 | 3.1pp | +0.0pp |
+| 50 (best in hindsight) | 2.3pp | +0.0pp |
+| unbounded | 2.3pp | -3.1pp |
+
+![synthetic rolling-origin CV window selection: mean fold gap vs. real test-set outcome](results/synthetic_cv_window_select.png)
+
+Here the fold-averaged metric *does* discriminate (1.9pp to 8.8pp across
+candidates, no ties) and correctly favors the middle of the range over the
+extremes — window=15 lands at +0.6pp real gap, beating the single-holdout
+method's own seed-0 pick of window=10 (+1.2pp) — see the "Automatic window
+selection" section above for that run's table on the same dataset and seed.
+`tests/test_cv_window_selection.py::test_cv_window_selection_does_not_uniformly_beat_single_holdout`
+pins down the specific documented case (seed=2, `synthetic`) where it's the
+single-holdout method that wins instead, so this isn't just a claim in a
+docstring — it's a case a future change can't silently paper over.
+
+**Honest takeaway:** rolling-origin CV is not a strict upgrade over v0.5's
+single holdout — on a calibration set already large enough to support a
+decent single holdout (`synthetic`, `temperature`), it's a coin flip at
+best. Its actual value shows up specifically on small calibration sets
+(`airline`-scale), where a single holdout slice is itself a high-variance
+estimate and averaging over several folds measurably helps, even though
+neither method gets near the oracle there — that gap is the structural
+problem "Automatic window selection" already documented, and this feature
+doesn't claim to have closed it.
+
 ## Architecture
 
 ```
@@ -464,11 +572,14 @@ forecasting/
                  # SlidingWindowAdaptiveConformalForecaster (sliding/growing-pool ACI) +
                  # evaluate_adaptive_coverage
   experiment.py  # wires the above together end-to-end for a given dataset,
-                 # including run_window_sweep_comparison (window tuning) and
-                 # run_auto_window_selection (automatic window selection)
+                 # including run_window_sweep_comparison (window tuning),
+                 # run_auto_window_selection (automatic window selection, v0.5),
+                 # and run_cv_window_selection + _make_rolling_folds
+                 # (rolling-origin cross-validated selection, v0.6)
   cli.py         # `python -m forecasting.cli benchmark [...]` /
-                 # `sliding-window [...]` / `window-sweep [...]` / `auto-window [...]`
-tests/           # 72 tests, including the coverage-tracking statistical checks above
+                 # `sliding-window [...]` / `window-sweep [...]` /
+                 # `auto-window [...]` / `cv-window-select [...]`
+tests/           # 87 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -477,13 +588,14 @@ results/         # generated plots (checked in so the README renders without rer
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                                    # 72 tests
+python -m pytest                                    # 87 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
 python -m forecasting.cli sliding-window --dataset airline --plot results/airline_sliding_window.png  # + sliding-pool ACI
 python -m forecasting.cli window-sweep --dataset airline --windows 5,7,10,15,20,30,50,unbounded --plot results/airline_window_sweep.png
 python -m forecasting.cli auto-window --dataset synthetic --candidates 5,7,10,15,20,30,50,unbounded --plot results/synthetic_auto_window.png
+python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --plot results/airline_cv_window_select.png
 ```
 
 ## What's next
@@ -499,12 +611,13 @@ python -m forecasting.cli auto-window --dataset synthetic --candidates 5,7,10,15
   scale.
 - A minimal FastAPI serving layer exposing `/forecast` with both the point
   prediction and the calibrated interval.
-- A window-selection method that doesn't rely purely on a calibration-period
-  holdout — "Automatic window selection" above found this approach is
-  structurally blind on a dataset (airline) whose whole problem is a
-  calibration-to-test shift; something like nested/rolling-origin
-  cross-validation across the calibration period itself (rather than one
-  fixed split) might carry more signal without touching the test set.
+- "Rolling-origin cross-validated window selection" above found CV helps
+  specifically when the calibration set is small (`airline`-scale) — a
+  natural follow-up is making `n_folds`/`min_initial_frac`/`min_fold_frac`
+  themselves adapt to `n_cal` automatically (right now they're fixed
+  defaults a caller can override, not chosen from the data), or trying a
+  *sliding* (not just expanding) fold scheme so later folds don't carry
+  early, possibly-stale calibration residuals forever.
 - Extend the window sweep's multi-seed check to `gamma` too (this run only
   tuned `window`, holding `gamma=0.05` fixed throughout — the two
   hyperparameters likely interact).

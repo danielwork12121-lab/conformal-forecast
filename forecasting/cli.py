@@ -40,15 +40,24 @@ holdout-based choice actually generalized:
     python -m forecasting.cli auto-window --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --plot results/airline_auto_window.png
 
 Select `window` via rolling-origin cross-validation instead of a single
-holdout slice: the calibration set is split into several expanding-window
-folds (fold k's "seed" is every calibration residual before it, its
-"validation chunk" is the next slice), each candidate window is scored by
-the MEAN of |coverage gap| across every fold (not just one slice), and the
+holdout slice: the calibration set is split into several folds (fold k's
+"validation chunk" is a slice of the calibration set; its "seed" is the
+residuals feeding the conformal pool before that chunk -- see
+`--fold-scheme` below), each candidate window is scored by the MEAN of
+|coverage gap| across every fold (not just one slice), and the
 smallest-mean-|gap| window is selected -- then, as with `auto-window`, the
 real test-set gap for every candidate is reported as an honest post-hoc
 check:
 
     python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --plot results/airline_cv_window_select.png
+
+`--fold-scheme` controls how much calibration history feeds each fold's
+seed: 'expanding' (default) grows it from the very start of the calibration
+set every fold; 'sliding' caps it at the most recent `--min-initial-frac`
+residuals, so later folds don't carry arbitrarily old residuals forever --
+see the README for an honest multi-seed comparison of the two:
+
+    python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --fold-scheme sliding --plot results/airline_cv_window_select_sliding.png
 """
 from __future__ import annotations
 
@@ -257,7 +266,8 @@ def _plot_cv_window_selection(dataset: str, result, path: str) -> None:
     ax.set_xlabel("window (max residual-pool size)")
     ax.set_ylabel("coverage gap (pp; fold column is |gap|, test column is signed)")
     ax.set_title(
-        f"{dataset}: rolling-origin CV window selection ({result.n_folds} folds) vs. real test-set outcome\n"
+        f"{dataset}: rolling-origin CV window selection ({result.fold_scheme}, {result.n_folds} folds) "
+        f"vs. real test-set outcome\n"
         f"selected window={labels[selected_idx]}, real test-set gap "
         f"{result.selected_test_result['coverage_gap'] * 100:+.1f}pp",
         fontsize=10,
@@ -362,6 +372,14 @@ def main() -> None:
     cv.add_argument("--n-folds", type=int, default=4, help="requested number of rolling-origin folds (may be fewer if the calibration set is small)")
     cv.add_argument("--min-initial-frac", type=float, default=0.2, help="fraction of the calibration set reserved as the first fold's seed")
     cv.add_argument("--min-fold-frac", type=float, default=0.1, help="minimum fraction of the calibration set each fold's validation chunk must have")
+    cv.add_argument(
+        "--fold-scheme",
+        choices=["expanding", "sliding"],
+        default="expanding",
+        help="'expanding' (default): every fold's seed grows from the start of the calibration set. "
+        "'sliding': each fold's seed is capped at the most recent min-initial-frac residuals, so later "
+        "folds don't carry arbitrarily old residuals forever",
+    )
     cv.add_argument("--plot", type=str, default=None, help="save a plot comparing mean fold |gap| vs. real test-set gap by window")
     cv.add_argument("--seed", type=int, default=0)
 
@@ -429,6 +447,7 @@ def main() -> None:
             n_folds=args.n_folds,
             min_initial_frac=args.min_initial_frac,
             min_fold_frac=args.min_fold_frac,
+            fold_scheme=args.fold_scheme,
             seed=args.seed,
         )
         print(format_cv_window_selection(result))

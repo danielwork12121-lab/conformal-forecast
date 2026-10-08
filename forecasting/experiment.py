@@ -685,6 +685,39 @@ def _make_rolling_folds(n: int, n_folds: int, min_initial: int, min_fold_size: i
     return folds
 
 
+def _fold_seed_start(train_end: int, min_initial: int, fold_scheme: str) -> int:
+    """How much calibration history feeds each fold's conformal-pool seed.
+
+    This is deliberately separate from `_make_rolling_folds`, which only
+    decides the (train_end, test_end) validation partition -- that
+    partition is identical under both schemes below. This function decides
+    where each fold's *seed* residuals start, which is the only thing that
+    differs between them:
+
+    - 'expanding' (v0.6's original behavior, still the default): every
+      fold's seed is `cal_residuals[0:train_end]` -- it only grows, never
+      drops old residuals, so later folds carry every residual since the
+      very start of the calibration set forever.
+    - 'sliding': every fold's seed is capped at the most recent
+      `min_initial` residuals before its own validation chunk
+      (`cal_residuals[max(0, train_end - min_initial):train_end]`) -- later
+      folds stop carrying arbitrarily old, possibly-stale residuals, at the
+      cost of a smaller (and for the early folds, identical) seed than
+      'expanding' gets. This is the README's own "What's next" follow-up
+      from v0.6: "trying a *sliding* (not just expanding) fold scheme so
+      later folds don't carry early, possibly-stale calibration residuals
+      forever."
+
+    Whether 'sliding' actually selects better windows than 'expanding' is
+    measured, not assumed -- see the README's multi-seed comparison.
+    """
+    if fold_scheme == "expanding":
+        return 0
+    if fold_scheme == "sliding":
+        return max(0, train_end - min_initial)
+    raise ValueError("fold_scheme must be 'expanding' or 'sliding'")
+
+
 @dataclass
 class CVWindowCandidate:
     window: int | None  # None = unbounded growing buffer
@@ -699,6 +732,7 @@ class CVWindowSelectionResult:
     dataset: str
     alpha: float
     gamma: float
+    fold_scheme: str  # 'expanding' (v0.6 default) or 'sliding' (v0.7) -- see _fold_seed_start
     n_folds: int  # actually achieved; may be less than requested, see _make_rolling_folds
     fold_bounds: list[tuple[int, int]]  # (train_end, test_end) indices into the calibration set
     candidates: list[CVWindowCandidate]  # one per candidate window, in the order given
@@ -717,6 +751,7 @@ def run_cv_window_selection(
     n_folds: int = 4,
     min_initial_frac: float = 0.2,
     min_fold_frac: float = 0.1,
+    fold_scheme: str = "expanding",
     lookback: int | None = None,
     period: int | None = None,
     seed: int = 0,
@@ -728,11 +763,18 @@ def run_cv_window_selection(
     Method: the LSTM is trained once, on X_train only (identical discipline
     to `run_auto_window_selection` -- selection must never see X_test, and
     the model doesn't depend on calibration data at all). The calibration
-    residuals are split into expanding-window folds via
-    `_make_rolling_folds`. For each candidate window, the sliding-pool ACI
-    forecaster is seeded with each fold's "seed" residuals and run
-    sequentially over that fold's validation chunk, scored by |coverage
-    gap| there. The per-window score is the MEAN of |gap| across folds --
+    set is partitioned into folds via `_make_rolling_folds` (this
+    partition -- which indices are each fold's validation chunk -- is the
+    same regardless of `fold_scheme`). What differs by `fold_scheme` is how
+    much calibration history feeds each fold's seed residuals, decided by
+    `_fold_seed_start`: 'expanding' (the default, v0.6's original behavior)
+    seeds every fold from the very start of the calibration set; 'sliding'
+    (v0.7) caps each fold's seed at the most recent `min_initial` residuals
+    before its own validation chunk, so later folds don't carry arbitrarily
+    old residuals forever. For each candidate window, the sliding-pool ACI
+    forecaster is seeded accordingly and run sequentially over that fold's
+    validation chunk, scored by |coverage gap| there. The per-window score
+    is the MEAN of |gap| across folds --
     not the mean of signed gap, so a window that swings over-covered on one
     fold and under-covered on another doesn't look artificially
     well-calibrated on average; it has to be *consistently* close to
@@ -756,6 +798,8 @@ def run_cv_window_selection(
         raise ValueError("n_folds must be a positive integer")
     if not (0.0 < min_initial_frac < 1.0) or not (0.0 < min_fold_frac < 1.0):
         raise ValueError("min_initial_frac and min_fold_frac must be in (0, 1)")
+    if fold_scheme not in ("expanding", "sliding"):
+        raise ValueError("fold_scheme must be 'expanding' or 'sliding'")
 
     n_cal = len(X_cal)
     min_initial = max(5, round(n_cal * min_initial_frac))
@@ -780,7 +824,8 @@ def run_cv_window_selection(
         abs_gaps, signed_gaps, widths = [], [], []
         for train_end, test_end in fold_bounds:
             forecaster = SlidingWindowAdaptiveConformalForecaster(base_model, alpha=alpha, gamma=gamma, window=window)
-            forecaster._residuals = cal_residuals[:train_end]
+            seed_start = _fold_seed_start(train_end, min_initial, fold_scheme)
+            forecaster._residuals = cal_residuals[seed_start:train_end]
             X_fold, y_fold = X_cal[train_end:test_end], y_cal[train_end:test_end]
             pred = forecaster.predict_sequential(X_fold, y_fold.reshape(-1))
             result = evaluate_adaptive_coverage(pred, y_fold)
@@ -818,6 +863,7 @@ def run_cv_window_selection(
         dataset=dataset,
         alpha=alpha,
         gamma=gamma,
+        fold_scheme=fold_scheme,
         n_folds=len(fold_bounds),
         fold_bounds=fold_bounds,
         candidates=candidates,
@@ -836,7 +882,7 @@ def format_cv_window_selection(result: CVWindowSelectionResult) -> str:
     lines = [
         f"### {result.dataset}: rolling-origin CV window selection "
         f"(LSTM (delta), nominal {nominal_pct}%, gamma={result.gamma}, "
-        f"n_folds={result.n_folds}, folds={fold_desc})",
+        f"fold_scheme={result.fold_scheme}, n_folds={result.n_folds}, folds={fold_desc})",
         "",
         "| Window | Mean &#124;fold gap&#124; (used to select) | Mean fold gap (signed) | Real test gap (post-hoc check) |",
         "|---|---|---|---|",

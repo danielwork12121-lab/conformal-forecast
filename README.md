@@ -560,6 +560,87 @@ neither method gets near the oracle there — that gap is the structural
 problem "Automatic window selection" already documented, and this feature
 doesn't claim to have closed it.
 
+## Sliding vs. expanding fold scheme: does capping fold history help?
+
+The CV section above folds the calibration set with an **expanding**
+seed by default: fold *k*'s seed residuals are everything since the very
+start of the calibration set, so later folds carry more and more history
+forever. The "What's next" note in v0.6 flagged the obvious follow-up
+question — does a **sliding** seed (capped at the most recent
+`min_initial_frac * n_cal` residuals, so later folds drop old residuals
+instead of accumulating them) select better windows? `--fold-scheme
+{expanding,sliding}` on `cv-window-select` makes this an actual, measured
+comparison rather than a guess.
+
+**Measured across 6 seeds × all 3 datasets (same seeds/candidates as the CV
+comparison above), the honest result is — again — mixed, and not in the
+direction the motivating hypothesis would predict:**
+
+| Dataset | Mean &#124;test gap&#124;, expanding | Mean &#124;test gap&#124;, sliding | Sliding wins / loses / ties (of 6 seeds) |
+|---|---|---|---|
+| `airline` (n_cal=28) | **8.3pp** | 8.9pp | 1 / 3 / 2 |
+| `synthetic` (n_cal=160) | 1.1pp | **0.8pp** | 2 / 0 / 4 |
+| `temperature` (n_cal=730) | 0.1pp | 0.1pp | 0 / 0 / 6 |
+
+The naive expectation going in was that capping fold history should help
+*most* on the smallest calibration set (`airline`) — that's exactly where
+"possibly-stale" residuals would seem most likely to hurt. The actual
+numbers say the opposite: on `airline`, sliding is slightly *worse* on
+average (8.9pp vs. 8.3pp, losing on 3 of 6 seeds and winning on only 1) —
+with only 28 calibration points, `min_initial_frac=0.2` already reserves
+just ~6 points for the first fold's seed, and capping later folds at that
+same ~6-point window instead of letting them accumulate up to ~22 points
+makes an already-tiny seed noisier, not more current. On `synthetic`
+(n_cal=160, enough room for a ~32-point capped seed that's still
+reasonably stable) sliding never loses and wins outright on 2 of 6 seeds.
+On `temperature` (n_cal=730) the two schemes are *exactly* identical on
+every seed tested — large enough that neither the first fold's seed nor
+any later one is ever actually truncated differently in a way that changes
+which window wins.
+
+Seed=3 on `airline` — the one case here where sliding *does* win, and by a
+wide margin:
+
+| `airline`, seed=3 | Selected window | Real test gap |
+|---|---|---|
+| expanding | unbounded (growing buffer) | -10.0pp |
+| sliding | 10 | **-3.3pp** |
+
+Seed=2 on `airline` — sliding's worst case, included for the same
+not-just-the-win-case reason the CV section above pins seed=2 on
+`synthetic`:
+
+| `airline`, seed=2 | Selected window | Real test gap |
+|---|---|---|
+| expanding | 7 | -16.7pp |
+| sliding | 5 | **-20.0pp** |
+
+Seed=0 on `airline` (the default seed used throughout this README) —
+included to show the two schemes don't always disagree; here they land on
+the exact same selection:
+
+![airline rolling-origin CV window selection (sliding fold scheme): mean fold gap vs. real test-set outcome](results/airline_cv_window_select_sliding.png)
+
+`tests/test_cv_window_selection.py` pins both of these specific cases
+(`test_cv_window_selection_sliding_scheme_helps_on_airline_seed_3` and
+`test_cv_window_selection_sliding_scheme_hurts_on_airline_seed_2`), plus a
+tie case on `temperature` seed=0
+(`test_cv_window_selection_fold_scheme_has_no_effect_on_temperature_seed_0`)
+— so a future change can't silently start claiming sliding is a strict
+upgrade (or a strict regression) without that claim being re-verified
+here, in either direction.
+
+**Honest takeaway:** `fold_scheme="sliding"` is not a strict upgrade over
+the `"expanding"` default, and the dataset where it helps least
+(`airline`) is specifically the one where the motivating "possibly-stale
+residuals" argument predicted it should help *most* — a useful reminder
+that an intuition about which direction a change should go is not a
+substitute for measuring it. `expanding` stays the default; `sliding` is
+there as an option, honestly documented as situational (helps when the
+capped seed is still a reasonable size relative to the calibration set,
+roughly `synthetic`-scale here, not `airline`-scale) rather than a
+recommended replacement.
+
 ## Architecture
 
 ```
@@ -574,12 +655,13 @@ forecasting/
   experiment.py  # wires the above together end-to-end for a given dataset,
                  # including run_window_sweep_comparison (window tuning),
                  # run_auto_window_selection (automatic window selection, v0.5),
-                 # and run_cv_window_selection + _make_rolling_folds
-                 # (rolling-origin cross-validated selection, v0.6)
+                 # run_cv_window_selection + _make_rolling_folds
+                 # (rolling-origin cross-validated selection, v0.6), and
+                 # _fold_seed_start (expanding vs. sliding fold scheme, v0.7)
   cli.py         # `python -m forecasting.cli benchmark [...]` /
                  # `sliding-window [...]` / `window-sweep [...]` /
-                 # `auto-window [...]` / `cv-window-select [...]`
-tests/           # 87 tests, including the coverage-tracking statistical checks above
+                 # `auto-window [...]` / `cv-window-select [... --fold-scheme]`
+tests/           # 99 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -588,7 +670,7 @@ results/         # generated plots (checked in so the README renders without rer
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                                    # 87 tests
+python -m pytest                                    # 99 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -596,6 +678,7 @@ python -m forecasting.cli sliding-window --dataset airline --plot results/airlin
 python -m forecasting.cli window-sweep --dataset airline --windows 5,7,10,15,20,30,50,unbounded --plot results/airline_window_sweep.png
 python -m forecasting.cli auto-window --dataset synthetic --candidates 5,7,10,15,20,30,50,unbounded --plot results/synthetic_auto_window.png
 python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --plot results/airline_cv_window_select.png
+python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --fold-scheme sliding --plot results/airline_cv_window_select_sliding.png
 ```
 
 ## What's next
@@ -615,9 +698,10 @@ python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10
   specifically when the calibration set is small (`airline`-scale) — a
   natural follow-up is making `n_folds`/`min_initial_frac`/`min_fold_frac`
   themselves adapt to `n_cal` automatically (right now they're fixed
-  defaults a caller can override, not chosen from the data), or trying a
-  *sliding* (not just expanding) fold scheme so later folds don't carry
-  early, possibly-stale calibration residuals forever.
+  defaults a caller can override, not chosen from the data). ("Sliding vs.
+  expanding fold scheme" above already answered the other half of that
+  v0.6 note — measured, not assumed, and the answer was "it depends on
+  calibration-set size, and not in the direction you'd guess.")
 - Extend the window sweep's multi-seed check to `gamma` too (this run only
   tuned `window`, holding `gamma=0.05` fixed throughout — the two
   hyperparameters likely interact).

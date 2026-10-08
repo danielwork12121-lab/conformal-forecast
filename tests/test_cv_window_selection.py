@@ -1,5 +1,6 @@
 """Tests for rolling-origin cross-validated window selection (v0.6) --
-`_make_rolling_folds` / `run_cv_window_selection` in `forecasting/experiment.py`.
+`_make_rolling_folds` / `run_cv_window_selection` in `forecasting/experiment.py`
+-- and its `fold_scheme` option (v0.7) -- `_fold_seed_start`.
 
 Same two-layer split as `test_auto_window_selection.py`:
 
@@ -19,6 +20,7 @@ from __future__ import annotations
 import pytest
 
 from forecasting.experiment import (
+    _fold_seed_start,
     _make_rolling_folds,
     _select_best_window,
     run_auto_window_selection,
@@ -77,6 +79,47 @@ def test_make_rolling_folds_invalid_args_raise():
         _make_rolling_folds(n=20, n_folds=2, min_initial=0, min_fold_size=5)
     with pytest.raises(ValueError):
         _make_rolling_folds(n=20, n_folds=2, min_initial=5, min_fold_size=0)
+
+
+# ---------------------------------------------------------------------------
+# Layer 1b: `_fold_seed_start` (v0.7) -- pure, no model/data dependency,
+# same testing split as `_make_rolling_folds` above. This decides how much
+# calibration history feeds each fold's seed; `_make_rolling_folds` itself
+# is unchanged by `fold_scheme` -- the (train_end, test_end) validation
+# partition is identical either way, only the seed start differs.
+# ---------------------------------------------------------------------------
+
+
+def test_fold_seed_start_expanding_is_always_zero():
+    for train_end in [10, 20, 55, 100]:
+        assert _fold_seed_start(train_end, min_initial=15, fold_scheme="expanding") == 0
+
+
+def test_fold_seed_start_sliding_caps_at_min_initial():
+    assert _fold_seed_start(100, min_initial=20, fold_scheme="sliding") == 80
+    assert _fold_seed_start(45, min_initial=20, fold_scheme="sliding") == 25
+
+
+def test_fold_seed_start_sliding_never_goes_negative_on_the_first_fold():
+    # The very first fold's seed is exactly [0, min_initial) under both
+    # schemes -- 'sliding' only starts dropping history once there's more
+    # than min_initial residuals behind the fold.
+    assert _fold_seed_start(15, min_initial=15, fold_scheme="sliding") == 0
+    assert _fold_seed_start(10, min_initial=15, fold_scheme="sliding") == 0
+
+
+def test_fold_seed_start_sliding_window_size_is_constant_after_the_first_fold():
+    # Once train_end exceeds min_initial, the sliding seed window's *size*
+    # (train_end - seed_start) stays pinned at min_initial rather than
+    # growing -- that's the whole point of 'sliding' vs. 'expanding'.
+    for train_end in [20, 45, 70, 100]:
+        seed_start = _fold_seed_start(train_end, min_initial=20, fold_scheme="sliding")
+        assert train_end - seed_start == 20
+
+
+def test_fold_seed_start_invalid_scheme_raises():
+    with pytest.raises(ValueError):
+        _fold_seed_start(50, min_initial=10, fold_scheme="bogus")
 
 
 # ---------------------------------------------------------------------------
@@ -178,3 +221,87 @@ def test_cv_window_selection_does_not_uniformly_beat_single_holdout():
         "passes with CV doing *better* or equal, the README's honest-mixed-results claim needs "
         "updating to match, not this test loosened to hide the change"
     )
+
+
+# ---------------------------------------------------------------------------
+# Layer 2b: `fold_scheme` (v0.7) -- real-data integration tests for the
+# 'expanding' vs. 'sliding' seed-window comparison. Same "measure, don't
+# assert" discipline as the layer-2 tests above: the honest, 6-seed x
+# 3-dataset result (see the README's own "Sliding vs. expanding fold
+# scheme" section) is mixed, so these pin the specific win/loss/tie cases
+# that were actually measured, not a blanket claim either direction.
+# ---------------------------------------------------------------------------
+
+
+def test_cv_window_selection_default_fold_scheme_is_expanding():
+    result = run_cv_window_selection("temperature", windows=[10, 30, None], seed=0)
+    assert result.fold_scheme == "expanding"
+
+
+def test_cv_window_selection_reports_the_requested_fold_scheme():
+    result = run_cv_window_selection("synthetic", windows=[10, 30], fold_scheme="sliding", seed=0)
+    assert result.fold_scheme == "sliding"
+
+
+def test_cv_window_selection_invalid_fold_scheme_raises():
+    with pytest.raises(ValueError):
+        run_cv_window_selection("temperature", windows=[5, 10], fold_scheme="bogus", seed=0)
+
+
+def test_cv_window_selection_sliding_scheme_is_deterministic_for_a_fixed_seed():
+    a = run_cv_window_selection("synthetic", windows=CANDIDATES, fold_scheme="sliding", seed=0)
+    b = run_cv_window_selection("synthetic", windows=CANDIDATES, fold_scheme="sliding", seed=0)
+    assert a.selected_window == b.selected_window
+    assert [c.mean_abs_fold_gap for c in a.candidates] == [c.mean_abs_fold_gap for c in b.candidates]
+
+
+def test_cv_window_selection_sliding_scheme_helps_on_airline_seed_3():
+    """Honest win case for `sliding`, pinned so a future change can't
+    silently claim it does better than this -- or stop doing this well --
+    without the README's own table being re-verified. See the README's
+    "Sliding vs. expanding fold scheme" section for the full 6-seed table
+    this is drawn from.
+    """
+    expanding = run_cv_window_selection("airline", windows=CANDIDATES, fold_scheme="expanding", seed=3)
+    sliding = run_cv_window_selection("airline", windows=CANDIDATES, fold_scheme="sliding", seed=3)
+    expanding_gap = abs(expanding.selected_test_result["coverage_gap"])
+    sliding_gap = abs(sliding.selected_test_result["coverage_gap"])
+    assert sliding_gap < expanding_gap, (
+        f"expected this specific documented case (airline, seed=3) where sliding "
+        f"(window={sliding.selected_window}, |gap|={sliding_gap:.4f}) beats expanding "
+        f"(window={expanding.selected_window}, |gap|={expanding_gap:.4f}) -- if this no longer "
+        "holds, the README's honest comparison needs updating to match, not this test loosened"
+    )
+
+
+def test_cv_window_selection_sliding_scheme_hurts_on_airline_seed_2():
+    """Honest loss case for `sliding` -- included for the same
+    not-just-the-win-case reason `test_cv_window_selection_does_not_uniformly_beat_single_holdout`
+    pins a loss case for CV vs. single-holdout above. `sliding` is NOT a
+    strict upgrade over `expanding`, and this is one of the measured cases
+    where it's worse.
+    """
+    expanding = run_cv_window_selection("airline", windows=CANDIDATES, fold_scheme="expanding", seed=2)
+    sliding = run_cv_window_selection("airline", windows=CANDIDATES, fold_scheme="sliding", seed=2)
+    expanding_gap = abs(expanding.selected_test_result["coverage_gap"])
+    sliding_gap = abs(sliding.selected_test_result["coverage_gap"])
+    assert sliding_gap > expanding_gap, (
+        f"expected this specific documented case (airline, seed=2) where sliding "
+        f"(window={sliding.selected_window}, |gap|={sliding_gap:.4f}) does worse than expanding "
+        f"(window={expanding.selected_window}, |gap|={expanding_gap:.4f}) -- if this no longer "
+        "holds, the README's honest comparison needs updating to match, not this test loosened"
+    )
+
+
+def test_cv_window_selection_fold_scheme_has_no_effect_on_temperature_seed_0():
+    """Tie case: on a calibration set as large as `temperature`'s
+    (n_cal=730), capping fold history at `min_initial_frac * n_cal` never
+    actually truncates a fold's seed differently in a way that changes
+    which window wins -- both schemes land on the exact same selection and
+    gap. Measured across all 6 README seeds, not just this one; seed=0
+    pinned here as the representative, reproducible case.
+    """
+    expanding = run_cv_window_selection("temperature", windows=CANDIDATES, fold_scheme="expanding", seed=0)
+    sliding = run_cv_window_selection("temperature", windows=CANDIDATES, fold_scheme="sliding", seed=0)
+    assert expanding.selected_window == sliding.selected_window
+    assert expanding.selected_test_result["coverage_gap"] == sliding.selected_test_result["coverage_gap"]

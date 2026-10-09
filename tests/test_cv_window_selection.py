@@ -1,7 +1,9 @@
 """Tests for rolling-origin cross-validated window selection (v0.6) --
 `_make_rolling_folds` / `run_cv_window_selection` in `forecasting/experiment.py`
--- its `fold_scheme` option (v0.7) -- `_fold_seed_start` -- and its
-`auto_folds` option (v0.8) -- `_auto_cv_fold_params`.
+-- its `fold_scheme` option (v0.7) -- `_fold_seed_start` -- its
+`auto_folds` option (v0.8) -- `_auto_cv_fold_params` -- and whether the two
+options compound when used together (v0.9, no new production code -- see
+the `_sliding_plus_auto_folds_` tests below).
 
 Same two-layer split as `test_auto_window_selection.py`:
 
@@ -440,4 +442,69 @@ def test_cv_window_selection_auto_folds_does_not_lose_on_airline_seed_1():
     assert auto_gap <= fixed_gap, (
         f"expected auto_folds (|gap|={auto_gap:.4f}) to not do worse than the fixed default "
         f"(|gap|={fixed_gap:.4f}) on this documented case (airline, seed=1)"
+    )
+
+
+def test_cv_window_selection_sliding_plus_auto_folds_loses_to_auto_alone_on_synthetic_seed_2():
+    """v0.9: does combining `fold_scheme='sliding'` (v0.7) with
+    `auto_folds=True` (v0.8) compound -- i.e. do better than `auto_folds`
+    alone, since both are independently non-losing/improving options?
+    Measured across the same 6 seeds x 3 datasets as every other
+    comparison in this README, the honest answer is no: on `synthetic`
+    specifically, adding `sliding` on top of `auto_folds` makes things
+    measurably *worse* on 4 of 6 seeds (mean |gap| 0.42pp -> 1.04pp), with
+    this seed=2 case as the clearest single instance. See the README's "Do
+    fold_scheme and auto_folds compound?" section for the full table.
+    """
+    auto_alone = run_cv_window_selection("synthetic", windows=CANDIDATES, auto_folds=True, seed=2)
+    compound = run_cv_window_selection(
+        "synthetic", windows=CANDIDATES, fold_scheme="sliding", auto_folds=True, seed=2
+    )
+    auto_alone_gap = abs(auto_alone.selected_test_result["coverage_gap"])
+    compound_gap = abs(compound.selected_test_result["coverage_gap"])
+    assert compound_gap > auto_alone_gap, (
+        f"expected this specific documented case (synthetic, seed=2) where adding "
+        f"fold_scheme='sliding' on top of auto_folds (window={compound.selected_window}, "
+        f"|gap|={compound_gap:.4f}) does WORSE than auto_folds alone (window={auto_alone.selected_window}, "
+        f"|gap|={auto_alone_gap:.4f}) -- if this no longer holds, the README's honest comparison "
+        "needs updating to match, not this test loosened"
+    )
+
+
+def test_cv_window_selection_sliding_plus_auto_folds_loses_to_auto_alone_on_airline_seed_4():
+    """Second loss case for the compound combination, on the smallest
+    dataset this time -- included for the same not-just-one-case reason
+    every other honest comparison in this test file pins more than a
+    single example.
+    """
+    auto_alone = run_cv_window_selection("airline", windows=CANDIDATES, auto_folds=True, seed=4)
+    compound = run_cv_window_selection(
+        "airline", windows=CANDIDATES, fold_scheme="sliding", auto_folds=True, seed=4
+    )
+    auto_alone_gap = abs(auto_alone.selected_test_result["coverage_gap"])
+    compound_gap = abs(compound.selected_test_result["coverage_gap"])
+    assert compound_gap > auto_alone_gap, (
+        f"expected this documented case (airline, seed=4) where the compound combination "
+        f"(window={compound.selected_window}, |gap|={compound_gap:.4f}) does worse than auto_folds "
+        f"alone (window={auto_alone.selected_window}, |gap|={auto_alone_gap:.4f})"
+    )
+
+
+def test_cv_window_selection_sliding_plus_auto_folds_matches_auto_alone_on_temperature_seed_0():
+    """On `temperature` -- the largest calibration set, where `auto_folds`
+    alone already ties the fixed default -- the compound combination also
+    ties `auto_folds` alone on every one of the 6 seeds measured. Included
+    so the compound finding isn't read as "always hurts": on this dataset
+    it's simply orthogonal, same as `fold_scheme` was on its own (see the
+    "Sliding vs. expanding fold scheme" section above).
+    """
+    auto_alone = run_cv_window_selection("temperature", windows=CANDIDATES, auto_folds=True, seed=0)
+    compound = run_cv_window_selection(
+        "temperature", windows=CANDIDATES, fold_scheme="sliding", auto_folds=True, seed=0
+    )
+    auto_alone_gap = abs(auto_alone.selected_test_result["coverage_gap"])
+    compound_gap = abs(compound.selected_test_result["coverage_gap"])
+    assert compound_gap == pytest.approx(auto_alone_gap, abs=1e-9), (
+        f"expected the compound combination (|gap|={compound_gap:.4f}) to tie auto_folds alone "
+        f"(|gap|={auto_alone_gap:.4f}) on this documented case (temperature, seed=0)"
     )

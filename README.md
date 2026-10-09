@@ -659,8 +659,8 @@ upfront, letting `_make_rolling_folds`'s existing capping logic bring that
 down to whatever a given dataset can actually support — so a bigger
 calibration set naturally gets more folds, not just the same 4, bigger.
 
-**Measured across the same 6 seeds × 3 datasets as the sections above,
-comparing `auto_folds=True` against the v0.6/v0.7 fixed defaults
+**Originally measured across 6 seeds × 3 datasets, comparing
+`auto_folds=True` against the v0.6/v0.7 fixed defaults
 (`fold_scheme="expanding"` throughout — orthogonal to that question):**
 
 | Dataset | n_folds, fixed | n_folds, auto | Mean &#124;test gap&#124;, fixed | Mean &#124;test gap&#124;, auto | Auto wins/loses/ties (of 6) |
@@ -669,13 +669,54 @@ comparing `auto_folds=True` against the v0.6/v0.7 fixed defaults
 | `synthetic` (n_cal=160) | 4 | 15 | 1.1pp | **0.4pp** | 5 / 0 / 1 |
 | `temperature` (n_cal=730) | 4 | 15 | 0.1pp | 0.1pp | 0 / 0 / 6 |
 
-Unlike the fold-*scheme* comparison above, this one is **not mixed** —
-across all 18 seed/dataset combinations actually measured, `auto_folds`
-never did worse than the fixed default, and on `synthetic` specifically it
-cuts the mean |gap| to roughly a third (1.1pp → 0.4pp), winning outright on
-5 of 6 seeds. (This is a report of what was measured, 18 data points, not a
-proof that `auto_folds` can never lose on data not tested here — the same
-caveat every other honest comparison in this README carries.)
+Across those 18 combinations, `auto_folds` never did worse than the fixed
+default. That table's own caveat (6 data points per dataset isn't a proof
+it can never lose) turned out to matter: see the next section.
+
+### v0.10: does "never lost" hold up with more seeds? (Not quite.)
+
+The 6-seed table above was flagged in this README's own "What's next" as
+narrower than "always helps," with the explicit follow-up being more seeds
+before considering flipping the default. **Re-run across 20 seeds (0–19) ×
+3 datasets, same candidate windows, same fixed-default baseline:**
+
+| Dataset | Mean &#124;test gap&#124;, fixed | Mean &#124;test gap&#124;, auto | Auto wins/loses/ties (of 20) |
+|---|---|---|---|
+| `airline` (n_cal=28) | 6.83pp | **6.17pp** | 4 / **1** / 15 |
+| `synthetic` (n_cal=160) | 1.09pp | **0.50pp** | 13 / **2** / 5 |
+| `temperature` (n_cal=730) | 0.13pp | **0.11pp** | 3 / 0 / 17 |
+
+**It's no longer a clean "never loses."** With 14 more seeds per dataset,
+3 genuine losses for `auto_folds` showed up that the original 6 seeds
+happened not to catch: `airline` seed=16 (fixed picks window=15 for an
+exact 0.0pp test gap; auto picks window=10 for +3.3pp — a real, if small,
+loss) and `synthetic` seeds 6 and 11 (both: fixed picks window=50 for an
+exact 0.0pp gap; auto picks window=30 for +0.6pp). All three losses are
+small in absolute terms and `auto_folds` still has a clearly better mean
+and a much better win/loss ratio on every dataset — this isn't a reversal
+of the earlier finding, just a correction of its strongest claim. The mean
+improvement and the directional pattern (bigger win on `synthetic`, a wash
+of small wins and one small loss on `airline`, a marginal no-op-leaning-
+positive on `temperature`) both hold up under 20 seeds; "never loses" does
+not.
+
+`tests/test_cv_window_selection.py` pins all three new loss cases
+(`test_cv_window_selection_auto_folds_loses_on_airline_seed_16`,
+`test_cv_window_selection_auto_folds_loses_on_synthetic_seed_6`,
+`test_cv_window_selection_auto_folds_loses_on_synthetic_seed_11`) alongside
+the original win/no-lose cases from the 6-seed table (which still hold —
+seed 1 and seed 2 weren't among the seeds that turned up a loss), so the
+full honest picture — wins, the one loss, and the earlier no-lose case —
+is all regression-tested together, not just the flattering half.
+
+![airline rolling-origin CV window selection (auto-folds), seed=16: the one documented loss case](results/airline_cv_window_select_auto_seed16.png)
+
+**Decision this answers:** the v0.8 README speculated "a future run could
+reasonably flip the default once more data points accumulate." With actual
+documented losses now in hand (not just a smaller sample failing to find
+any), the honest call is to **leave `auto_folds` defaulting to `False`**
+— it's a good opt-in recommendation backed by 60 measurements across 3
+datasets, not a safe new default that never regresses.
 
 Seed=0 on `temperature`, with `auto_folds=True` requesting (and getting)
 15 folds instead of 4 — note the fold-averaged metric actually
@@ -703,12 +744,16 @@ and a no-worse-than-fixed case on `airline` seed=1
 a future change can't silently weaken this result without the test suite
 catching it.
 
-**Honest takeaway:** unlike `fold_scheme`, `auto_folds` *is* a clear
-improvement over the v0.6/v0.7 fixed defaults on every dataset measured
-here — it's `False` by default only because changing a default is a
-bigger decision than adding an opt-in flag backed by one afternoon's worth
-of 18 measurements, not because the result is actually mixed. A future
-run could reasonably flip the default once more data points accumulate.
+**Honest takeaway (updated by the 20-seed re-check above):** `auto_folds`
+is a reliable *improvement on average* over the v0.6/v0.7 fixed defaults
+— a clearly better mean |gap| and a lopsided win/loss ratio on every
+dataset measured — but it is not a strict, never-lose upgrade; 3 small
+losses out of 60 seed/dataset measurements say so plainly. `False` stays
+the default: not as a placeholder pending more data (that was the original
+framing, from 18 measurements that hadn't yet found a loss), but as the
+actual right call now that a larger sample has one. Opt in with
+`--auto-folds` when you want the better average; don't expect it to never
+regress.
 
 ## Do `fold_scheme` and `auto_folds` compound?
 
@@ -836,13 +881,14 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
 - Extend the window sweep's multi-seed check to `gamma` too (this run only
   tuned `window`, holding `gamma=0.05` fixed throughout — the two
   hyperparameters likely interact).
-- "Automatic fold count" above found `auto_folds` never did worse than the
-  v0.6/v0.7 fixed defaults across every seed/dataset tried — a natural
-  follow-up is whether that holds up with more seeds and candidate windows
-  before actually flipping the default to `True`. (The other half of this
-  question — whether combining it with `fold_scheme="sliding"` helps
-  further — is now answered above: it doesn't, so `auto_folds` alone
-  remains the recommended configuration.)
+- Both open questions from the "Automatic fold count" section are now
+  answered: whether `auto_folds` holds up with more seeds before flipping
+  the default (re-checked at 20 seeds — it doesn't hold up as a strict
+  "never loses," so the default stays `False`), and whether combining it
+  with `fold_scheme="sliding"` helps further (it doesn't, see above). The
+  natural remaining follow-up in this vein would be checking whether
+  candidate window choice (`--candidates`) itself needs a similar
+  seed-robustness re-check, or moving on to one of the items below.
 
 ## License
 

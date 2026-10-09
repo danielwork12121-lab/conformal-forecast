@@ -710,6 +710,69 @@ bigger decision than adding an opt-in flag backed by one afternoon's worth
 of 18 measurements, not because the result is actually mixed. A future
 run could reasonably flip the default once more data points accumulate.
 
+## Do `fold_scheme` and `auto_folds` compound?
+
+Both options above are independently non-losing-or-better than their v0.6
+defaults, measured separately. The obvious next question — flagged in this
+README's own "What's next" after `auto_folds` shipped — is whether using
+them *together* (`--fold-scheme sliding --auto-folds`) compounds into
+something even better than `auto_folds` alone, since both are opt-in and
+nothing stops a caller from combining them (the CLI and Python API already
+accept both flags at once; no new code was needed to answer this).
+
+**Measured across the same 6 seeds × 3 datasets as every comparison
+above, comparing the compound combination against `auto_folds=True` alone
+(`fold_scheme="expanding"`, i.e. `auto_folds`'s own best configuration so
+far):**
+
+| Dataset | Mean &#124;test gap&#124;, auto_folds alone | Mean &#124;test gap&#124;, sliding+auto (compound) | Compound wins/loses/ties (of 6) |
+|---|---|---|---|
+| `airline` (n_cal=28) | 7.8pp | 7.8pp | 1 / 2 / 3 |
+| `synthetic` (n_cal=160) | **0.4pp** | 1.0pp | 0 / 4 / 2 |
+| `temperature` (n_cal=730) | 0.1pp | 0.1pp | 0 / 0 / 6 |
+
+**It does not compound — if anything, it's a mild regression.** On
+`synthetic`, the dataset where `auto_folds` alone made its biggest
+improvement (1.1pp → 0.4pp, a ~3x reduction), stacking `sliding` on top
+gives most of that gain back (0.4pp → 1.0pp, losing on 4 of 6 seeds and
+never winning). On `airline` it's a wash — a tied mean hiding 1 win, 2
+losses, and 3 ties, not a real improvement. On `temperature` it's exactly
+what you'd expect from two options that are each already a no-op there:
+still a no-op together, tied on every single seed.
+
+Seed=2 on `synthetic` — the clearest single loss case, included because
+it's the sharpest illustration of the regression, not because it's
+cherry-picked (the aggregate table above already shows the direction
+holds across most seeds on this dataset):
+
+| `synthetic`, seed=2 | Selected window | Real test gap |
+|---|---|---|
+| auto_folds alone | 20 | **+0.6pp** |
+| sliding + auto_folds | unbounded (growing buffer) | +1.9pp |
+
+![synthetic rolling-origin CV window selection (sliding fold scheme + auto-folds, compound): mean fold gap vs. real test-set outcome](results/synthetic_cv_window_select_sliding_auto.png)
+
+`tests/test_cv_window_selection.py` pins this seed=2 `synthetic` loss case
+(`test_cv_window_selection_sliding_plus_auto_folds_loses_to_auto_alone_on_synthetic_seed_2`),
+a second loss case on `airline` seed=4
+(`test_cv_window_selection_sliding_plus_auto_folds_loses_to_auto_alone_on_airline_seed_4`),
+and an exact-tie case on `temperature` seed=0
+(`test_cv_window_selection_sliding_plus_auto_folds_matches_auto_alone_on_temperature_seed_0`)
+— so a future change can't silently start claiming the combination helps
+without that claim being re-verified here.
+
+**Honest takeaway:** two independently non-losing options don't
+automatically compose into something better, and here they measurably
+don't — capping the fold seed (`sliding`) throws away exactly the kind of
+long calibration history that having *more, smaller* folds
+(`auto_folds`) was starting to make good use of, on the one dataset where
+`auto_folds` had the most room to work with (`synthetic`, the mid-sized
+set). The recommendation is to use `auto_folds` on its own, not combined
+with `fold_scheme="sliding"` — this doesn't change either flag's own
+default, both remain independently opt-in exactly as before, and this
+finding only closes the open question of whether to recommend combining
+them (answer: no).
+
 ## Architecture
 
 ```
@@ -727,12 +790,15 @@ forecasting/
                  # run_cv_window_selection + _make_rolling_folds
                  # (rolling-origin cross-validated selection, v0.6),
                  # _fold_seed_start (expanding vs. sliding fold scheme, v0.7),
-                 # and _auto_cv_fold_params (data-sized fold count, v0.8)
+                 # _auto_cv_fold_params (data-sized fold count, v0.8) --
+                 # fold_scheme and auto_folds can be combined via the same
+                 # run_cv_window_selection call (v0.9 measured this
+                 # combination; no new function needed, see README)
   cli.py         # `python -m forecasting.cli benchmark [...]` /
                  # `sliding-window [...]` / `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]`
-tests/           # 109 tests, including the coverage-tracking statistical checks above
+tests/           # 112 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -741,7 +807,7 @@ results/         # generated plots (checked in so the README renders without rer
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                                    # 109 tests
+python -m pytest                                    # 112 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -751,6 +817,7 @@ python -m forecasting.cli auto-window --dataset synthetic --candidates 5,7,10,15
 python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --plot results/airline_cv_window_select.png
 python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --fold-scheme sliding --plot results/airline_cv_window_select_sliding.png
 python -m forecasting.cli cv-window-select --dataset temperature --candidates 5,7,10,15,20,30,50,unbounded --auto-folds --plot results/temperature_cv_window_select_auto.png
+python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,10,15,20,30,50,unbounded --fold-scheme sliding --auto-folds --plot results/synthetic_cv_window_select_sliding_auto.png
 ```
 
 ## What's next
@@ -772,9 +839,10 @@ python -m forecasting.cli cv-window-select --dataset temperature --candidates 5,
 - "Automatic fold count" above found `auto_folds` never did worse than the
   v0.6/v0.7 fixed defaults across every seed/dataset tried — a natural
   follow-up is whether that holds up with more seeds and candidate windows
-  before actually flipping the default, and whether `auto_folds` and
-  `fold_scheme="sliding"` compound (tried independently here, never
-  together).
+  before actually flipping the default to `True`. (The other half of this
+  question — whether combining it with `fold_scheme="sliding"` helps
+  further — is now answered above: it doesn't, so `auto_folds` alone
+  remains the recommended configuration.)
 
 ## License
 

@@ -1,6 +1,7 @@
 """Tests for rolling-origin cross-validated window selection (v0.6) --
 `_make_rolling_folds` / `run_cv_window_selection` in `forecasting/experiment.py`
--- and its `fold_scheme` option (v0.7) -- `_fold_seed_start`.
+-- its `fold_scheme` option (v0.7) -- `_fold_seed_start` -- and its
+`auto_folds` option (v0.8) -- `_auto_cv_fold_params`.
 
 Same two-layer split as `test_auto_window_selection.py`:
 
@@ -20,6 +21,7 @@ from __future__ import annotations
 import pytest
 
 from forecasting.experiment import (
+    _auto_cv_fold_params,
     _fold_seed_start,
     _make_rolling_folds,
     _select_best_window,
@@ -305,3 +307,137 @@ def test_cv_window_selection_fold_scheme_has_no_effect_on_temperature_seed_0():
     sliding = run_cv_window_selection("temperature", windows=CANDIDATES, fold_scheme="sliding", seed=0)
     assert expanding.selected_window == sliding.selected_window
     assert expanding.selected_test_result["coverage_gap"] == sliding.selected_test_result["coverage_gap"]
+
+
+# ---------------------------------------------------------------------------
+# Layer 1c: `_auto_cv_fold_params` (v0.8) -- pure, no model/data dependency,
+# same testing split as `_make_rolling_folds` / `_fold_seed_start` above.
+# Decides (n_folds, min_initial_frac, min_fold_frac) from n_cal instead of
+# the v0.6/v0.7 fixed defaults (4, 0.2, 0.1) applied regardless of
+# calibration-set size.
+# ---------------------------------------------------------------------------
+
+
+def test_auto_cv_fold_params_requests_max_folds_regardless_of_n_cal():
+    # The requested n_folds is deliberately a constant upper bound --
+    # _make_rolling_folds's own capping (actual_folds = min(n_folds, usable
+    # // min_fold_size)) is what adapts it down per dataset, not this
+    # function directly reducing its request for a smaller n_cal.
+    for n_cal in [10, 28, 160, 730, 5000]:
+        n_folds, _, _ = _auto_cv_fold_params(n_cal, max_folds=15)
+        assert n_folds == 15
+
+
+def test_auto_cv_fold_params_fractions_shrink_as_n_cal_grows():
+    # Larger n_cal -> smaller fractions, because the function targets
+    # roughly constant ABSOLUTE fold sizes, not a constant fraction.
+    _, mi_small, mf_small = _auto_cv_fold_params(28)
+    _, mi_mid, mf_mid = _auto_cv_fold_params(160)
+    _, mi_large, mf_large = _auto_cv_fold_params(730)
+    assert mi_small > mi_mid > mi_large
+    assert mf_small > mf_mid > mf_large
+
+
+def test_auto_cv_fold_params_targets_translate_to_absolute_point_counts():
+    # min_initial_frac * n_cal should land close to target_min_initial (and
+    # likewise for min_fold_frac/target_fold_size) whenever the 0.4/0.2 cap
+    # isn't binding -- confirms the "roughly constant absolute size" framing
+    # in the docstring is actually what the numbers do, not just a claim.
+    n_cal = 400
+    n_folds, min_initial_frac, min_fold_frac = _auto_cv_fold_params(
+        n_cal, target_min_initial=8, target_fold_size=4
+    )
+    assert abs(min_initial_frac * n_cal - 8) < 1e-6
+    assert abs(min_fold_frac * n_cal - 4) < 1e-6
+
+
+def test_auto_cv_fold_params_caps_fractions_on_a_tiny_calibration_set():
+    # Below the point where target_min_initial/target_fold_size would push
+    # the fraction past the cap, the 0.4/0.2 ceiling takes over instead of
+    # requesting an ever-larger fraction as n_cal shrinks further.
+    n_folds, min_initial_frac, min_fold_frac = _auto_cv_fold_params(5, target_min_initial=8, target_fold_size=4)
+    assert min_initial_frac == 0.4
+    assert min_fold_frac == 0.2
+
+
+# ---------------------------------------------------------------------------
+# Layer 2c: real-data integration, via run_cv_window_selection(auto_folds=True).
+# Same "measure, don't assert" discipline: the honest 6-seed x 3-dataset
+# result (see the README's "Automatic fold count" section) is that
+# auto_folds never did worse than the v0.6/v0.7 fixed defaults across the
+# 18 seed/dataset combinations actually measured, and sometimes did
+# noticeably better -- reported as measured, not claimed as a general
+# guarantee beyond what was tested.
+# ---------------------------------------------------------------------------
+
+
+def test_cv_window_selection_default_auto_folds_is_false():
+    result = run_cv_window_selection("temperature", windows=[10, 30, None], seed=0)
+    assert result.auto_folds is False
+    assert result.n_folds == 4  # the v0.6 fixed default, unchanged
+
+
+def test_cv_window_selection_auto_folds_reports_true_and_the_params_used():
+    result = run_cv_window_selection("synthetic", windows=[10, 30], auto_folds=True, seed=0)
+    assert result.auto_folds is True
+    assert result.min_initial_frac == pytest.approx(min(0.4, 8 / 160))
+    assert result.min_fold_frac == pytest.approx(min(0.2, 4 / 160))
+
+
+def test_cv_window_selection_auto_folds_achieves_more_folds_on_larger_datasets():
+    # The whole point: a larger calibration set should get MORE folds
+    # automatically, not just bigger ones at the same fixed count of 4.
+    airline = run_cv_window_selection("airline", windows=[10, 30], auto_folds=True, seed=0)
+    synthetic = run_cv_window_selection("synthetic", windows=[10, 30], auto_folds=True, seed=0)
+    temperature = run_cv_window_selection("temperature", windows=[10, 30], auto_folds=True, seed=0)
+    assert airline.n_folds > 4  # still beats the old fixed default, even on the smallest set
+    assert synthetic.n_folds > airline.n_folds
+    assert temperature.n_folds >= synthetic.n_folds
+
+
+def test_cv_window_selection_auto_folds_is_deterministic_for_a_fixed_seed():
+    a = run_cv_window_selection("synthetic", windows=CANDIDATES, auto_folds=True, seed=0)
+    b = run_cv_window_selection("synthetic", windows=CANDIDATES, auto_folds=True, seed=0)
+    assert a.selected_window == b.selected_window
+    assert a.n_folds == b.n_folds
+    assert [c.mean_abs_fold_gap for c in a.candidates] == [c.mean_abs_fold_gap for c in b.candidates]
+
+
+def test_cv_window_selection_auto_folds_beats_fixed_default_on_synthetic_seed_2():
+    """Honest win case for `auto_folds=True`, pinned the same way the
+    fold_scheme win/loss cases above are -- so a future change can't
+    silently claim it does better or stop doing this well without the
+    README's own table being re-verified. See the README's "Automatic
+    fold count" section for the full 6-seed x 3-dataset table.
+    """
+    fixed = run_cv_window_selection("synthetic", windows=CANDIDATES, auto_folds=False, seed=2)
+    auto = run_cv_window_selection("synthetic", windows=CANDIDATES, auto_folds=True, seed=2)
+    fixed_gap = abs(fixed.selected_test_result["coverage_gap"])
+    auto_gap = abs(auto.selected_test_result["coverage_gap"])
+    assert auto_gap < fixed_gap, (
+        f"expected this specific documented case (synthetic, seed=2) where auto_folds "
+        f"(n_folds={auto.n_folds}, window={auto.selected_window}, |gap|={auto_gap:.4f}) beats the "
+        f"fixed default (n_folds={fixed.n_folds}, window={fixed.selected_window}, |gap|={fixed_gap:.4f}) "
+        "-- if this no longer holds, the README's honest comparison needs updating to match, not "
+        "this test loosened"
+    )
+
+
+def test_cv_window_selection_auto_folds_does_not_lose_on_airline_seed_1():
+    """Not-just-ties/wins case: pins the specific `airline` seed=1 result
+    where auto_folds does measurably better (not just tie) even on the
+    smallest, most fold-constrained dataset -- where `fold_scheme=sliding`
+    (v0.7) was measured to be slightly *worse* on average. Across all 18
+    seed/dataset combinations measured for this README section, auto_folds
+    was never observed to do worse than the fixed default -- this is one
+    concrete instance of that, not a claim that it can never lose on data
+    not tested here.
+    """
+    fixed = run_cv_window_selection("airline", windows=CANDIDATES, auto_folds=False, seed=1)
+    auto = run_cv_window_selection("airline", windows=CANDIDATES, auto_folds=True, seed=1)
+    fixed_gap = abs(fixed.selected_test_result["coverage_gap"])
+    auto_gap = abs(auto.selected_test_result["coverage_gap"])
+    assert auto_gap <= fixed_gap, (
+        f"expected auto_folds (|gap|={auto_gap:.4f}) to not do worse than the fixed default "
+        f"(|gap|={fixed_gap:.4f}) on this documented case (airline, seed=1)"
+    )

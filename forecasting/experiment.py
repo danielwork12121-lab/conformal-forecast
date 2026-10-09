@@ -718,6 +718,53 @@ def _fold_seed_start(train_end: int, min_initial: int, fold_scheme: str) -> int:
     raise ValueError("fold_scheme must be 'expanding' or 'sliding'")
 
 
+def _auto_cv_fold_params(
+    n_cal: int,
+    target_min_initial: int = 8,
+    target_fold_size: int = 4,
+    max_folds: int = 15,
+) -> tuple[int, float, float]:
+    """Auto-select `(n_folds, min_initial_frac, min_fold_frac)` for
+    `run_cv_window_selection` as a function of `n_cal`, instead of v0.6/v0.7's
+    fixed defaults (4, 0.2, 0.1) applied the same way regardless of
+    calibration-set size -- the other half of the v0.6 "What's next" note
+    this feature follows up on (the first half, `fold_scheme`, shipped in
+    v0.7).
+
+    The v0.6 fixed defaults reserve a FRACTION of `n_cal` (20% / 10%) for
+    the first fold's seed and each fold's validation chunk. That fraction
+    is the wrong thing to hold constant: on a tiny calibration set
+    (`airline`, n_cal=28) it's barely enough points to be useful at all
+    (min_initial=6, min_fold_size=3), while on a large one (`temperature`,
+    n_cal=730) it reserves far more absolute history than any fold
+    actually needs (min_initial=146, min_fold_size=73) -- and because
+    `n_folds=4` is *also* fixed, that surplus data is never spent on more
+    folds, just bigger ones.
+
+    This instead targets roughly constant ABSOLUTE fold sizes
+    (`target_min_initial`, `target_fold_size` points) translated into the
+    fraction-based API `run_cv_window_selection` already uses, and
+    requests a generous `max_folds` upfront -- `_make_rolling_folds`'s own
+    `actual_folds = min(n_folds, usable // min_fold_size)` already caps
+    that down to whatever a given `n_cal` can actually support, so asking
+    for more folds than needed costs nothing. The practical effect: a
+    small calibration set gets a few more folds than the old fixed default
+    (its absolute floors are smaller), and a large one gets MANY more
+    (`max_folds`, capped), spending its surplus data on more folds instead
+    of leaving it unused. Whether more folds actually selects better
+    windows is measured, not assumed -- see the README's multi-seed
+    comparison.
+
+    The 0.4 / 0.2 caps on the returned fractions keep at least a little
+    room for folds to exist at all on a pathologically small `n_cal`
+    (below `_make_rolling_folds` would return `None` either way, raised by
+    `run_cv_window_selection` as today).
+    """
+    min_initial_frac = min(0.4, target_min_initial / n_cal)
+    min_fold_frac = min(0.2, target_fold_size / n_cal)
+    return max_folds, min_initial_frac, min_fold_frac
+
+
 @dataclass
 class CVWindowCandidate:
     window: int | None  # None = unbounded growing buffer
@@ -733,7 +780,10 @@ class CVWindowSelectionResult:
     alpha: float
     gamma: float
     fold_scheme: str  # 'expanding' (v0.6 default) or 'sliding' (v0.7) -- see _fold_seed_start
+    auto_folds: bool  # v0.8: if True, n_folds/min_initial_frac/min_fold_frac came from _auto_cv_fold_params(n_cal)
     n_folds: int  # actually achieved; may be less than requested, see _make_rolling_folds
+    min_initial_frac: float  # actually used (caller-given, or auto-selected if auto_folds)
+    min_fold_frac: float  # actually used (caller-given, or auto-selected if auto_folds)
     fold_bounds: list[tuple[int, int]]  # (train_end, test_end) indices into the calibration set
     candidates: list[CVWindowCandidate]  # one per candidate window, in the order given
     selected_window: int | None  # chosen using the fold columns only
@@ -752,6 +802,7 @@ def run_cv_window_selection(
     min_initial_frac: float = 0.2,
     min_fold_frac: float = 0.1,
     fold_scheme: str = "expanding",
+    auto_folds: bool = False,
     lookback: int | None = None,
     period: int | None = None,
     seed: int = 0,
@@ -788,20 +839,32 @@ def run_cv_window_selection(
     to honestly report whether this selection method's choice generalized
     -- same post-hoc-only discipline as `run_auto_window_selection`.
 
+    If `auto_folds=True` (v0.8), the `n_folds`/`min_initial_frac`/
+    `min_fold_frac` arguments above are IGNORED, and `_auto_cv_fold_params`
+    picks them from `n_cal` instead -- see that function's own docstring
+    for the heuristic and why the v0.6/v0.7 fixed defaults don't adapt to
+    calibration-set size on their own. `CVWindowSelectionResult.n_folds`/
+    `.min_initial_frac`/`.min_fold_frac` always report what was actually
+    used, whichever way it was chosen.
+
     Raises ValueError if the calibration set is too small to form even one
     fold of `min_fold_frac * n_cal` points after reserving
     `min_initial_frac * n_cal` points for the first fold's seed.
     """
     X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+    n_cal = len(X_cal)
 
-    if n_folds < 1:
-        raise ValueError("n_folds must be a positive integer")
-    if not (0.0 < min_initial_frac < 1.0) or not (0.0 < min_fold_frac < 1.0):
-        raise ValueError("min_initial_frac and min_fold_frac must be in (0, 1)")
     if fold_scheme not in ("expanding", "sliding"):
         raise ValueError("fold_scheme must be 'expanding' or 'sliding'")
 
-    n_cal = len(X_cal)
+    if auto_folds:
+        n_folds, min_initial_frac, min_fold_frac = _auto_cv_fold_params(n_cal)
+    else:
+        if n_folds < 1:
+            raise ValueError("n_folds must be a positive integer")
+        if not (0.0 < min_initial_frac < 1.0) or not (0.0 < min_fold_frac < 1.0):
+            raise ValueError("min_initial_frac and min_fold_frac must be in (0, 1)")
+
     min_initial = max(5, round(n_cal * min_initial_frac))
     min_fold_size = max(3, round(n_cal * min_fold_frac))
     fold_bounds = _make_rolling_folds(n_cal, n_folds, min_initial, min_fold_size)
@@ -864,7 +927,10 @@ def run_cv_window_selection(
         alpha=alpha,
         gamma=gamma,
         fold_scheme=fold_scheme,
+        auto_folds=auto_folds,
         n_folds=len(fold_bounds),
+        min_initial_frac=min_initial_frac,
+        min_fold_frac=min_fold_frac,
         fold_bounds=fold_bounds,
         candidates=candidates,
         selected_window=selected_window,
@@ -879,10 +945,11 @@ def format_cv_window_selection(result: CVWindowSelectionResult) -> str:
     nominal_pct = int(round((1 - result.alpha) * 100))
     s, f = result.static, result.fixed_pool
     fold_desc = ", ".join(f"[{a}:{b})" for a, b in result.fold_bounds)
+    folds_label = f"n_folds={result.n_folds} (auto)" if result.auto_folds else f"n_folds={result.n_folds}"
     lines = [
         f"### {result.dataset}: rolling-origin CV window selection "
         f"(LSTM (delta), nominal {nominal_pct}%, gamma={result.gamma}, "
-        f"fold_scheme={result.fold_scheme}, n_folds={result.n_folds}, folds={fold_desc})",
+        f"fold_scheme={result.fold_scheme}, {folds_label}, folds={fold_desc})",
         "",
         "| Window | Mean &#124;fold gap&#124; (used to select) | Mean fold gap (signed) | Real test gap (post-hoc check) |",
         "|---|---|---|---|",

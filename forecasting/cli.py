@@ -58,6 +58,14 @@ residuals, so later folds don't carry arbitrarily old residuals forever --
 see the README for an honest multi-seed comparison of the two:
 
     python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --fold-scheme sliding --plot results/airline_cv_window_select_sliding.png
+
+`--auto-folds` replaces `--n-folds`/`--min-initial-frac`/`--min-fold-frac`
+(ignored when this is set) with values chosen automatically from the
+calibration set's own size, instead of the same fixed fractions applied
+regardless of dataset -- see the README for whether more, data-sized folds
+actually select better windows:
+
+    python -m forecasting.cli cv-window-select --dataset temperature --candidates 5,7,10,15,20,30,50,unbounded --auto-folds --plot results/temperature_cv_window_select_auto.png
 """
 from __future__ import annotations
 
@@ -265,8 +273,9 @@ def _plot_cv_window_selection(dataset: str, result, path: str) -> None:
     ax.set_xticklabels(labels)
     ax.set_xlabel("window (max residual-pool size)")
     ax.set_ylabel("coverage gap (pp; fold column is |gap|, test column is signed)")
+    folds_label = f"{result.n_folds} folds, auto" if result.auto_folds else f"{result.n_folds} folds"
     ax.set_title(
-        f"{dataset}: rolling-origin CV window selection ({result.fold_scheme}, {result.n_folds} folds) "
+        f"{dataset}: rolling-origin CV window selection ({result.fold_scheme}, {folds_label}) "
         f"vs. real test-set outcome\n"
         f"selected window={labels[selected_idx]}, real test-set gap "
         f"{result.selected_test_result['coverage_gap'] * 100:+.1f}pp",
@@ -380,6 +389,13 @@ def main() -> None:
         "'sliding': each fold's seed is capped at the most recent min-initial-frac residuals, so later "
         "folds don't carry arbitrarily old residuals forever",
     )
+    cv.add_argument(
+        "--auto-folds",
+        action="store_true",
+        help="pick n-folds/min-initial-frac/min-fold-frac automatically from the calibration set's size "
+        "instead of the fixed defaults above (which are then ignored) -- see _auto_cv_fold_params's "
+        "docstring for the heuristic",
+    )
     cv.add_argument("--plot", type=str, default=None, help="save a plot comparing mean fold |gap| vs. real test-set gap by window")
     cv.add_argument("--seed", type=int, default=0)
 
@@ -448,6 +464,7 @@ def main() -> None:
             min_initial_frac=args.min_initial_frac,
             min_fold_frac=args.min_fold_frac,
             fold_scheme=args.fold_scheme,
+            auto_folds=args.auto_folds,
             seed=args.seed,
         )
         print(format_cv_window_selection(result))

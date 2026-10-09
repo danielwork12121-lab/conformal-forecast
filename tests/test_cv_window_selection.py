@@ -445,6 +445,61 @@ def test_cv_window_selection_auto_folds_does_not_lose_on_airline_seed_1():
     )
 
 
+def test_cv_window_selection_auto_folds_loses_on_airline_seed_16():
+    """v0.10: the 6-seed table above (seeds 0-5) never found a case where
+    `auto_folds` did worse than the fixed default. Re-checking across 20
+    seeds (0-19) found 3 that do -- this is one of them. The fixed default
+    happens to land on an exact 0.0pp test gap here; auto_folds picks a
+    smaller window (more, smaller folds push it toward window=10 instead of
+    15) that measurably undershoots. Small in absolute terms (+3.3pp), but
+    a real loss, not a tie -- see the README's "does 'never lost' hold up
+    with more seeds?" section for the full 20-seed table this is drawn from.
+    """
+    fixed = run_cv_window_selection("airline", windows=CANDIDATES, auto_folds=False, seed=16)
+    auto = run_cv_window_selection("airline", windows=CANDIDATES, auto_folds=True, seed=16)
+    fixed_gap = abs(fixed.selected_test_result["coverage_gap"])
+    auto_gap = abs(auto.selected_test_result["coverage_gap"])
+    assert auto_gap > fixed_gap, (
+        f"expected this documented case (airline, seed=16) where auto_folds "
+        f"(n_folds={auto.n_folds}, window={auto.selected_window}, |gap|={auto_gap:.4f}) does WORSE than "
+        f"the fixed default (n_folds={fixed.n_folds}, window={fixed.selected_window}, |gap|={fixed_gap:.4f}) "
+        "-- if this no longer holds, the README's 20-seed table needs updating to match, not this test loosened"
+    )
+
+
+def test_cv_window_selection_auto_folds_loses_on_synthetic_seed_6():
+    """v0.10: second of the 3 new loss cases found at 20 seeds (the other
+    is seed=11, same dataset, same exact numbers) -- see
+    test_cv_window_selection_auto_folds_loses_on_airline_seed_16 and the
+    README section it references for the full context.
+    """
+    fixed = run_cv_window_selection("synthetic", windows=CANDIDATES, auto_folds=False, seed=6)
+    auto = run_cv_window_selection("synthetic", windows=CANDIDATES, auto_folds=True, seed=6)
+    fixed_gap = abs(fixed.selected_test_result["coverage_gap"])
+    auto_gap = abs(auto.selected_test_result["coverage_gap"])
+    assert auto_gap > fixed_gap, (
+        f"expected this documented case (synthetic, seed=6) where auto_folds "
+        f"(n_folds={auto.n_folds}, window={auto.selected_window}, |gap|={auto_gap:.4f}) does WORSE than "
+        f"the fixed default (n_folds={fixed.n_folds}, window={fixed.selected_window}, |gap|={fixed_gap:.4f})"
+    )
+
+
+def test_cv_window_selection_auto_folds_loses_on_synthetic_seed_11():
+    """v0.10: third of the 3 new loss cases found at 20 seeds -- included
+    alongside seed=6 (same dataset) so the loss isn't read as a one-off
+    fluke of a single seed.
+    """
+    fixed = run_cv_window_selection("synthetic", windows=CANDIDATES, auto_folds=False, seed=11)
+    auto = run_cv_window_selection("synthetic", windows=CANDIDATES, auto_folds=True, seed=11)
+    fixed_gap = abs(fixed.selected_test_result["coverage_gap"])
+    auto_gap = abs(auto.selected_test_result["coverage_gap"])
+    assert auto_gap > fixed_gap, (
+        f"expected this documented case (synthetic, seed=11) where auto_folds "
+        f"(n_folds={auto.n_folds}, window={auto.selected_window}, |gap|={auto_gap:.4f}) does WORSE than "
+        f"the fixed default (n_folds={fixed.n_folds}, window={fixed.selected_window}, |gap|={fixed_gap:.4f})"
+    )
+
+
 def test_cv_window_selection_sliding_plus_auto_folds_loses_to_auto_alone_on_synthetic_seed_2():
     """v0.9: does combining `fold_scheme='sliding'` (v0.7) with
     `auto_folds=True` (v0.8) compound -- i.e. do better than `auto_folds`

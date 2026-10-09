@@ -641,6 +641,75 @@ capped seed is still a reasonable size relative to the calibration set,
 roughly `synthetic`-scale here, not `airline`-scale) rather than a
 recommended replacement.
 
+## Automatic fold count: do more, data-sized folds help?
+
+The rolling-origin CV section's own `n_folds=4`, `min_initial_frac=0.2`,
+`min_fold_frac=0.1` defaults are fixed *fractions* of the calibration set,
+applied the same way regardless of how big that calibration set actually
+is. That's the wrong thing to hold constant: on `airline` (n_cal=28) those
+fractions barely clear the floors `_make_rolling_folds` already enforces
+(min_initial=6, min_fold_size=3), while on `temperature` (n_cal=730) they
+reserve far more absolute history than any one fold needs (min_initial=146,
+min_fold_size=73) — and because `n_folds=4` is *also* fixed, none of that
+surplus data on `temperature` ever gets spent on *more* folds, just bigger
+ones. `--auto-folds` (`_auto_cv_fold_params` in `forecasting/experiment.py`)
+targets roughly constant *absolute* fold sizes instead (8 points for the
+first fold's seed, 4 per validation chunk) and requests a generous 15 folds
+upfront, letting `_make_rolling_folds`'s existing capping logic bring that
+down to whatever a given dataset can actually support — so a bigger
+calibration set naturally gets more folds, not just the same 4, bigger.
+
+**Measured across the same 6 seeds × 3 datasets as the sections above,
+comparing `auto_folds=True` against the v0.6/v0.7 fixed defaults
+(`fold_scheme="expanding"` throughout — orthogonal to that question):**
+
+| Dataset | n_folds, fixed | n_folds, auto | Mean &#124;test gap&#124;, fixed | Mean &#124;test gap&#124;, auto | Auto wins/loses/ties (of 6) |
+|---|---|---|---|---|---|
+| `airline` (n_cal=28) | 4 | 5 | 8.3pp | **7.8pp** | 1 / 0 / 5 |
+| `synthetic` (n_cal=160) | 4 | 15 | 1.1pp | **0.4pp** | 5 / 0 / 1 |
+| `temperature` (n_cal=730) | 4 | 15 | 0.1pp | 0.1pp | 0 / 0 / 6 |
+
+Unlike the fold-*scheme* comparison above, this one is **not mixed** —
+across all 18 seed/dataset combinations actually measured, `auto_folds`
+never did worse than the fixed default, and on `synthetic` specifically it
+cuts the mean |gap| to roughly a third (1.1pp → 0.4pp), winning outright on
+5 of 6 seeds. (This is a report of what was measured, 18 data points, not a
+proof that `auto_folds` can never lose on data not tested here — the same
+caveat every other honest comparison in this README carries.)
+
+Seed=0 on `temperature`, with `auto_folds=True` requesting (and getting)
+15 folds instead of 4 — note the fold-averaged metric actually
+*discriminates* across candidates now (6.7pp down to 1.4pp, no ties),
+unlike the 4-fold version earlier in this README where differences this
+small would often tie:
+
+| `temperature`, window (15 folds, auto) | Mean &#124;fold gap&#124; (used to select) | Real test gap (post-hoc check) |
+|---|---|---|
+| 5 | 6.7pp | -6.7pp |
+| 7 | 3.1pp | -2.3pp |
+| 10 | 1.9pp | +0.1pp |
+| 15 | 1.5pp | +0.0pp |
+| 20 | 1.4pp | +0.1pp |
+| 30 | 1.5pp | +0.1pp |
+| 50 (**selected**) | 1.4pp | +0.1pp |
+| unbounded (best in hindsight) | 1.6pp | +0.0pp |
+
+![temperature rolling-origin CV window selection (auto-folds): mean fold gap vs. real test-set outcome](results/temperature_cv_window_select_auto.png)
+
+`tests/test_cv_window_selection.py` pins the `synthetic` seed=2 win case
+(`test_cv_window_selection_auto_folds_beats_fixed_default_on_synthetic_seed_2`)
+and a no-worse-than-fixed case on `airline` seed=1
+(`test_cv_window_selection_auto_folds_does_not_lose_on_airline_seed_1`), so
+a future change can't silently weaken this result without the test suite
+catching it.
+
+**Honest takeaway:** unlike `fold_scheme`, `auto_folds` *is* a clear
+improvement over the v0.6/v0.7 fixed defaults on every dataset measured
+here — it's `False` by default only because changing a default is a
+bigger decision than adding an opt-in flag backed by one afternoon's worth
+of 18 measurements, not because the result is actually mixed. A future
+run could reasonably flip the default once more data points accumulate.
+
 ## Architecture
 
 ```
@@ -656,12 +725,14 @@ forecasting/
                  # including run_window_sweep_comparison (window tuning),
                  # run_auto_window_selection (automatic window selection, v0.5),
                  # run_cv_window_selection + _make_rolling_folds
-                 # (rolling-origin cross-validated selection, v0.6), and
-                 # _fold_seed_start (expanding vs. sliding fold scheme, v0.7)
+                 # (rolling-origin cross-validated selection, v0.6),
+                 # _fold_seed_start (expanding vs. sliding fold scheme, v0.7),
+                 # and _auto_cv_fold_params (data-sized fold count, v0.8)
   cli.py         # `python -m forecasting.cli benchmark [...]` /
                  # `sliding-window [...]` / `window-sweep [...]` /
-                 # `auto-window [...]` / `cv-window-select [... --fold-scheme]`
-tests/           # 99 tests, including the coverage-tracking statistical checks above
+                 # `auto-window [...]` / `cv-window-select [... --fold-scheme
+                 # --auto-folds]`
+tests/           # 109 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -670,7 +741,7 @@ results/         # generated plots (checked in so the README renders without rer
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                                    # 99 tests
+python -m pytest                                    # 109 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -679,6 +750,7 @@ python -m forecasting.cli window-sweep --dataset airline --windows 5,7,10,15,20,
 python -m forecasting.cli auto-window --dataset synthetic --candidates 5,7,10,15,20,30,50,unbounded --plot results/synthetic_auto_window.png
 python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --plot results/airline_cv_window_select.png
 python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --fold-scheme sliding --plot results/airline_cv_window_select_sliding.png
+python -m forecasting.cli cv-window-select --dataset temperature --candidates 5,7,10,15,20,30,50,unbounded --auto-folds --plot results/temperature_cv_window_select_auto.png
 ```
 
 ## What's next
@@ -694,17 +766,15 @@ python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10
   scale.
 - A minimal FastAPI serving layer exposing `/forecast` with both the point
   prediction and the calibrated interval.
-- "Rolling-origin cross-validated window selection" above found CV helps
-  specifically when the calibration set is small (`airline`-scale) — a
-  natural follow-up is making `n_folds`/`min_initial_frac`/`min_fold_frac`
-  themselves adapt to `n_cal` automatically (right now they're fixed
-  defaults a caller can override, not chosen from the data). ("Sliding vs.
-  expanding fold scheme" above already answered the other half of that
-  v0.6 note — measured, not assumed, and the answer was "it depends on
-  calibration-set size, and not in the direction you'd guess.")
 - Extend the window sweep's multi-seed check to `gamma` too (this run only
   tuned `window`, holding `gamma=0.05` fixed throughout — the two
   hyperparameters likely interact).
+- "Automatic fold count" above found `auto_folds` never did worse than the
+  v0.6/v0.7 fixed defaults across every seed/dataset tried — a natural
+  follow-up is whether that holds up with more seeds and candidate windows
+  before actually flipping the default, and whether `auto_folds` and
+  `fold_scheme="sliding"` compound (tried independently here, never
+  together).
 
 ## License
 

@@ -66,6 +66,12 @@ regardless of dataset -- see the README for whether more, data-sized folds
 actually select better windows:
 
     python -m forecasting.cli cv-window-select --dataset temperature --candidates 5,7,10,15,20,30,50,unbounded --auto-folds --plot results/temperature_cv_window_select_auto.png
+
+Serve the calibrated forecasts over a minimal REST API (see
+`forecasting/api.py` and the README's "Serving it as an API" section --
+demo-quality, not production: the LSTM refits per request):
+
+    python -m forecasting.cli serve --port 8000
 """
 from __future__ import annotations
 
@@ -399,6 +405,14 @@ def main() -> None:
     cv.add_argument("--plot", type=str, default=None, help="save a plot comparing mean fold |gap| vs. real test-set gap by window")
     cv.add_argument("--seed", type=int, default=0)
 
+    serve = sub.add_parser(
+        "serve",
+        help="run forecasting/api.py (GET /health, GET /datasets, POST /forecast) with uvicorn",
+    )
+    serve.add_argument("--host", type=str, default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument("--reload", action="store_true", help="auto-reload on code changes (development only)")
+
     args = parser.parse_args()
 
     if args.command == "benchmark":
@@ -472,6 +486,10 @@ def main() -> None:
         if args.plot:
             _plot_cv_window_selection(args.dataset, result, args.plot)
             print(f"Saved plot to {args.plot}")
+    elif args.command == "serve":
+        import uvicorn
+
+        uvicorn.run("forecasting.api:app", host=args.host, port=args.port, reload=args.reload)
 
 
 if __name__ == "__main__":

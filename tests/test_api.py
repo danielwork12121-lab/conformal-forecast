@@ -135,3 +135,129 @@ def test_forecast_lstm_matches_direct_pipeline_exactly():
 def test_docs_endpoint_is_reachable():
     resp = client.get("/docs")
     assert resp.status_code == 200
+
+
+# --- Fitted-forecaster cache (v0.12) ---------------------------------------
+
+
+def test_cache_starts_empty_after_clear():
+    resp = client.delete("/cache")
+    assert resp.status_code == 200
+    stats = client.get("/cache/stats").json()
+    assert stats == {"size": 0, "max_size": 16, "keys": []}
+
+
+def test_cache_reuses_fitted_model_across_requests_that_only_differ_by_alpha(monkeypatch):
+    """The actual regression test for caching: two /forecast calls with the
+    same (dataset, model, seed, lookback, period) but different `alpha`
+    must fit the LSTM exactly once, not twice."""
+    client.delete("/cache")
+    from forecasting import models as models_module
+
+    calls = {"n": 0}
+    original_fit = models_module.LSTMForecaster.fit
+
+    def counting_fit(self, *args, **kwargs):
+        calls["n"] += 1
+        return original_fit(self, *args, **kwargs)
+
+    monkeypatch.setattr(models_module.LSTMForecaster, "fit", counting_fit)
+
+    r1 = client.post("/forecast", json={"dataset": "synthetic", "model": "lstm", "seed": 11, "alpha": 0.1})
+    r2 = client.post("/forecast", json={"dataset": "synthetic", "model": "lstm", "seed": 11, "alpha": 0.2})
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert calls["n"] == 1, "second request should have reused the cached fit, not refit"
+
+    stats = client.get("/cache/stats").json()
+    assert stats["size"] == 1
+    assert stats["keys"][0] == {"dataset": "synthetic", "model": "lstm", "seed": 11, "lookback": None, "period": None}
+
+    client.delete("/cache")
+
+
+def test_cache_key_distinguishes_different_seeds(monkeypatch):
+    """A different `seed` must NOT reuse another seed's cached fit -- that
+    would silently serve the wrong model's forecast."""
+    client.delete("/cache")
+    from forecasting import models as models_module
+
+    calls = {"n": 0}
+    original_fit = models_module.LSTMForecaster.fit
+
+    def counting_fit(self, *args, **kwargs):
+        calls["n"] += 1
+        return original_fit(self, *args, **kwargs)
+
+    monkeypatch.setattr(models_module.LSTMForecaster, "fit", counting_fit)
+
+    client.post("/forecast", json={"dataset": "synthetic", "model": "lstm", "seed": 1})
+    client.post("/forecast", json={"dataset": "synthetic", "model": "lstm", "seed": 2})
+    assert calls["n"] == 2
+
+    stats = client.get("/cache/stats").json()
+    assert stats["size"] == 2
+
+    client.delete("/cache")
+
+
+def test_cached_fit_gives_identical_point_forecast_across_different_alpha():
+    """Correctness, not just call-counting: whether or not the fit is
+    served from cache, the point forecast for one (dataset, model, seed)
+    must not change with alpha -- only the interval should."""
+    client.delete("/cache")
+    r1 = client.post("/forecast", json={"dataset": "airline", "model": "naive", "alpha": 0.1}).json()
+    r2 = client.post("/forecast", json={"dataset": "airline", "model": "naive", "alpha": 0.4}).json()
+
+    assert [p["point_forecast"] for p in r1["points"]] == [p["point_forecast"] for p in r2["points"]]
+    assert [p["actual"] for p in r1["points"]] == [p["actual"] for p in r2["points"]]
+    # A smaller nominal coverage (alpha=0.4 -> 60%) must give a narrower (or
+    # equal) interval than a larger one (alpha=0.1 -> 90%), never wider.
+    assert r2["summary"]["q_hat"] <= r1["summary"]["q_hat"]
+    assert r1["summary"]["mae"] == r2["summary"]["mae"] == pytest.approx(45.1, abs=1e-3)
+
+    client.delete("/cache")
+
+
+def test_cache_evicts_least_recently_used_beyond_max_size(monkeypatch):
+    client.delete("/cache")
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_CACHE_MAX_SIZE", 2)
+
+    # 3 distinct keys (naive ignores `seed` numerically, but it still keys
+    # the cache separately -- that's fine, this test is about eviction
+    # mechanics, not about naive actually using the seed).
+    client.post("/forecast", json={"dataset": "synthetic", "model": "naive", "seed": 1})
+    client.post("/forecast", json={"dataset": "synthetic", "model": "naive", "seed": 2})
+    client.post("/forecast", json={"dataset": "synthetic", "model": "naive", "seed": 3})
+
+    stats = client.get("/cache/stats").json()
+    assert stats["size"] == 2
+    seeds_cached = {k["seed"] for k in stats["keys"]}
+    assert seeds_cached == {2, 3}, "seed=1 was least-recently-used and should have been evicted first"
+
+    client.delete("/cache")
+
+
+def test_cache_access_moves_entry_to_most_recently_used(monkeypatch):
+    """Re-requesting an existing key must count as a fresh 'use' for LRU
+    purposes -- otherwise a popular key could still be evicted just because
+    it happened to be cached first."""
+    client.delete("/cache")
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_CACHE_MAX_SIZE", 2)
+
+    client.post("/forecast", json={"dataset": "synthetic", "model": "naive", "seed": 1})
+    client.post("/forecast", json={"dataset": "synthetic", "model": "naive", "seed": 2})
+    # Touch seed=1 again so it becomes the most-recently-used of the two.
+    client.post("/forecast", json={"dataset": "synthetic", "model": "naive", "seed": 1})
+    # A third, new key should now evict seed=2 (least-recently-used), not seed=1.
+    client.post("/forecast", json={"dataset": "synthetic", "model": "naive", "seed": 3})
+
+    stats = client.get("/cache/stats").json()
+    seeds_cached = {k["seed"] for k in stats["keys"]}
+    assert seeds_cached == {1, 3}
+
+    client.delete("/cache")

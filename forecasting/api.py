@@ -2,31 +2,53 @@
 
 Deliberately thin: no new forecasting logic lives here. Every endpoint
 calls straight into `experiment._prepare_split` + `conformal.SplitConformalForecaster`
--- the same code path `run_experiment` (and 115 existing tests) already
+-- the same code path `run_experiment` (and 125 existing tests) already
 exercise -- so the calibrated forecasts this repo produces can be called by
 another program instead of only read off a markdown table.
 
-Honest scope, stated here and in the README: this is a demo-quality
-serving layer. No auth, no rate limiting, no response caching -- the LSTM
-is retrained from scratch on every `/forecast` request that asks for it,
-which is fine for a request every few seconds on these small bundled
-datasets and would not be fine in production. See the README's "Serving
-it as an API" section and "What's next" for the honest follow-ups
-(caching a fitted forecaster; accepting a user-supplied series).
+v0.12: fitted-forecaster caching. `/forecast`'s expensive step is fitting
+the model (trivial for naive/seasonal_naive, real training for lstm) --
+`alpha` never affects that fit, only the conformal quantile computed from
+it, which is a cheap O(n_cal log n_cal) sort. So the cache key below is
+`(dataset, model, seed, lookback, period)`, deliberately excluding `alpha`:
+two requests that differ only in `alpha` reuse one fit and each get their
+own correctly-recomputed interval. `_model_cache` is a small bounded LRU
+(`_CACHE_MAX_SIZE` entries, oldest-used evicted first) guarded by a lock,
+inspectable via `GET /cache/stats` and resettable via `DELETE /cache` --
+both exist mainly so the test suite can verify cache behavior through the
+same HTTP interface every other test uses, rather than by reaching into
+module internals, but they're also genuinely useful operationally (e.g.
+forcing a refit after noticing something odd).
+
+Honest scope, stated here and in the README: this is still a demo-quality
+serving layer. No auth, no rate limiting, no persistence across process
+restarts (the cache is in-memory only) -- but the LSTM no longer retrains
+on every request for a (dataset, model, seed, lookback, period) combo
+that's already been seen, which was v0.11's own most obvious gap. See the
+README's "Serving it as an API" section and "What's next" for what's still
+not done (accepting a user-supplied series instead of only the 3 bundled
+dataset names).
 
 Endpoints
 ---------
-GET  /health     -- liveness check.
-GET  /datasets   -- static metadata for the 3 bundled datasets.
-POST /forecast   -- run one model on one dataset through the conformal
-                    pipeline; returns every test point's actual value,
-                    point forecast, calibrated interval, and whether the
-                    interval covered the actual, plus summary stats.
+GET    /health       -- liveness check.
+GET    /datasets     -- static metadata for the 3 bundled datasets.
+POST   /forecast     -- run one model on one dataset through the conformal
+                         pipeline; returns every test point's actual value,
+                         point forecast, calibrated interval, and whether
+                         the interval covered the actual, plus summary
+                         stats. Reuses a cached fit when one exists.
+GET    /cache/stats  -- current cache size, max size, and cached keys.
+DELETE /cache        -- clear the cache (forces the next matching request
+                         to refit).
 """
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from typing import Literal
 
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -42,8 +64,74 @@ app = FastAPI(
         "a fixed set of bundled datasets. Demo-quality: see the repo README "
         "for honest scope notes."
     ),
-    version="0.10",
+    version="0.12",
 )
+
+# --- Fitted-forecaster cache (v0.12) ---------------------------------------
+# Keyed on everything that affects model *fitting*; `alpha` is excluded on
+# purpose (see module docstring). A plain OrderedDict + a lock is enough for
+# a demo-quality server -- no eviction policy more elaborate than "least
+# recently used" is needed at this scale.
+_CACHE_MAX_SIZE = 16
+_model_cache: "OrderedDict[tuple, dict]" = OrderedDict()
+_cache_lock = threading.Lock()
+
+
+def _cache_key(req: "ForecastRequest") -> tuple:
+    return (req.dataset, req.model, req.seed, req.lookback, req.period)
+
+
+def _get_or_fit(req: "ForecastRequest") -> dict:
+    """Return the fitted-model bundle for `req`'s (dataset, model, seed,
+    lookback, period), fitting and caching it on first use.
+
+    Raises HTTPException(422) for a dataset/lookback/period combination
+    `_prepare_split` rejects (too few windows) -- same behavior `forecast()`
+    had before caching existed, just moved here since this is now the one
+    place that calls `_prepare_split`.
+    """
+    key = _cache_key(req)
+    with _cache_lock:
+        cached = _model_cache.get(key)
+        if cached is not None:
+            _model_cache.move_to_end(key)
+            return cached
+
+    try:
+        X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(
+            req.dataset, req.lookback, req.period
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if req.model == "naive":
+        model = NaiveForecaster()
+    elif req.model == "seasonal_naive":
+        model = SeasonalNaiveForecaster(period=period)
+    else:
+        model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=req.seed))
+
+    model.fit(X_train, y_train)
+
+    bundle = {
+        "model": model,
+        "X_cal": X_cal,
+        "y_cal": y_cal,
+        "X_test": X_test,
+        "y_test": y_test,
+        "normalizer": normalizer,
+        "period": period,
+    }
+    with _cache_lock:
+        # Another request for the same key may have raced this one and won
+        # -- keep whichever bundle is already there rather than clobbering
+        # it with a second, redundant fit's result.
+        bundle = _model_cache.setdefault(key, bundle)
+        _model_cache.move_to_end(key)
+        while len(_model_cache) > _CACHE_MAX_SIZE:
+            _model_cache.popitem(last=False)
+    return bundle
+
 
 DATASET_DESCRIPTIONS = {
     "airline": (
@@ -118,24 +206,41 @@ def datasets() -> dict:
     }
 
 
+@app.get("/cache/stats")
+def cache_stats() -> dict:
+    with _cache_lock:
+        keys = list(_model_cache.keys())
+    return {
+        "size": len(keys),
+        "max_size": _CACHE_MAX_SIZE,
+        "keys": [
+            {"dataset": k[0], "model": k[1], "seed": k[2], "lookback": k[3], "period": k[4]} for k in keys
+        ],
+    }
+
+
+@app.delete("/cache")
+def clear_cache() -> dict:
+    with _cache_lock:
+        n = len(_model_cache)
+        _model_cache.clear()
+    return {"cleared": n}
+
+
 @app.post("/forecast", response_model=ForecastResponse)
 def forecast(req: ForecastRequest) -> ForecastResponse:
-    try:
-        X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(
-            req.dataset, req.lookback, req.period
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    bundle = _get_or_fit(req)
+    model = bundle["model"]
+    X_cal, y_cal = bundle["X_cal"], bundle["y_cal"]
+    X_test, y_test = bundle["X_test"], bundle["y_test"]
+    normalizer = bundle["normalizer"]
 
-    if req.model == "naive":
-        model = NaiveForecaster()
-    elif req.model == "seasonal_naive":
-        model = SeasonalNaiveForecaster(period=period)
-    else:
-        model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=req.seed))
-
+    # The fit (possibly reused from cache) never depends on alpha -- only
+    # this quantile does, so it's always recomputed fresh per request.
     conformal = SplitConformalForecaster(model, alpha=req.alpha)
-    conformal.fit(X_train, y_train, X_cal, y_cal)
+    cal_pred = model.predict(X_cal)
+    residuals = np.abs(y_cal - cal_pred).reshape(-1)
+    conformal.q_hat = SplitConformalForecaster._quantile_with_finite_sample_correction(residuals, req.alpha)
     pred = conformal.predict(X_test)
 
     point = normalizer.inverse_transform(pred.point).reshape(-1)

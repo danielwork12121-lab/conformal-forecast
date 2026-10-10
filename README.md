@@ -818,6 +818,46 @@ default, both remain independently opt-in exactly as before, and this
 finding only closes the open question of whether to recommend combining
 them (answer: no).
 
+## Serving it as an API (v0.11)
+
+Everything above is driven through the CLI, one process invocation at a
+time. `forecasting/api.py` wraps the exact same pipeline — `_prepare_split`
++ `SplitConformalForecaster`, the code path `run_experiment` and 115 of
+this repo's tests already exercise — behind a minimal REST API, so another
+program can call it instead of parsing a markdown table:
+
+```bash
+python -m forecasting.cli serve --port 8000
+```
+
+- `GET /health` — liveness check.
+- `GET /datasets` — static metadata for the 3 bundled datasets.
+- `POST /forecast` — body: `{"dataset": "airline", "model": "lstm", "alpha": 0.1, "seed": 0, "max_points": 10}`
+  (`dataset` is required; everything else has a default). Returns every
+  test point's actual value, point forecast, calibrated `[lower, upper]`
+  interval, and whether the interval covered the actual, plus summary
+  stats (MAE, empirical/nominal coverage, coverage gap, mean interval
+  width, `q_hat`). An unknown dataset/model or an out-of-range `alpha`
+  returns `422` with a validation error. Interactive docs (Swagger UI) are
+  at `/docs`.
+
+`tests/test_api.py` checks request validation, response well-formedness
+(interval ordering, `covered` consistency, coverage matching a direct
+count), `max_points` truncation, and — the test that actually matters —
+an LSTM forecast computed through the API is checked for **exact**
+numeric agreement (`np.testing.assert_allclose`, `rtol=1e-5`) against the
+same forecast computed by calling `forecasting.conformal` /
+`forecasting.experiment` directly, so the API can't silently drift from
+the library it wraps.
+
+**Honest scope:** this is a demo-quality serving layer, not a production
+one — no auth, no rate limiting, no response caching. The LSTM is
+retrained from scratch on every `/forecast` request that asks for it,
+which is fine for occasional requests against these small bundled
+datasets and would not scale past that. See "What's next" for the
+follow-ups (caching a fitted forecaster; accepting a user-supplied series
+instead of only the 3 bundled dataset names).
+
 ## Architecture
 
 ```
@@ -839,11 +879,13 @@ forecasting/
                  # fold_scheme and auto_folds can be combined via the same
                  # run_cv_window_selection call (v0.9 measured this
                  # combination; no new function needed, see README)
+  api.py         # FastAPI app wrapping _prepare_split + SplitConformalForecaster:
+                 # GET /health, GET /datasets, POST /forecast (v0.11)
   cli.py         # `python -m forecasting.cli benchmark [...]` /
                  # `sliding-window [...]` / `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
-                 # --auto-folds]`
-tests/           # 112 tests, including the coverage-tracking statistical checks above
+                 # --auto-folds]` / `serve [--host --port --reload]`
+tests/           # 125 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -852,7 +894,7 @@ results/         # generated plots (checked in so the README renders without rer
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                                    # 112 tests
+python -m pytest                                    # 125 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -876,8 +918,6 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   Transformer forecaster) to see whether the small-data problem on the
   airline dataset is LSTM-specific or general to neural approaches at this
   scale.
-- A minimal FastAPI serving layer exposing `/forecast` with both the point
-  prediction and the calibrated interval.
 - Extend the window sweep's multi-seed check to `gamma` too (this run only
   tuned `window`, holding `gamma=0.05` fixed throughout — the two
   hyperparameters likely interact).
@@ -889,6 +929,14 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   natural remaining follow-up in this vein would be checking whether
   candidate window choice (`--candidates`) itself needs a similar
   seed-robustness re-check, or moving on to one of the items below.
+- The FastAPI serving layer (v0.11, above) refits the requested model from
+  scratch on every `/forecast` call — caching a fitted forecaster per
+  (dataset, model, seed) instead would make repeated requests cheap
+  without changing any answer it returns.
+- `/forecast` only accepts the 3 bundled dataset names; accepting a
+  user-supplied series in the request body (with the same conformal
+  pipeline run over it) would make the API useful beyond this repo's own
+  benchmark data.
 
 ## License
 

@@ -47,19 +47,23 @@ class AdaptiveComparison:
     alpha_t: np.ndarray  # (n_test,) -- ACI's adapted alpha_t over the test window
 
 
-def _prepare_split(
-    dataset: str,
-    lookback: int | None,
-    period: int | None,
+def _prepare_split_from_series(
+    series: np.ndarray,
+    lookback: int,
+    period: int,
+    label: str = "series",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Normalizer, int]:
-    """Shared data-prep path for both `run_experiment` and
-    `run_adaptive_comparison`, so the two can never silently drift apart on
-    how a dataset gets split/windowed/normalized.
-    """
-    series = load_dataset(dataset)
-    lookback = lookback or DEFAULT_LOOKBACKS.get(dataset, 12)
-    period = period or DEFAULT_PERIODS.get(dataset, 12)
+    """Shared split/window/normalize/validate core, extracted (v0.13) so it
+    can be used both by the bundled-dataset path (`_prepare_split`, below)
+    and by a user-supplied series (the API's `/forecast` `series` field) --
+    the two can never silently drift apart on how a series gets
+    split/windowed/normalized, whichever way it arrived.
 
+    `label` is used only in the "not enough windows" error message below,
+    so a caller can name whichever input failed (a dataset name, or
+    "series" for a user-supplied one) without this function needing to
+    know or care where the series came from.
+    """
     split = chronological_split(series, train_frac=0.6, cal_frac=0.2)
 
     normalizer = Normalizer().fit(split.train)
@@ -81,11 +85,34 @@ def _prepare_split(
 
     if len(X_train) < 5 or len(X_cal) < 5 or len(X_test) < 5:
         raise ValueError(
-            f"Not enough windows for dataset={dataset} lookback={lookback}: "
+            f"Not enough windows for {label} lookback={lookback}: "
             f"train={len(X_train)} cal={len(X_cal)} test={len(X_test)}"
         )
 
     return X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period
+
+
+def _prepare_split(
+    dataset: str,
+    lookback: int | None,
+    period: int | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Normalizer, int]:
+    """Shared data-prep path for both `run_experiment` and
+    `run_adaptive_comparison`, so the two can never silently drift apart on
+    how a dataset gets split/windowed/normalized.
+
+    v0.13: now a thin wrapper around `_prepare_split_from_series` -- this
+    function's only remaining job is resolving a bundled dataset's name
+    into an actual series plus its default lookback/period; the real
+    split/window/normalize/validate work is shared with the user-supplied-
+    series API path. Confirmed behavior-preserving: the full test suite
+    passed, unchanged, immediately after this refactor and before any new
+    code was written.
+    """
+    series = load_dataset(dataset)
+    lookback = lookback or DEFAULT_LOOKBACKS.get(dataset, 12)
+    period = period or DEFAULT_PERIODS.get(dataset, 12)
+    return _prepare_split_from_series(series, lookback, period, label=f"dataset={dataset}")
 
 
 def run_experiment(

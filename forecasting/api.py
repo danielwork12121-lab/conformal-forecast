@@ -20,40 +20,59 @@ same HTTP interface every other test uses, rather than by reaching into
 module internals, but they're also genuinely useful operationally (e.g.
 forcing a refit after noticing something odd).
 
+v0.13: accepting a user-supplied `series` instead of only the 3 bundled
+dataset names. `ForecastRequest` now accepts exactly one of `dataset` or
+`series` (enforced by a model-level validator); a custom series shares the
+*exact* same split/window/normalize/validate core as the bundled-dataset
+path via `experiment._prepare_split_from_series` (extracted from
+`_prepare_split` this same version -- see that function's docstring). A
+custom series has no name to key the fit cache on, so `_cache_key()` now
+returns a 6-tuple tagged `"dataset"` or `"custom"`, with the custom tag's
+discriminator being a truncated SHA-256 of the series' float64 bytes
+(`_series_cache_id()`) -- two requests for the identical series (even with
+different `alpha`) still share one fit, and two different series never
+collide. `GET /cache/stats` emits the *same* 5-field dict as before for
+dataset-path entries (so the existing exact-dict-equality test keeps
+passing byte-for-byte) and a 6-field dict (adds `series_hash`) for
+custom-series entries.
+
 Honest scope, stated here and in the README: this is still a demo-quality
 serving layer. No auth, no rate limiting, no persistence across process
-restarts (the cache is in-memory only) -- but the LSTM no longer retrains
-on every request for a (dataset, model, seed, lookback, period) combo
-that's already been seen, which was v0.11's own most obvious gap. See the
-README's "Serving it as an API" section and "What's next" for what's still
-not done (accepting a user-supplied series instead of only the 3 bundled
-dataset names).
+restarts (the cache is in-memory only); a custom series is not persisted
+server-side beyond the cache bundle either -- a client must resend the
+full series on every request (see the README's "What's next" for a
+proposed "dataset handle" endpoint that would fix that). But the LSTM no
+longer retrains on every request for a combo that's already been seen
+(v0.12's own fix), and the API is no longer limited to the 3 bundled
+dataset names (this version's fix).
 
 Endpoints
 ---------
 GET    /health       -- liveness check.
 GET    /datasets     -- static metadata for the 3 bundled datasets.
-POST   /forecast     -- run one model on one dataset through the conformal
-                         pipeline; returns every test point's actual value,
-                         point forecast, calibrated interval, and whether
-                         the interval covered the actual, plus summary
-                         stats. Reuses a cached fit when one exists.
+POST   /forecast     -- run one model on one dataset OR one user-supplied
+                         series through the conformal pipeline; returns
+                         every test point's actual value, point forecast,
+                         calibrated interval, and whether the interval
+                         covered the actual, plus summary stats. Reuses a
+                         cached fit when one exists.
 GET    /cache/stats  -- current cache size, max size, and cached keys.
 DELETE /cache        -- clear the cache (forces the next matching request
                          to refit).
 """
 from __future__ import annotations
 
+import hashlib
 import threading
 from collections import OrderedDict
 from typing import Literal
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from forecasting.conformal import SplitConformalForecaster, evaluate_coverage
-from forecasting.experiment import _prepare_split
+from forecasting.experiment import DEFAULT_LOOKBACKS, _prepare_split, _prepare_split_from_series
 from forecasting.metrics import mae as _mae
 from forecasting.models import DeltaWrapper, LSTMForecaster, NaiveForecaster, SeasonalNaiveForecaster
 
@@ -61,11 +80,18 @@ app = FastAPI(
     title="conformal-forecast API",
     description=(
         "Calibrated time-series forecasts (split conformal prediction) over "
-        "a fixed set of bundled datasets. Demo-quality: see the repo README "
-        "for honest scope notes."
+        "a fixed set of bundled datasets, or over your own series. "
+        "Demo-quality: see the repo README for honest scope notes."
     ),
-    version="0.12",
+    version="0.13",
 )
+
+# Generic defaults used for a user-supplied series, which has no dataset
+# name to look up DEFAULT_LOOKBACKS/DEFAULT_PERIODS with -- the same
+# fallback value `_prepare_split` already uses for an unlisted dataset
+# name (see `forecasting.experiment.DEFAULT_LOOKBACKS/DEFAULT_PERIODS`).
+_CUSTOM_SERIES_DEFAULT_LOOKBACK = 12
+_CUSTOM_SERIES_DEFAULT_PERIOD = 12
 
 # --- Fitted-forecaster cache (v0.12) ---------------------------------------
 # Keyed on everything that affects model *fitting*; `alpha` is excluded on
@@ -77,18 +103,37 @@ _model_cache: "OrderedDict[tuple, dict]" = OrderedDict()
 _cache_lock = threading.Lock()
 
 
+def _series_cache_id(series: list[float]) -> str:
+    """A stable cache-key discriminator for a user-supplied series, which
+    has no dataset name to key on. Truncated (16 hex chars = 64 bits --
+    ample to avoid an accidental collision at this cache's scale of at
+    most `_CACHE_MAX_SIZE` entries) SHA-256 of the series' float64 bytes,
+    so two requests for the byte-identical series always hash identically
+    and two different series practically never collide.
+    """
+    arr = np.asarray(series, dtype=np.float64)
+    return hashlib.sha256(arr.tobytes()).hexdigest()[:16]
+
+
 def _cache_key(req: "ForecastRequest") -> tuple:
-    return (req.dataset, req.model, req.seed, req.lookback, req.period)
+    """Everything that affects model *fitting*, tagged by source so a
+    dataset-path key and a custom-series-path key can never collide even
+    if a coincidence made their other fields match. `alpha` is excluded on
+    purpose (see module docstring) in both cases.
+    """
+    if req.series is not None:
+        return ("custom", _series_cache_id(req.series), req.model, req.seed, req.lookback, req.period)
+    return ("dataset", req.dataset, req.model, req.seed, req.lookback, req.period)
 
 
 def _get_or_fit(req: "ForecastRequest") -> dict:
-    """Return the fitted-model bundle for `req`'s (dataset, model, seed,
-    lookback, period), fitting and caching it on first use.
+    """Return the fitted-model bundle for `req`'s cache key (see
+    `_cache_key`), fitting and caching it on first use.
 
-    Raises HTTPException(422) for a dataset/lookback/period combination
-    `_prepare_split` rejects (too few windows) -- same behavior `forecast()`
-    had before caching existed, just moved here since this is now the one
-    place that calls `_prepare_split`.
+    Raises HTTPException(422) for a dataset/series/lookback/period
+    combination `_prepare_split`/`_prepare_split_from_series` rejects (too
+    few windows) -- same behavior `forecast()` had before caching existed,
+    just moved here since this is now the one place that calls either.
     """
     key = _cache_key(req)
     with _cache_lock:
@@ -98,11 +143,31 @@ def _get_or_fit(req: "ForecastRequest") -> dict:
             return cached
 
     try:
-        X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(
-            req.dataset, req.lookback, req.period
-        )
+        if req.series is not None:
+            lookback = req.lookback or _CUSTOM_SERIES_DEFAULT_LOOKBACK
+            period = req.period or _CUSTOM_SERIES_DEFAULT_PERIOD
+            series_arr = np.asarray(req.series, dtype=np.float64)
+            X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split_from_series(
+                series_arr, lookback, period, label="series"
+            )
+        else:
+            # Mirrors the lookback resolution `_prepare_split` does internally
+            # (idempotent, no side effects) so `n_input_points` below can be
+            # computed the same way for both paths without changing
+            # `_prepare_split`'s own return signature.
+            lookback = req.lookback or DEFAULT_LOOKBACKS.get(req.dataset, 12)
+            X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(
+                req.dataset, req.lookback, req.period
+            )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # Raw input-series length, derived rather than re-fetched: make_windows
+    # produces exactly len(series) - lookback windows, and X_train/X_cal/
+    # X_test exactly partition those (X_test absorbs the remainder) -- so
+    # this holds for both the bundled-dataset path and the custom-series
+    # path without needing either prepare-split function to return it.
+    n_input_points = lookback + len(X_train) + len(X_cal) + len(X_test)
 
     if req.model == "naive":
         model = NaiveForecaster()
@@ -121,6 +186,7 @@ def _get_or_fit(req: "ForecastRequest") -> dict:
         "y_test": y_test,
         "normalizer": normalizer,
         "period": period,
+        "n_input_points": n_input_points,
     }
     with _cache_lock:
         # Another request for the same key may have raced this one and won
@@ -153,15 +219,37 @@ ModelName = Literal["naive", "seasonal_naive", "lstm"]
 
 
 class ForecastRequest(BaseModel):
-    dataset: DatasetName = Field(..., description="one of the 3 bundled datasets")
+    dataset: DatasetName | None = Field(
+        None, description="one of the 3 bundled datasets -- exactly one of `dataset`/`series` is required"
+    )
+    series: list[float] | None = Field(
+        None,
+        min_length=30,
+        description=(
+            "a user-supplied series instead of a bundled dataset (v0.13) -- exactly one of "
+            "`dataset`/`series` is required. 30 points is a practical floor: `_prepare_split_from_series` "
+            "needs at least 5 train + 5 calibration + 5 test windows after the default lookback=12, and a "
+            "shorter series will likely still fail that check with a 422, just later and less clearly."
+        ),
+    )
     model: ModelName = Field("naive", description="point-forecast model to calibrate")
     alpha: float = Field(0.1, gt=0.0, lt=1.0, description="miscoverage rate, e.g. 0.1 -> 90% intervals")
     seed: int = Field(0, description="LSTM init/training seed (ignored for naive/seasonal_naive)")
-    lookback: int | None = Field(None, gt=0, description="override the dataset's default lookback window")
-    period: int | None = Field(None, gt=0, description="override the dataset's default seasonal period")
+    lookback: int | None = Field(
+        None, gt=0, description="override the default lookback window (the dataset's default, or 12 for a series)"
+    )
+    period: int | None = Field(
+        None, gt=0, description="override the default seasonal period (the dataset's default, or 12 for a series)"
+    )
     max_points: int | None = Field(
         None, gt=0, description="return only the most recent N test points in `points` (default: all)"
     )
+
+    @model_validator(mode="after")
+    def _exactly_one_of_dataset_or_series(self) -> "ForecastRequest":
+        if (self.dataset is None) == (self.series is None):
+            raise ValueError("exactly one of `dataset` or `series` is required")
+        return self
 
 
 class ForecastPoint(BaseModel):
@@ -184,10 +272,11 @@ class ForecastSummary(BaseModel):
 
 
 class ForecastResponse(BaseModel):
-    dataset: DatasetName
+    dataset: DatasetName | Literal["custom"]
     model: ModelName
     alpha: float
     seed: int
+    n_input_points: int
     points: list[ForecastPoint]
     summary: ForecastSummary
 
@@ -206,6 +295,29 @@ def datasets() -> dict:
     }
 
 
+def _cache_key_to_dict(key: tuple) -> dict:
+    """Render one `_cache_key()` tuple for `GET /cache/stats`.
+
+    Dataset-path keys (`("dataset", name, model, seed, lookback, period)`)
+    render as the exact same 5-field dict shape v0.12 always produced
+    (preserving the existing exact-dict-equality test byte-for-byte);
+    custom-series keys (`("custom", series_id, model, seed, lookback,
+    period)`) render as a 6-field dict that additionally identifies the
+    series by its cache-key hash rather than a name it doesn't have.
+    """
+    source, discriminator, model, seed, lookback, period = key
+    if source == "dataset":
+        return {"dataset": discriminator, "model": model, "seed": seed, "lookback": lookback, "period": period}
+    return {
+        "dataset": "custom",
+        "series_hash": discriminator,
+        "model": model,
+        "seed": seed,
+        "lookback": lookback,
+        "period": period,
+    }
+
+
 @app.get("/cache/stats")
 def cache_stats() -> dict:
     with _cache_lock:
@@ -213,9 +325,7 @@ def cache_stats() -> dict:
     return {
         "size": len(keys),
         "max_size": _CACHE_MAX_SIZE,
-        "keys": [
-            {"dataset": k[0], "model": k[1], "seed": k[2], "lookback": k[3], "period": k[4]} for k in keys
-        ],
+        "keys": [_cache_key_to_dict(k) for k in keys],
     }
 
 
@@ -278,6 +388,14 @@ def forecast(req: ForecastRequest) -> ForecastResponse:
         n_test=cov["n_test"],
     )
 
+    response_dataset = "custom" if req.series is not None else req.dataset
+
     return ForecastResponse(
-        dataset=req.dataset, model=req.model, alpha=req.alpha, seed=req.seed, points=points, summary=summary
+        dataset=response_dataset,
+        model=req.model,
+        alpha=req.alpha,
+        seed=req.seed,
+        n_input_points=bundle["n_input_points"],
+        points=points,
+        summary=summary,
     )

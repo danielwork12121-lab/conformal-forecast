@@ -818,13 +818,14 @@ default, both remain independently opt-in exactly as before, and this
 finding only closes the open question of whether to recommend combining
 them (answer: no).
 
-## Serving it as an API (v0.11, caching added in v0.12)
+## Serving it as an API (v0.11, caching added in v0.12, user series in v0.13)
 
 Everything above is driven through the CLI, one process invocation at a
 time. `forecasting/api.py` wraps the exact same pipeline — `_prepare_split`
-+ `SplitConformalForecaster`, the code path `run_experiment` and 125 of
-this repo's tests already exercise — behind a minimal REST API, so another
-program can call it instead of parsing a markdown table:
+/ `_prepare_split_from_series` + `SplitConformalForecaster`, the code path
+`run_experiment` and 139 of this repo's tests already exercise — behind a
+minimal REST API, so another program can call it instead of parsing a
+markdown table:
 
 ```bash
 python -m forecasting.cli serve --port 8000
@@ -832,14 +833,18 @@ python -m forecasting.cli serve --port 8000
 
 - `GET /health` — liveness check.
 - `GET /datasets` — static metadata for the 3 bundled datasets.
-- `POST /forecast` — body: `{"dataset": "airline", "model": "lstm", "alpha": 0.1, "seed": 0, "max_points": 10}`
-  (`dataset` is required; everything else has a default). Returns every
-  test point's actual value, point forecast, calibrated `[lower, upper]`
-  interval, and whether the interval covered the actual, plus summary
-  stats (MAE, empirical/nominal coverage, coverage gap, mean interval
-  width, `q_hat`). An unknown dataset/model or an out-of-range `alpha`
-  returns `422` with a validation error. Interactive docs (Swagger UI) are
-  at `/docs`.
+- `POST /forecast` — body is either `{"dataset": "airline", "model": "lstm", "alpha": 0.1, "seed": 0, "max_points": 10}`
+  or, as of v0.13, `{"series": [50.1, 51.3, ...], "model": "lstm", "alpha": 0.1}`
+  (exactly one of `dataset`/`series` is required; everything else has a
+  default). Returns every test point's actual value, point forecast,
+  calibrated `[lower, upper]` interval, and whether the interval covered
+  the actual, plus summary stats (MAE, empirical/nominal coverage,
+  coverage gap, mean interval width, `q_hat`) and `n_input_points`. An
+  unknown dataset/model, both `dataset` and `series` given (or neither), a
+  `series` shorter than 30 points, an out-of-range `alpha`, or a
+  `series`/`lookback` combination too short to split into train/cal/test
+  windows all return `422` with a validation error. Interactive docs
+  (Swagger UI) are at `/docs`.
 - `GET /cache/stats` / `DELETE /cache` — v0.12: inspect or clear the
   fitted-model cache (below).
 
@@ -873,11 +878,50 @@ grows), and two eviction tests (the least-recently-used entry is evicted
 once the cache exceeds its max size, and re-requesting an entry correctly
 refreshes its recency so a popular key survives eviction).
 
+**Accepting a user-supplied series (v0.13):** `/forecast` previously only
+accepted one of the 3 bundled dataset names, which made it useless for
+anyone's own data. `ForecastRequest` now accepts exactly one of `dataset`
+or `series` (enforced by a pydantic `model_validator`), and a custom
+series runs through the *exact same* split/window/normalize/validate core
+as the bundled-dataset path: `_prepare_split` was refactored into a thin
+wrapper (it resolves a dataset name to a series + its default
+lookback/period, then delegates) around a new
+`_prepare_split_from_series(series, lookback, period, label)`, which does
+the actual work — confirmed behavior-preserving by running the full
+131-test suite immediately after the refactor and before any new code.
+A custom series has no name to key the fitted-model cache on, so
+`_cache_key()` now returns a 6-tuple tagged `"dataset"` or `"custom"`
+(previously an untagged 5-tuple); the custom tag's discriminator is a
+truncated SHA-256 hash of the series' float64 bytes, so two requests for
+the byte-identical series (even with different `alpha`) still share one
+fit, and two different series never collide. `GET /cache/stats` still
+emits the exact same 5-field dict as before for dataset-path entries
+(preserving the existing exact-dict-equality test byte-for-byte) and a
+6-field dict (adds `series_hash`) for custom-series entries. Measured
+directly against a running server, not just asserted: a first `lstm`
+request on a 250-point custom series took 1.302s; a second request for
+the byte-identical series with a different `alpha` — a cache hit — took
+0.004s, about **325x faster**, with byte-identical point forecasts and a
+correctly smaller `q_hat` for the larger `alpha`. The existing
+bundled-dataset path was re-checked on the same running server afterward
+(`airline`/`naive` still gives the documented MAE of 45.1, an unknown
+dataset still 422s) to confirm nothing regressed. `tests/test_api.py`
+backs this with 8 new tests (131 → 139): both/neither dataset-and-series
+rejection, a field-level too-short rejection (`min_length=30`) and a
+separate split-level one (a `lookback` that's too large relative to the
+series length, actually tripping `_prepare_split_from_series`'s own "not
+enough windows" error rather than just the field check), a
+well-formedness check, an exact-match-against-the-direct-pipeline check
+(same discipline as the existing bundled-dataset LSTM test), a
+cache-reuse-across-`alpha` check for the series path, and a check that
+two different series never share a cache entry.
+
 **Honest scope:** still a demo-quality serving layer, not a production
 one — no auth, no rate limiting, and the cache is in-memory only (cleared
-on restart, and not shared across multiple server processes). See "What's
-next" for what's still not done (accepting a user-supplied series instead
-of only the 3 bundled dataset names).
+on restart, and not shared across multiple server processes). A custom
+series is not persisted server-side beyond the cache bundle either — a
+client has to resend the full series on every request; see "What's next"
+for a proposed "dataset handle" endpoint that would fix that.
 
 ## Architecture
 
@@ -899,17 +943,22 @@ forecasting/
                  # _auto_cv_fold_params (data-sized fold count, v0.8) --
                  # fold_scheme and auto_folds can be combined via the same
                  # run_cv_window_selection call (v0.9 measured this
-                 # combination; no new function needed, see README)
-  api.py         # FastAPI app wrapping _prepare_split + SplitConformalForecaster:
-                 # GET /health, GET /datasets, POST /forecast (v0.11);
+                 # combination; no new function needed, see README) --
+                 # _prepare_split_from_series (v0.13): the shared split/
+                 # window/normalize/validate core, extracted from
+                 # _prepare_split so the API's user-supplied-series path
+                 # can reuse it exactly
+  api.py         # FastAPI app wrapping _prepare_split / _prepare_split_from_series
+                 # + SplitConformalForecaster: GET /health, GET /datasets,
+                 # POST /forecast (v0.11, accepts dataset OR series as of v0.13);
                  # GET /cache/stats, DELETE /cache + a bounded-LRU fitted-
-                 # forecaster cache keyed on (dataset, model, seed,
-                 # lookback, period), excluding alpha (v0.12)
+                 # forecaster cache keyed on (source-tag, dataset-or-series-hash,
+                 # model, seed, lookback, period), excluding alpha (v0.12, tagged v0.13)
   cli.py         # `python -m forecasting.cli benchmark [...]` /
                  # `sliding-window [...]` / `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]` / `serve [--host --port --reload]`
-tests/           # 131 tests, including the coverage-tracking statistical checks above
+tests/           # 139 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -918,7 +967,7 @@ results/         # generated plots (checked in so the README renders without rer
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                                    # 131 tests
+python -m pytest                                    # 139 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -953,10 +1002,14 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   natural remaining follow-up in this vein would be checking whether
   candidate window choice (`--candidates`) itself needs a similar
   seed-robustness re-check, or moving on to one of the items below.
-- `/forecast` only accepts the 3 bundled dataset names; accepting a
-  user-supplied series in the request body (with the same conformal
-  pipeline run over it) would make the API useful beyond this repo's own
-  benchmark data.
+- A "dataset handle" endpoint: now that `/forecast` accepts a
+  user-supplied `series` (v0.13), a repeat caller still has to resend the
+  whole series on every request, since nothing is persisted server-side
+  beyond the fit cache. A `POST /series` that returns a handle (e.g. the
+  same `series_hash` already computed internally) a client could pass
+  instead of the raw series would fix that, at the cost of needing an
+  actual (even if simple) persistence story the cache doesn't currently
+  have.
 
 ## License
 

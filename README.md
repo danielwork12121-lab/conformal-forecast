@@ -818,12 +818,12 @@ default, both remain independently opt-in exactly as before, and this
 finding only closes the open question of whether to recommend combining
 them (answer: no).
 
-## Serving it as an API (v0.11, caching added in v0.12, user series in v0.13)
+## Serving it as an API (v0.11, caching in v0.12, user series in v0.13, dataset handles in v0.14)
 
 Everything above is driven through the CLI, one process invocation at a
 time. `forecasting/api.py` wraps the exact same pipeline — `_prepare_split`
 / `_prepare_split_from_series` + `SplitConformalForecaster`, the code path
-`run_experiment` and 139 of this repo's tests already exercise — behind a
+`run_experiment` and 153 of this repo's tests already exercise — behind a
 minimal REST API, so another program can call it instead of parsing a
 markdown table:
 
@@ -833,18 +833,23 @@ python -m forecasting.cli serve --port 8000
 
 - `GET /health` — liveness check.
 - `GET /datasets` — static metadata for the 3 bundled datasets.
-- `POST /forecast` — body is either `{"dataset": "airline", "model": "lstm", "alpha": 0.1, "seed": 0, "max_points": 10}`
-  or, as of v0.13, `{"series": [50.1, 51.3, ...], "model": "lstm", "alpha": 0.1}`
-  (exactly one of `dataset`/`series` is required; everything else has a
-  default). Returns every test point's actual value, point forecast,
-  calibrated `[lower, upper]` interval, and whether the interval covered
-  the actual, plus summary stats (MAE, empirical/nominal coverage,
-  coverage gap, mean interval width, `q_hat`) and `n_input_points`. An
-  unknown dataset/model, both `dataset` and `series` given (or neither), a
-  `series` shorter than 30 points, an out-of-range `alpha`, or a
-  `series`/`lookback` combination too short to split into train/cal/test
-  windows all return `422` with a validation error. Interactive docs
-  (Swagger UI) are at `/docs`.
+- `POST /series` / `GET /series/{series_id}` / `DELETE /series/{series_id}`
+  — v0.14: register a series once, get back an id to reuse (below).
+- `POST /forecast` — body is `{"dataset": "airline", "model": "lstm", "alpha": 0.1, "seed": 0, "max_points": 10}`,
+  or, as of v0.13, `{"series": [50.1, 51.3, ...], "model": "lstm", "alpha": 0.1}`,
+  or, as of v0.14, `{"series_id": "a1b2c3...", "model": "lstm", "alpha": 0.1}`
+  (exactly one of `dataset`/`series`/`series_id` is required; everything
+  else has a default). Returns every test point's actual value, point
+  forecast, calibrated `[lower, upper]` interval, and whether the interval
+  covered the actual, plus summary stats (MAE, empirical/nominal coverage,
+  coverage gap, mean interval width, `q_hat`), `n_input_points`, and (for a
+  `series`/`series_id` request) `series_id`. An unknown dataset/model, more
+  or less than exactly one of `dataset`/`series`/`series_id` given, a
+  `series` shorter than 30 points, an unknown `series_id`, an out-of-range
+  `alpha`, or a `series`/`lookback` combination too short to split into
+  train/cal/test windows all return `422` (or, for an unknown `series_id`,
+  `404`) with a validation error. Interactive docs (Swagger UI) are at
+  `/docs`.
 - `GET /cache/stats` / `DELETE /cache` — v0.12: inspect or clear the
   fitted-model cache (below).
 
@@ -916,12 +921,49 @@ well-formedness check, an exact-match-against-the-direct-pipeline check
 cache-reuse-across-`alpha` check for the series path, and a check that
 two different series never share a cache entry.
 
+**A "dataset handle" for a series (v0.14):** v0.13 itself flagged the next
+gap honestly — a client still had to resend the whole series on every
+request, since nothing was persisted server-side beyond the fit cache.
+`POST /series` now registers a series once and returns a `series_id` —
+which is *exactly* `_series_cache_id(series)`, the same hash v0.13 already
+computed internally for the fit cache, so a later `/forecast` call using
+`series_id` collides on the fit cache with an equivalent inline-`series`
+call for the byte-identical series by construction, not by coincidence
+(verified directly: `tests/test_api.py` posts a series both ways and
+asserts the two forecasts are pointwise identical, not just similarly
+shaped). The series store is a second, independently-sized bounded LRU
+(`_SERIES_STORE_MAX_SIZE = 32`), separate from the 16-entry fit cache,
+inspectable via `GET /series/{series_id}` and removable via
+`DELETE /series/{series_id}`. To avoid forcing a separate round-trip just
+to get reuse, every inline-`series` `/forecast` call *also* opportunistically
+registers that series, so its `series_id` comes back in the very first
+response (`ForecastResponse.series_id`) — a client can send the series
+once and reuse it by id from then on, without ever calling `POST /series`
+explicitly. One subtlety worth stating plainly because it's easy to get
+backwards: a `series_id` whose *fit* is still warm in the model cache
+keeps working even after its raw series has been deleted from (or aged
+out of) the series store, since the cache key is the id string itself,
+not a lookup — the store is only ever consulted on an actual cache miss.
+`tests/test_api.py` checks this directly (delete the series, re-request
+with a different `alpha`, confirm the LSTM was not refit and the forecast
+is unchanged) alongside the complementary case: a `series_id` that *is*
+both a cache miss and missing from the store correctly 404s rather than
+silently falling back to anything else. 14 new tests (139 → 153):
+register/info/delete round-trips, idempotent registration (the same
+series registered twice returns the same id), the three-way exactly-one-
+of `dataset`/`series`/`series_id` validation (now covering all the new
+pairwise combinations, not just the old `dataset`-vs-`series` one), the
+warm-cache-survives-store-deletion case, the cache-miss-after-eviction
+404 case, and the end-to-end "register once, forecast by id later"
+round-trip.
+
 **Honest scope:** still a demo-quality serving layer, not a production
-one — no auth, no rate limiting, and the cache is in-memory only (cleared
-on restart, and not shared across multiple server processes). A custom
-series is not persisted server-side beyond the cache bundle either — a
-client has to resend the full series on every request; see "What's next"
-for a proposed "dataset handle" endpoint that would fix that.
+one — no auth, no rate limiting, and both the fit cache and the series
+store are in-memory only (cleared on restart, not shared across multiple
+server processes, and each independently bounded — the series store can
+evict an id while its fit is still cached, or vice versa). A `series_id`
+is therefore a same-process convenience, not a durable handle a client
+should expect to work indefinitely or across a restart.
 
 ## Architecture
 
@@ -950,15 +992,18 @@ forecasting/
                  # can reuse it exactly
   api.py         # FastAPI app wrapping _prepare_split / _prepare_split_from_series
                  # + SplitConformalForecaster: GET /health, GET /datasets,
-                 # POST /forecast (v0.11, accepts dataset OR series as of v0.13);
-                 # GET /cache/stats, DELETE /cache + a bounded-LRU fitted-
-                 # forecaster cache keyed on (source-tag, dataset-or-series-hash,
-                 # model, seed, lookback, period), excluding alpha (v0.12, tagged v0.13)
+                 # POST /forecast (v0.11, accepts dataset OR series as of v0.13,
+                 # OR series_id as of v0.14); GET /cache/stats, DELETE /cache +
+                 # a bounded-LRU fitted-forecaster cache keyed on (source-tag,
+                 # dataset-or-series-hash, model, seed, lookback, period),
+                 # excluding alpha (v0.12, tagged v0.13); POST /series,
+                 # GET /series/{id}, DELETE /series/{id} + a second, independently
+                 # bounded LRU storing raw series by their fit-cache hash (v0.14)
   cli.py         # `python -m forecasting.cli benchmark [...]` /
                  # `sliding-window [...]` / `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]` / `serve [--host --port --reload]`
-tests/           # 139 tests, including the coverage-tracking statistical checks above
+tests/           # 153 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -967,7 +1012,7 @@ results/         # generated plots (checked in so the README renders without rer
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                                    # 139 tests
+python -m pytest                                    # 153 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -1002,14 +1047,19 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   natural remaining follow-up in this vein would be checking whether
   candidate window choice (`--candidates`) itself needs a similar
   seed-robustness re-check, or moving on to one of the items below.
-- A "dataset handle" endpoint: now that `/forecast` accepts a
-  user-supplied `series` (v0.13), a repeat caller still has to resend the
-  whole series on every request, since nothing is persisted server-side
-  beyond the fit cache. A `POST /series` that returns a handle (e.g. the
-  same `series_hash` already computed internally) a client could pass
-  instead of the raw series would fix that, at the cost of needing an
-  actual (even if simple) persistence story the cache doesn't currently
-  have.
+- The "dataset handle" endpoint proposed here is now shipped (v0.14):
+  `POST /series` / `GET /series/{id}` / `DELETE /series/{id}`, plus
+  opportunistic registration from `/forecast` itself — see the API
+  section above. The natural next step in this vein would be a `GET
+  /series` listing endpoint (there's currently no way to enumerate what's
+  registered without already knowing an id), or giving the series store
+  an actual TTL instead of pure LRU-by-capacity, so an id's lifetime is
+  predictable rather than dependent on how many *other* series get
+  registered after it.
+- A WebSocket or streaming endpoint for a series that grows over time
+  (e.g. one new point per request) instead of always being posted whole —
+  would need an actual incremental-update story for the fit cache, which
+  right now only ever caches one fully-formed fit per key.
 
 ## License
 

@@ -395,6 +395,26 @@ def test_cache_reuses_fitted_model_for_series_across_alpha(monkeypatch):
     client.delete("/cache")
 
 
+def test_cache_series_id_response_matches_registration_id():
+    """The `series_id` an inline-`series` `/forecast` call hands back must be
+    the exact id a direct `POST /series` registration of the same series
+    would produce -- the two paths are supposed to agree by construction,
+    not by coincidence."""
+    client.delete("/cache")
+    series = _make_synthetic_series(n=250, seed=42)
+
+    forecast_resp = client.post("/forecast", json={"series": series, "model": "naive"})
+    assert forecast_resp.status_code == 200
+    forecast_series_id = forecast_resp.json()["series_id"]
+    assert forecast_series_id is not None
+
+    register_resp = client.post("/series", json={"series": series})
+    assert register_resp.status_code == 200
+    assert register_resp.json()["series_id"] == forecast_series_id
+
+    client.delete("/cache")
+
+
 def test_cache_distinguishes_different_series(monkeypatch):
     """Two different series, otherwise identical request fields, must never
     share a cache entry -- that would silently serve one series' fit for
@@ -421,5 +441,180 @@ def test_cache_distinguishes_different_series(monkeypatch):
     assert stats["size"] == 2
     hashes = {k["series_hash"] for k in stats["keys"]}
     assert len(hashes) == 2, "two different series must not collide on the same cache key"
+
+    client.delete("/cache")
+
+
+# --- Dataset handle: POST/GET/DELETE /series (v0.14) -----------------------
+
+
+def test_register_series_returns_id_and_length():
+    series = _make_synthetic_series(n=60, seed=20)
+    resp = client.post("/series", json={"series": series})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["length"] == 60
+    assert isinstance(body["series_id"], str) and len(body["series_id"]) == 16
+
+
+def test_register_series_rejects_shorter_than_minimum():
+    resp = client.post("/series", json={"series": list(range(10))})
+    assert resp.status_code == 422
+
+
+def test_register_series_is_idempotent():
+    """Registering the byte-identical series twice must return the same id
+    -- the id is a content hash, not a sequence number."""
+    series = _make_synthetic_series(n=60, seed=21)
+    id_1 = client.post("/series", json={"series": series}).json()["series_id"]
+    id_2 = client.post("/series", json={"series": series}).json()["series_id"]
+    assert id_1 == id_2
+
+
+def test_series_info_reports_registered_series():
+    series = _make_synthetic_series(n=70, seed=22)
+    series_id = client.post("/series", json={"series": series}).json()["series_id"]
+    resp = client.get(f"/series/{series_id}")
+    assert resp.status_code == 200
+    assert resp.json() == {"series_id": series_id, "length": 70}
+
+
+def test_series_info_404s_for_unknown_id():
+    resp = client.get("/series/not-a-real-id")
+    assert resp.status_code == 404
+
+
+def test_delete_series_removes_it_and_is_idempotent():
+    series = _make_synthetic_series(n=60, seed=23)
+    series_id = client.post("/series", json={"series": series}).json()["series_id"]
+
+    resp = client.delete(f"/series/{series_id}")
+    assert resp.status_code == 200
+    assert resp.json() == {"deleted": True}
+
+    # Now gone.
+    assert client.get(f"/series/{series_id}").status_code == 404
+    # Deleting again is a no-op, not an error.
+    resp = client.delete(f"/series/{series_id}")
+    assert resp.json() == {"deleted": False}
+
+
+def test_forecast_rejects_dataset_and_series_id_together():
+    series = _make_synthetic_series(n=60, seed=24)
+    series_id = client.post("/series", json={"series": series}).json()["series_id"]
+    resp = client.post("/forecast", json={"dataset": "airline", "series_id": series_id})
+    assert resp.status_code == 422
+
+
+def test_forecast_rejects_series_and_series_id_together():
+    series = _make_synthetic_series(n=60, seed=25)
+    series_id = client.post("/series", json={"series": series}).json()["series_id"]
+    resp = client.post("/forecast", json={"series": series, "series_id": series_id})
+    assert resp.status_code == 422
+
+
+def test_forecast_rejects_unknown_series_id():
+    resp = client.post("/forecast", json={"series_id": "not-a-real-id", "model": "naive"})
+    assert resp.status_code == 404
+
+
+def test_forecast_by_series_id_matches_forecast_by_inline_series():
+    """The whole point of the feature: a `series_id` request must give the
+    identical forecast a byte-identical inline `series` request would, not
+    merely a well-formed one."""
+    client.delete("/cache")
+    series = _make_synthetic_series(n=250, seed=26)
+
+    inline_resp = client.post("/forecast", json={"series": series, "model": "lstm", "seed": 3, "alpha": 0.1})
+    assert inline_resp.status_code == 200
+    inline_body = inline_resp.json()
+
+    series_id = client.post("/series", json={"series": series}).json()["series_id"]
+    handle_resp = client.post("/forecast", json={"series_id": series_id, "model": "lstm", "seed": 3, "alpha": 0.1})
+    assert handle_resp.status_code == 200
+    handle_body = handle_resp.json()
+
+    assert handle_body["points"] == inline_body["points"]
+    assert handle_body["summary"] == inline_body["summary"]
+    assert handle_body["series_id"] == inline_body["series_id"] == series_id
+    assert handle_body["n_input_points"] == inline_body["n_input_points"] == 250
+
+    client.delete("/cache")
+
+
+def test_forecast_by_series_id_reuses_cached_fit_without_touching_series_store(monkeypatch):
+    """A `series_id` whose fit is already warm in the model cache must not
+    need the series store at all -- so it keeps working even after the raw
+    series has been deleted from the store (or aged out of it)."""
+    client.delete("/cache")
+    from forecasting import models as models_module
+
+    calls = {"n": 0}
+    original_fit = models_module.LSTMForecaster.fit
+
+    def counting_fit(self, *args, **kwargs):
+        calls["n"] += 1
+        return original_fit(self, *args, **kwargs)
+
+    monkeypatch.setattr(models_module.LSTMForecaster, "fit", counting_fit)
+
+    series = _make_synthetic_series(n=250, seed=27)
+    series_id = client.post("/series", json={"series": series}).json()["series_id"]
+
+    r1 = client.post("/forecast", json={"series_id": series_id, "model": "lstm", "seed": 8, "alpha": 0.1})
+    assert r1.status_code == 200
+    assert calls["n"] == 1
+
+    # Delete the series from the store -- the fit is still cached.
+    client.delete(f"/series/{series_id}")
+    assert client.get(f"/series/{series_id}").status_code == 404
+
+    r2 = client.post("/forecast", json={"series_id": series_id, "model": "lstm", "seed": 8, "alpha": 0.1})
+    assert r2.status_code == 200
+    assert calls["n"] == 1, "should have reused the cached fit, not refit, and never needed the deleted series"
+    assert r2.json()["points"] == r1.json()["points"]
+
+    # A different `alpha` is still a cache hit on the fit (still no second
+    # fit, still no need for the deleted series) -- just a different
+    # interval, same point forecasts, exactly like the inline-series cache
+    # tests above.
+    r3 = client.post("/forecast", json={"series_id": series_id, "model": "lstm", "seed": 8, "alpha": 0.3})
+    assert r3.status_code == 200
+    assert calls["n"] == 1
+    assert [p["point_forecast"] for p in r3.json()["points"]] == [p["point_forecast"] for p in r1.json()["points"]]
+
+    client.delete("/cache")
+
+
+def test_forecast_by_series_id_404s_on_cache_miss_after_eviction(monkeypatch):
+    """Unlike the warm-cache case above, a cache *miss* for a `series_id`
+    that's no longer in the store has no raw series to fit from -- it must
+    404, not silently fall back to anything else."""
+    client.delete("/cache")
+    series = _make_synthetic_series(n=60, seed=28)
+    series_id = client.post("/series", json={"series": series}).json()["series_id"]
+    client.delete(f"/series/{series_id}")
+
+    resp = client.post("/forecast", json={"series_id": series_id, "model": "naive"})
+    assert resp.status_code == 404
+
+    client.delete("/cache")
+
+
+def test_forecast_inline_series_is_reusable_by_id_without_resending_it():
+    """An inline `series` call opportunistically registers the series, so a
+    later request can reference it by `series_id` alone -- this is the
+    feature's main promise: resend the series once, reuse it by id after."""
+    client.delete("/cache")
+    series = _make_synthetic_series(n=250, seed=29)
+
+    first = client.post("/forecast", json={"series": series, "model": "naive"})
+    assert first.status_code == 200
+    series_id = first.json()["series_id"]
+
+    second = client.post("/forecast", json={"series_id": series_id, "model": "seasonal_naive"})
+    assert second.status_code == 200
+    assert second.json()["dataset"] == "custom"
+    assert second.json()["n_input_points"] == 250
 
     client.delete("/cache")

@@ -36,29 +36,58 @@ dataset-path entries (so the existing exact-dict-equality test keeps
 passing byte-for-byte) and a 6-field dict (adds `series_hash`) for
 custom-series entries.
 
+v0.14: a "dataset handle" for a user-supplied series, so a repeat caller
+doesn't have to resend the whole series on every request (v0.13's own
+honestly-flagged gap). `POST /series` registers a series once and returns
+its `series_id` -- which is *exactly* `_series_cache_id(series)`, the same
+hash v0.13 already computed internally, so a request using `series_id`
+collides on the fit cache with an equivalent inline-`series` request for
+the byte-identical series, by construction, not by coincidence. The store
+is a second small bounded LRU (`_SERIES_STORE_MAX_SIZE`, independently
+sized from the fit cache), inspectable via `GET /series/{series_id}` and
+removable via `DELETE /series/{series_id}`. `ForecastRequest` now accepts
+exactly one of `dataset`/`series`/`series_id` (the validator below grew a
+third branch); and -- opportunistically, so a client doesn't have to
+separately call `POST /series` first just to get reuse -- every inline-
+`series` `/forecast` call also registers that series, so its `series_id`
+comes back in the response (`ForecastResponse.series_id`) ready to reuse
+on the next call without resending the series at all. A `series_id` whose
+fit is still warm in the model cache works even if it's since been evicted
+from the series store -- the cache key is the id string itself, not a
+lookup, so the raw series is only ever fetched from the store on an actual
+cache miss.
+
 Honest scope, stated here and in the README: this is still a demo-quality
 serving layer. No auth, no rate limiting, no persistence across process
-restarts (the cache is in-memory only); a custom series is not persisted
-server-side beyond the cache bundle either -- a client must resend the
-full series on every request (see the README's "What's next" for a
-proposed "dataset handle" endpoint that would fix that). But the LSTM no
+restarts -- both the fit cache and the series store are in-memory only and
+vanish on restart or eviction, so `series_id` is a same-process convenience,
+not a durable handle a client can rely on indefinitely. But the LSTM no
 longer retrains on every request for a combo that's already been seen
-(v0.12's own fix), and the API is no longer limited to the 3 bundled
-dataset names (this version's fix).
+(v0.12), the API isn't limited to 3 bundled dataset names (v0.13), and a
+repeat caller no longer has to resend a whole series it already sent once
+(v0.14, this version's fix).
 
 Endpoints
 ---------
-GET    /health       -- liveness check.
-GET    /datasets     -- static metadata for the 3 bundled datasets.
-POST   /forecast     -- run one model on one dataset OR one user-supplied
-                         series through the conformal pipeline; returns
-                         every test point's actual value, point forecast,
-                         calibrated interval, and whether the interval
-                         covered the actual, plus summary stats. Reuses a
-                         cached fit when one exists.
-GET    /cache/stats  -- current cache size, max size, and cached keys.
-DELETE /cache        -- clear the cache (forces the next matching request
-                         to refit).
+GET    /health              -- liveness check.
+GET    /datasets            -- static metadata for the 3 bundled datasets.
+POST   /series               -- register a series, get back its `series_id`
+                                 (idempotent: registering the same series
+                                 twice returns the same id).
+GET    /series/{series_id}   -- check whether a `series_id` is still in the
+                                 store, and its length.
+DELETE /series/{series_id}   -- remove a series from the store.
+POST   /forecast             -- run one model on one dataset OR one
+                                 user-supplied series OR a previously
+                                 registered `series_id` through the
+                                 conformal pipeline; returns every test
+                                 point's actual value, point forecast,
+                                 calibrated interval, and whether the
+                                 interval covered the actual, plus summary
+                                 stats. Reuses a cached fit when one exists.
+GET    /cache/stats         -- current fit-cache size, max size, and keys.
+DELETE /cache                -- clear the fit cache (forces the next
+                                 matching request to refit).
 """
 from __future__ import annotations
 
@@ -80,10 +109,11 @@ app = FastAPI(
     title="conformal-forecast API",
     description=(
         "Calibrated time-series forecasts (split conformal prediction) over "
-        "a fixed set of bundled datasets, or over your own series. "
+        "a fixed set of bundled datasets, your own series, or a series "
+        "you've registered once and referenced by id. "
         "Demo-quality: see the repo README for honest scope notes."
     ),
-    version="0.13",
+    version="0.14",
 )
 
 # Generic defaults used for a user-supplied series, which has no dataset
@@ -115,14 +145,54 @@ def _series_cache_id(series: list[float]) -> str:
     return hashlib.sha256(arr.tobytes()).hexdigest()[:16]
 
 
-def _cache_key(req: "ForecastRequest") -> tuple:
+# --- Dataset-handle series store (v0.14) -----------------------------------
+# A second, independently-sized bounded LRU, storing raw series by the exact
+# same id `_series_cache_id()` produces -- so a series registered via
+# `POST /series` and the same series sent inline to `/forecast` always agree
+# on their id, and the two paths' fit-cache entries collide by construction.
+_SERIES_STORE_MAX_SIZE = 32
+_series_store: "OrderedDict[str, list[float]]" = OrderedDict()
+_series_lock = threading.Lock()
+
+
+def _register_series(series: list[float]) -> str:
+    """Store `series` under its content hash (idempotent -- registering the
+    same series twice just refreshes its LRU position) and return the id.
+    """
+    series_id = _series_cache_id(series)
+    with _series_lock:
+        _series_store[series_id] = series
+        _series_store.move_to_end(series_id)
+        while len(_series_store) > _SERIES_STORE_MAX_SIZE:
+            _series_store.popitem(last=False)
+    return series_id
+
+
+def _resolve_series_id(series_id: str) -> list[float]:
+    """Look up a previously registered series by id, bumping its LRU
+    position. Raises HTTPException(404) if it's not (or no longer) in the
+    store -- the store is a bounded LRU, so an id can legitimately age out.
+    """
+    with _series_lock:
+        series = _series_store.get(series_id)
+        if series is not None:
+            _series_store.move_to_end(series_id)
+    if series is None:
+        raise HTTPException(status_code=404, detail=f"no series registered with id {series_id!r}")
+    return series
+
+
+def _cache_key(req: "ForecastRequest", series_id: str | None) -> tuple:
     """Everything that affects model *fitting*, tagged by source so a
     dataset-path key and a custom-series-path key can never collide even
     if a coincidence made their other fields match. `alpha` is excluded on
-    purpose (see module docstring) in both cases.
+    purpose (see module docstring) in both cases. `series_id` is resolved by
+    the caller (`_get_or_fit`) from either `req.series` (hashed) or
+    `req.series_id` (used as-is) -- this function never touches `_series_store`,
+    so a cache hit never needs the raw series at all, only its id string.
     """
-    if req.series is not None:
-        return ("custom", _series_cache_id(req.series), req.model, req.seed, req.lookback, req.period)
+    if series_id is not None:
+        return ("custom", series_id, req.model, req.seed, req.lookback, req.period)
     return ("dataset", req.dataset, req.model, req.seed, req.lookback, req.period)
 
 
@@ -130,12 +200,26 @@ def _get_or_fit(req: "ForecastRequest") -> dict:
     """Return the fitted-model bundle for `req`'s cache key (see
     `_cache_key`), fitting and caching it on first use.
 
+    Raises HTTPException(404) if `req.series_id` doesn't name a series
+    still in `_series_store` *and* the fit isn't already cached (a warm
+    cache entry never needs the store at all -- see `_cache_key`).
     Raises HTTPException(422) for a dataset/series/lookback/period
     combination `_prepare_split`/`_prepare_split_from_series` rejects (too
     few windows) -- same behavior `forecast()` had before caching existed,
     just moved here since this is now the one place that calls either.
     """
-    key = _cache_key(req)
+    # An inline `series` is opportunistically registered *before* the cache
+    # check, every time -- cheap (just the hash it would need anyway for the
+    # cache key) and it keeps the series store's LRU position fresh so a
+    # repeatedly-used inline series doesn't fall out of the store between
+    # calls. A bare `series_id` is used as-is here; it's only actually
+    # resolved against the store below, and only on a cache miss.
+    if req.series is not None:
+        series_id = _register_series(req.series)
+    else:
+        series_id = req.series_id
+
+    key = _cache_key(req, series_id)
     with _cache_lock:
         cached = _model_cache.get(key)
         if cached is not None:
@@ -143,10 +227,11 @@ def _get_or_fit(req: "ForecastRequest") -> dict:
             return cached
 
     try:
-        if req.series is not None:
+        if series_id is not None:
+            series_list = req.series if req.series is not None else _resolve_series_id(req.series_id)
             lookback = req.lookback or _CUSTOM_SERIES_DEFAULT_LOOKBACK
             period = req.period or _CUSTOM_SERIES_DEFAULT_PERIOD
-            series_arr = np.asarray(req.series, dtype=np.float64)
+            series_arr = np.asarray(series_list, dtype=np.float64)
             X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split_from_series(
                 series_arr, lookback, period, label="series"
             )
@@ -187,6 +272,7 @@ def _get_or_fit(req: "ForecastRequest") -> dict:
         "normalizer": normalizer,
         "period": period,
         "n_input_points": n_input_points,
+        "series_id": series_id,
     }
     with _cache_lock:
         # Another request for the same key may have raced this one and won
@@ -220,16 +306,26 @@ ModelName = Literal["naive", "seasonal_naive", "lstm"]
 
 class ForecastRequest(BaseModel):
     dataset: DatasetName | None = Field(
-        None, description="one of the 3 bundled datasets -- exactly one of `dataset`/`series` is required"
+        None, description="one of the 3 bundled datasets -- exactly one of `dataset`/`series`/`series_id` is required"
     )
     series: list[float] | None = Field(
         None,
         min_length=30,
         description=(
             "a user-supplied series instead of a bundled dataset (v0.13) -- exactly one of "
-            "`dataset`/`series` is required. 30 points is a practical floor: `_prepare_split_from_series` "
-            "needs at least 5 train + 5 calibration + 5 test windows after the default lookback=12, and a "
-            "shorter series will likely still fail that check with a 422, just later and less clearly."
+            "`dataset`/`series`/`series_id` is required. 30 points is a practical floor: "
+            "`_prepare_split_from_series` needs at least 5 train + 5 calibration + 5 test windows after "
+            "the default lookback=12, and a shorter series will likely still fail that check with a 422, "
+            "just later and less clearly. Registered opportunistically under its own `series_id` (see "
+            "`ForecastResponse.series_id`) so a later request can reuse it without resending it."
+        ),
+    )
+    series_id: str | None = Field(
+        None,
+        description=(
+            "the id of a series registered earlier, via `POST /series` or returned from a previous "
+            "`/forecast` response (v0.14) -- exactly one of `dataset`/`series`/`series_id` is required. "
+            "A 404 means the id isn't (or is no longer; the store is a bounded LRU) known."
         ),
     )
     model: ModelName = Field("naive", description="point-forecast model to calibrate")
@@ -246,9 +342,10 @@ class ForecastRequest(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _exactly_one_of_dataset_or_series(self) -> "ForecastRequest":
-        if (self.dataset is None) == (self.series is None):
-            raise ValueError("exactly one of `dataset` or `series` is required")
+    def _exactly_one_source(self) -> "ForecastRequest":
+        provided = sum(x is not None for x in (self.dataset, self.series, self.series_id))
+        if provided != 1:
+            raise ValueError("exactly one of `dataset`, `series`, or `series_id` is required")
         return self
 
 
@@ -277,8 +374,30 @@ class ForecastResponse(BaseModel):
     alpha: float
     seed: int
     n_input_points: int
+    series_id: str | None = Field(
+        None,
+        description=(
+            "set whenever `dataset` is \"custom\" (i.e. the request used `series` or `series_id`), to "
+            "this series' registered id -- reuse it as `series_id` on a later request instead of "
+            "resending the series. None for a bundled-dataset request."
+        ),
+    )
     points: list[ForecastPoint]
     summary: ForecastSummary
+
+
+class SeriesRegisterRequest(BaseModel):
+    series: list[float] = Field(..., min_length=30, description="the series to register; see `ForecastRequest.series`")
+
+
+class SeriesRegisterResponse(BaseModel):
+    series_id: str
+    length: int
+
+
+class SeriesInfoResponse(BaseModel):
+    series_id: str
+    length: int
 
 
 @app.get("/health")
@@ -293,6 +412,25 @@ def datasets() -> dict:
             {"name": name, "description": desc} for name, desc in DATASET_DESCRIPTIONS.items()
         ]
     }
+
+
+@app.post("/series", response_model=SeriesRegisterResponse)
+def register_series(req: SeriesRegisterRequest) -> SeriesRegisterResponse:
+    series_id = _register_series(req.series)
+    return SeriesRegisterResponse(series_id=series_id, length=len(req.series))
+
+
+@app.get("/series/{series_id}", response_model=SeriesInfoResponse)
+def series_info(series_id: str) -> SeriesInfoResponse:
+    series = _resolve_series_id(series_id)
+    return SeriesInfoResponse(series_id=series_id, length=len(series))
+
+
+@app.delete("/series/{series_id}")
+def delete_series(series_id: str) -> dict:
+    with _series_lock:
+        existed = _series_store.pop(series_id, None) is not None
+    return {"deleted": existed}
 
 
 def _cache_key_to_dict(key: tuple) -> dict:
@@ -388,7 +526,7 @@ def forecast(req: ForecastRequest) -> ForecastResponse:
         n_test=cov["n_test"],
     )
 
-    response_dataset = "custom" if req.series is not None else req.dataset
+    response_dataset = "custom" if bundle["series_id"] is not None else req.dataset
 
     return ForecastResponse(
         dataset=response_dataset,
@@ -396,6 +534,7 @@ def forecast(req: ForecastRequest) -> ForecastResponse:
         alpha=req.alpha,
         seed=req.seed,
         n_input_points=bundle["n_input_points"],
+        series_id=bundle["series_id"],
         points=points,
         summary=summary,
     )

@@ -57,6 +57,16 @@ from the series store -- the cache key is the id string itself, not a
 lookup, so the raw series is only ever fetched from the store on an actual
 cache miss.
 
+v0.15: v0.14 itself flagged the natural follow-up -- a `series_id` is a
+content hash, not a sequence number, so there was no way to discover what's
+registered without already knowing an id (e.g. after an opportunistic
+registration from `/forecast`, if the caller only kept the forecast and not
+the id). `GET /series` lists every series currently in the store --
+`series_id`, `length` -- most-recently-used first, alongside the store's
+current `count` and `max_size`, using the exact same `SeriesInfoResponse`
+shape `GET /series/{series_id}` already returns per entry, so there's one
+response shape for "one series" either way.
+
 Honest scope, stated here and in the README: this is still a demo-quality
 serving layer. No auth, no rate limiting, no persistence across process
 restarts -- both the fit cache and the series store are in-memory only and
@@ -74,6 +84,9 @@ GET    /datasets            -- static metadata for the 3 bundled datasets.
 POST   /series               -- register a series, get back its `series_id`
                                  (idempotent: registering the same series
                                  twice returns the same id).
+GET    /series                -- list every series currently in the store
+                                 (series_id, length), most-recently-used
+                                 first, plus the store's count/max_size.
 GET    /series/{series_id}   -- check whether a `series_id` is still in the
                                  store, and its length.
 DELETE /series/{series_id}   -- remove a series from the store.
@@ -113,7 +126,7 @@ app = FastAPI(
         "you've registered once and referenced by id. "
         "Demo-quality: see the repo README for honest scope notes."
     ),
-    version="0.14",
+    version="0.15",
 )
 
 # Generic defaults used for a user-supplied series, which has no dataset
@@ -400,6 +413,14 @@ class SeriesInfoResponse(BaseModel):
     length: int
 
 
+class SeriesListResponse(BaseModel):
+    series: list[SeriesInfoResponse] = Field(
+        description="every series currently in the store, most-recently-used first"
+    )
+    count: int = Field(description="len(series) -- how many are currently registered")
+    max_size: int = Field(description="the store's capacity; the oldest entry is evicted past this")
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -418,6 +439,24 @@ def datasets() -> dict:
 def register_series(req: SeriesRegisterRequest) -> SeriesRegisterResponse:
     series_id = _register_series(req.series)
     return SeriesRegisterResponse(series_id=series_id, length=len(req.series))
+
+
+@app.get("/series", response_model=SeriesListResponse)
+def list_series() -> SeriesListResponse:
+    """Enumerate every series currently in the store (v0.15). Without this,
+    a caller has no way to discover what's registered without already
+    knowing an id -- ids are content hashes, not a sequence a client could
+    guess or iterate, and an inline `series` `/forecast` call registers one
+    "silently" (the id only ever surfaces in that one response). Ordered
+    most-recently-used first, the same recency `GET /series/{id}` and a
+    cache lookup already bump, so the most likely-relevant entries lead.
+    """
+    with _series_lock:
+        items = [
+            SeriesInfoResponse(series_id=sid, length=len(series))
+            for sid, series in reversed(list(_series_store.items()))
+        ]
+    return SeriesListResponse(series=items, count=len(items), max_size=_SERIES_STORE_MAX_SIZE)
 
 
 @app.get("/series/{series_id}", response_model=SeriesInfoResponse)

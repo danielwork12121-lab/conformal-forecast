@@ -989,6 +989,45 @@ evict an id while its fit is still cached, or vice versa). A `series_id`
 is therefore a same-process convenience, not a durable handle a client
 should expect to work indefinitely or across a restart.
 
+## Installable as a real dependency (v0.16)
+
+Through v0.15, `pyproject.toml` had no `[build-system]` table and no
+`packages` directive, so `pip install .` (and `pip install git+<this
+repo>`) failed outright: setuptools' automatic package discovery sees
+three top-level directories (`forecasting/`, `data/`, `results/`) and
+refuses to guess which one is the actual package. This was never caught
+because every install in this project's own history has been
+`pip install -r requirements.txt` against a checkout, which never
+triggers package discovery at all — it surfaced only when a second,
+downstream project (a commodity-price forecasting application) tried to
+depend on this repo as a real library via `pip install
+git+https://github.com/danielwork12121-lab/conformal-forecast.git`, which
+is exactly the use case a from-scratch forecasting library should support.
+Fixed by adding an explicit `[build-system]` table and
+`[tool.setuptools] packages = ["forecasting"]`, plus a real `dependencies`
+list (`numpy`, `pandas`, `torch` — what every core module actually needs
+at import time) so a downstream `pip install` resolves them automatically
+instead of silently leaving them missing. `fastapi`/`uvicorn`/`httpx`
+(needed only for the serving layer) and `matplotlib`/`pytest` (needed only
+for plotting/testing) moved to optional-dependency groups (`api`, `dev`)
+rather than being required for core library use.
+
+Also added: `prepare_split_from_series`, a public, stable-name wrapper
+around the existing `_prepare_split_from_series` (the shared chronological
+split / z-score normalize / sliding-window core this library's own API
+and tests already relied on internally). A downstream project reusing
+this library's forecasting logic needs the *same* split/window/normalize
+pipeline this library validates its own coverage guarantees against —
+not a second, potentially-drifting reimplementation of it — so this gives
+that a real public name instead of reaching into an underscore-prefixed
+internal. 2 new tests (159 → 161): the public wrapper is checked to return
+output identical to the private function it wraps, and to raise the same
+error on a too-short series. Verified end-to-end, not just unit-tested in
+isolation: a fresh `pip install -e .` of this exact fix (against this
+repo's own real pushed `main`, from a separate downstream checkout) is
+what caught the original packaging bug in the first place, and the same
+install was re-run clean after the fix, before this shipped.
+
 ## Architecture
 
 ```
@@ -1013,7 +1052,10 @@ forecasting/
                  # _prepare_split_from_series (v0.13): the shared split/
                  # window/normalize/validate core, extracted from
                  # _prepare_split so the API's user-supplied-series path
-                 # can reuse it exactly
+                 # can reuse it exactly; prepare_split_from_series (v0.16):
+                 # a public, stable-name wrapper around the same function,
+                 # for downstream projects depending on this repo as a
+                 # library rather than reaching into an internal
   api.py         # FastAPI app wrapping _prepare_split / _prepare_split_from_series
                  # + SplitConformalForecaster: GET /health, GET /datasets,
                  # POST /forecast (v0.11, accepts dataset OR series as of v0.13,
@@ -1028,7 +1070,7 @@ forecasting/
                  # `sliding-window [...]` / `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]` / `serve [--host --port --reload]`
-tests/           # 159 tests, including the coverage-tracking statistical checks above
+tests/           # 161 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -1036,8 +1078,9 @@ results/         # generated plots (checked in so the README renders without rer
 ## Running it yourself
 
 ```bash
-pip install -r requirements.txt
-python -m pytest                                    # 159 tests
+pip install -r requirements.txt       # from a checkout
+# or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
+python -m pytest                                    # 161 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -1085,6 +1128,14 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   (e.g. one new point per request) instead of always being posted whole —
   would need an actual incremental-update story for the fit cache, which
   right now only ever caches one fully-formed fit per key.
+- This repo is now a real, installable dependency (v0.16) for a second,
+  separate project
+  ([kalshi-commodity-forecaster](https://github.com/danielwork12121-lab/kalshi-commodity-forecaster))
+  that applies this library's calibrated forecasting to real commodity
+  price data. If that project's needs expose another internal that should
+  really be public (the way `prepare_split_from_series` was), do the same
+  thing again: add a stable public wrapper, don't ask the downstream
+  project to work around it.
 
 ## License
 

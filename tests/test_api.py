@@ -637,6 +637,12 @@ def _fresh_series_store(monkeypatch) -> None:
     from collections import OrderedDict
 
     monkeypatch.setattr(api_module, "_series_store", OrderedDict())
+    # Also give the idle-TTL bookkeeping (v0.17) a clean slate, for the same
+    # reason: it's module-level shared state that would otherwise carry
+    # leftover entries (and thus leftover last-access timestamps) across
+    # tests, even though those entries belong to different series ids than
+    # whatever a given test registers.
+    monkeypatch.setattr(api_module, "_series_last_access", {})
 
 
 def test_list_series_reflects_empty_store(monkeypatch):
@@ -722,3 +728,129 @@ def test_list_series_includes_opportunistically_registered_inline_series(monkeyp
     assert body["series"] == [{"series_id": series_id, "length": 250}]
 
     client.delete("/cache")
+
+
+# --- Idle-TTL eviction for the series store (v0.17) -------------------------
+#
+# A series can now age out two independent ways: capacity (tested above,
+# unchanged) or idle time. `_clock` is monkeypatched to a fake, test-
+# controlled clock rather than sleeping for real, the same reason
+# `_SERIES_STORE_MAX_SIZE` is monkeypatched above instead of registering 32
+# real series to force a real eviction.
+
+
+def _fake_clock(monkeypatch, start: float = 1_000.0):
+    """Install a fake, test-advanceable clock in place of `_clock` and
+    return a function that advances it by `seconds`.
+    """
+    import forecasting.api as api_module
+
+    state = {"now": start}
+    monkeypatch.setattr(api_module, "_clock", lambda: state["now"])
+
+    def advance(seconds: float) -> None:
+        state["now"] += seconds
+
+    return advance
+
+
+def test_series_survives_within_ttl_window(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_TTL_SECONDS", 100.0)
+    advance = _fake_clock(monkeypatch)
+
+    series_id = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=41)}).json()["series_id"]
+    advance(50.0)  # well under the 100s TTL
+
+    assert client.get(f"/series/{series_id}").status_code == 200
+    assert client.get("/series").json()["count"] == 1
+
+
+def test_series_expires_after_ttl_and_disappears_from_listing(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_TTL_SECONDS", 100.0)
+    advance = _fake_clock(monkeypatch)
+
+    series_id = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=42)}).json()["series_id"]
+    advance(150.0)  # past the 100s TTL, nothing else touched it in between
+
+    resp = client.get(f"/series/{series_id}")
+    assert resp.status_code == 404
+
+    body = client.get("/series").json()
+    assert body["count"] == 0
+    assert body["series"] == []
+
+
+def test_resolving_a_series_resets_its_ttl(monkeypatch):
+    """Touching a series (via GET /series/{id}, or the fit-cache path that
+    calls the same resolver) refreshes its idle clock -- the same recency
+    semantics the LRU-capacity eviction already relies on, now also
+    protecting against idle-TTL eviction."""
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_TTL_SECONDS", 100.0)
+    advance = _fake_clock(monkeypatch)
+
+    series_id = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=43)}).json()["series_id"]
+    advance(80.0)  # under the TTL
+    assert client.get(f"/series/{series_id}").status_code == 200  # touches it, resets the idle clock
+
+    advance(80.0)  # another 80s -- 160s since registration, but only 80s since the touch above
+    assert client.get(f"/series/{series_id}").status_code == 200
+
+
+def test_ttl_expiry_does_not_affect_unexpired_siblings(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_TTL_SECONDS", 100.0)
+    advance = _fake_clock(monkeypatch)
+
+    id_old = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=44)}).json()["series_id"]
+    advance(90.0)
+    id_new = client.post("/series", json={"series": _make_synthetic_series(n=41, seed=45)}).json()["series_id"]
+    advance(20.0)  # id_old is now 110s idle (expired); id_new is only 20s idle (fine)
+
+    body = client.get("/series").json()
+    assert body["count"] == 1
+    assert [s["series_id"] for s in body["series"]] == [id_new]
+    assert client.get(f"/series/{id_old}").status_code == 404
+    assert client.get(f"/series/{id_new}").status_code == 200
+
+
+def test_ttl_eviction_does_not_leak_last_access_bookkeeping(monkeypatch):
+    """An id evicted by TTL (or by capacity -- see the LRU-capacity test
+    above) must not leave a dangling entry in `_series_last_access`; that
+    dict's size should track the store's real size, not grow unbounded as
+    series come and go."""
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_TTL_SECONDS", 100.0)
+    advance = _fake_clock(monkeypatch)
+
+    client.post("/series", json={"series": _make_synthetic_series(n=40, seed=46)})
+    advance(150.0)
+    client.get("/series")  # triggers the sweep
+
+    assert len(api_module._series_last_access) == 0
+    assert len(api_module._series_store) == 0
+
+
+def test_capacity_eviction_also_cleans_up_last_access_bookkeeping(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_MAX_SIZE", 1)
+
+    client.post("/series", json={"series": _make_synthetic_series(n=40, seed=47)})
+    client.post("/series", json={"series": _make_synthetic_series(n=41, seed=48)})  # evicts the first by capacity
+
+    assert len(api_module._series_store) == 1
+    assert len(api_module._series_last_access) == 1

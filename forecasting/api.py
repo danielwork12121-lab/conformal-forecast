@@ -67,6 +67,22 @@ current `count` and `max_size`, using the exact same `SeriesInfoResponse`
 shape `GET /series/{series_id}` already returns per entry, so there's one
 response shape for "one series" either way.
 
+v0.17: the series store (v0.14) only ever evicted by *capacity*
+(`_SERIES_STORE_MAX_SIZE`) -- a deployment that only ever registers a
+handful of series at a time would keep every one of them in memory
+indefinitely, since the LRU eviction path only triggers once the store is
+actually full. This adds a second, independent eviction policy: a series
+idle (not registered or resolved) for more than `_SERIES_STORE_TTL_SECONDS`
+is purged even when the store is nowhere near capacity. Purging happens
+lazily -- on every `POST /series`, `GET /series/{id}`, and `GET /series`
+call, before that call's own logic runs -- rather than via a background
+thread, which keeps the store's state trivially easy to reason about
+(single lock, no timer thread, no shutdown-cleanup concern) at the cost of
+a series technically outliving its TTL if nothing ever touches the store
+again. No response shape changed: a caller sees exactly what it already
+saw for a `series_id` that aged out by capacity -- `GET /series/{id}`
+returns 404, and the id is absent from `GET /series`'s listing.
+
 Honest scope, stated here and in the README: this is still a demo-quality
 serving layer. No auth, no rate limiting, no persistence across process
 restarts -- both the fit cache and the series store are in-memory only and
@@ -87,8 +103,12 @@ POST   /series               -- register a series, get back its `series_id`
 GET    /series                -- list every series currently in the store
                                  (series_id, length), most-recently-used
                                  first, plus the store's count/max_size.
+                                 An idle-TTL sweep (v0.17) runs before the
+                                 listing, so an entry that's aged out is
+                                 already gone from it.
 GET    /series/{series_id}   -- check whether a `series_id` is still in the
-                                 store, and its length.
+                                 store, and its length. 404 if it's aged out
+                                 either by capacity or by idle-TTL (v0.17).
 DELETE /series/{series_id}   -- remove a series from the store.
 POST   /forecast             -- run one model on one dataset OR one
                                  user-supplied series OR a previously
@@ -106,6 +126,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import time
 from collections import OrderedDict
 from typing import Literal
 
@@ -126,7 +147,7 @@ app = FastAPI(
         "you've registered once and referenced by id. "
         "Demo-quality: see the repo README for honest scope notes."
     ),
-    version="0.15",
+    version="0.17",
 )
 
 # Generic defaults used for a user-supplied series, which has no dataset
@@ -167,29 +188,73 @@ _SERIES_STORE_MAX_SIZE = 32
 _series_store: "OrderedDict[str, list[float]]" = OrderedDict()
 _series_lock = threading.Lock()
 
+# --- Idle-TTL eviction for the series store (v0.17) -------------------------
+# A second, independent eviction policy alongside the capacity-based LRU
+# above: a series untouched for more than `_SERIES_STORE_TTL_SECONDS` is
+# purged even if the store isn't full. `_clock` is a module-level function
+# (never called as `time.monotonic()` directly elsewhere in this file) so
+# tests can monkeypatch it to simulate time passing without a real sleep.
+# `_series_last_access` is kept in lockstep with `_series_store` -- an id is
+# never present in one without the other once a lock-holding function
+# returns.
+_SERIES_STORE_TTL_SECONDS = 3600.0
+_series_last_access: dict[str, float] = {}
+
+
+def _clock() -> float:
+    return time.monotonic()
+
+
+def _purge_expired_series_locked() -> None:
+    """Evict every series idle longer than `_SERIES_STORE_TTL_SECONDS`.
+
+    Caller must already hold `_series_lock`.
+    """
+    now = _clock()
+    expired = [
+        sid
+        for sid, last_seen in _series_last_access.items()
+        if now - last_seen > _SERIES_STORE_TTL_SECONDS
+    ]
+    for sid in expired:
+        _series_store.pop(sid, None)
+        _series_last_access.pop(sid, None)
+
+
+def _touch_series_locked(series_id: str) -> None:
+    """Record that `series_id` was just used. Caller must hold `_series_lock`."""
+    _series_last_access[series_id] = _clock()
+
 
 def _register_series(series: list[float]) -> str:
     """Store `series` under its content hash (idempotent -- registering the
-    same series twice just refreshes its LRU position) and return the id.
+    same series twice just refreshes its LRU position and its TTL) and
+    return the id.
     """
     series_id = _series_cache_id(series)
     with _series_lock:
+        _purge_expired_series_locked()
         _series_store[series_id] = series
         _series_store.move_to_end(series_id)
+        _touch_series_locked(series_id)
         while len(_series_store) > _SERIES_STORE_MAX_SIZE:
-            _series_store.popitem(last=False)
+            evicted_id, _ = _series_store.popitem(last=False)
+            _series_last_access.pop(evicted_id, None)
     return series_id
 
 
 def _resolve_series_id(series_id: str) -> list[float]:
     """Look up a previously registered series by id, bumping its LRU
-    position. Raises HTTPException(404) if it's not (or no longer) in the
-    store -- the store is a bounded LRU, so an id can legitimately age out.
+    position and its TTL. Raises HTTPException(404) if it's not (or no
+    longer) in the store -- a series can legitimately age out either by
+    capacity or by idle-TTL (v0.17).
     """
     with _series_lock:
+        _purge_expired_series_locked()
         series = _series_store.get(series_id)
         if series is not None:
             _series_store.move_to_end(series_id)
+            _touch_series_locked(series_id)
     if series is None:
         raise HTTPException(status_code=404, detail=f"no series registered with id {series_id!r}")
     return series
@@ -450,8 +515,11 @@ def list_series() -> SeriesListResponse:
     "silently" (the id only ever surfaces in that one response). Ordered
     most-recently-used first, the same recency `GET /series/{id}` and a
     cache lookup already bump, so the most likely-relevant entries lead.
+    Runs the idle-TTL sweep (v0.17) first, so an entry that's aged out
+    never appears in the listing.
     """
     with _series_lock:
+        _purge_expired_series_locked()
         items = [
             SeriesInfoResponse(series_id=sid, length=len(series))
             for sid, series in reversed(list(_series_store.items()))
@@ -469,6 +537,7 @@ def series_info(series_id: str) -> SeriesInfoResponse:
 def delete_series(series_id: str) -> dict:
     with _series_lock:
         existed = _series_store.pop(series_id, None) is not None
+        _series_last_access.pop(series_id, None)
     return {"deleted": existed}
 
 

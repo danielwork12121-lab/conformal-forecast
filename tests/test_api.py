@@ -618,3 +618,107 @@ def test_forecast_inline_series_is_reusable_by_id_without_resending_it():
     assert second.json()["n_input_points"] == 250
 
     client.delete("/cache")
+
+
+# --- Listing registered series (v0.15) --------------------------------------
+#
+# The whole store is module-level shared state, re-registered-into by every
+# test above (and never fully cleared, since there was no bulk-clear
+# endpoint before this feature). Rather than asserting exact contents against
+# that shared history, every test below first swaps in a fresh, empty
+# `_series_store` via `monkeypatch.setattr` (auto-reverted after the test,
+# same technique the cache-eviction tests above already use for
+# `_CACHE_MAX_SIZE`) so each test's listing assertions are exact and order
+# does not depend on what ran before it.
+
+
+def _fresh_series_store(monkeypatch) -> None:
+    import forecasting.api as api_module
+    from collections import OrderedDict
+
+    monkeypatch.setattr(api_module, "_series_store", OrderedDict())
+
+
+def test_list_series_reflects_empty_store(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    resp = client.get("/series")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["series"] == []
+    assert body["count"] == 0
+    import forecasting.api as api_module
+
+    assert body["max_size"] == api_module._SERIES_STORE_MAX_SIZE
+
+
+def test_list_series_includes_registered_entries_with_correct_lengths(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    id_a = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=30)}).json()["series_id"]
+    id_b = client.post("/series", json={"series": _make_synthetic_series(n=55, seed=31)}).json()["series_id"]
+
+    body = client.get("/series").json()
+    assert body["count"] == 2
+    lengths_by_id = {s["series_id"]: s["length"] for s in body["series"]}
+    assert lengths_by_id == {id_a: 40, id_b: 55}
+
+
+def test_list_series_orders_most_recently_used_first(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    id_a = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=32)}).json()["series_id"]
+    id_b = client.post("/series", json={"series": _make_synthetic_series(n=41, seed=33)}).json()["series_id"]
+    id_c = client.post("/series", json={"series": _make_synthetic_series(n=42, seed=34)}).json()["series_id"]
+    # Registration order so far (oldest -> newest use): a, b, c. Touching a
+    # via GET bumps it to most-recently-used, without changing b/c's relative
+    # order -- the same recency semantics /forecast's cache miss path and a
+    # repeat GET /series/{id} already rely on.
+    client.get(f"/series/{id_a}")
+
+    body = client.get("/series").json()
+    assert [s["series_id"] for s in body["series"]] == [id_a, id_c, id_b]
+
+
+def test_list_series_respects_store_capacity_after_eviction(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_MAX_SIZE", 2)
+
+    client.post("/series", json={"series": _make_synthetic_series(n=40, seed=35)})
+    id_b = client.post("/series", json={"series": _make_synthetic_series(n=41, seed=36)}).json()["series_id"]
+    id_c = client.post("/series", json={"series": _make_synthetic_series(n=42, seed=37)}).json()["series_id"]
+
+    body = client.get("/series").json()
+    assert body["max_size"] == 2
+    assert body["count"] == 2
+    assert {s["series_id"] for s in body["series"]} == {id_b, id_c}, (
+        "the first-registered series was least-recently-used and should have been evicted"
+    )
+
+
+def test_list_series_reflects_deletion(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    id_a = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=38)}).json()["series_id"]
+    id_b = client.post("/series", json={"series": _make_synthetic_series(n=41, seed=39)}).json()["series_id"]
+    client.delete(f"/series/{id_a}")
+
+    body = client.get("/series").json()
+    assert body["count"] == 1
+    assert [s["series_id"] for s in body["series"]] == [id_b]
+
+
+def test_list_series_includes_opportunistically_registered_inline_series(monkeypatch):
+    """The feature's actual motivation: an inline `series` /forecast call
+    registers a series "silently" -- this is the one place that id becomes
+    discoverable again without already having kept the forecast response."""
+    _fresh_series_store(monkeypatch)
+    client.delete("/cache")
+    series = _make_synthetic_series(n=250, seed=40)
+
+    resp = client.post("/forecast", json={"series": series, "model": "naive"})
+    series_id = resp.json()["series_id"]
+
+    body = client.get("/series").json()
+    assert body["count"] == 1
+    assert body["series"] == [{"series_id": series_id, "length": 250}]
+
+    client.delete("/cache")

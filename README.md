@@ -818,7 +818,7 @@ default, both remain independently opt-in exactly as before, and this
 finding only closes the open question of whether to recommend combining
 them (answer: no).
 
-## Serving it as an API (v0.11, caching in v0.12, user series in v0.13, dataset handles in v0.14, listing in v0.15)
+## Serving it as an API (v0.11, caching in v0.12, user series in v0.13, dataset handles in v0.14, listing in v0.15, idle-TTL eviction in v0.17)
 
 Everything above is driven through the CLI, one process invocation at a
 time. `forecasting/api.py` wraps the exact same pipeline — `_prepare_split`
@@ -836,7 +836,8 @@ python -m forecasting.cli serve --port 8000
 - `POST /series` / `GET /series` / `GET /series/{series_id}` /
   `DELETE /series/{series_id}` — v0.14: register a series once, get back an
   id to reuse (below); v0.15: `GET /series` (no id) lists every series
-  currently registered.
+  currently registered; v0.17: an entry also ages out automatically after
+  an idle period, independent of the store's capacity (below).
 - `POST /forecast` — body is `{"dataset": "airline", "model": "lstm", "alpha": 0.1, "seed": 0, "max_points": 10}`,
   or, as of v0.13, `{"series": [50.1, 51.3, ...], "model": "lstm", "alpha": 0.1}`,
   or, as of v0.14, `{"series_id": "a1b2c3...", "model": "lstm", "alpha": 0.1}`
@@ -989,6 +990,39 @@ evict an id while its fit is still cached, or vice versa). A `series_id`
 is therefore a same-process convenience, not a durable handle a client
 should expect to work indefinitely or across a restart.
 
+**Idle-TTL eviction for the series store (v0.17):** through v0.16, the
+series store only ever evicted by *capacity* (`_SERIES_STORE_MAX_SIZE =
+32`) — a deployment that only ever registers a handful of series at once
+would keep every one of them in memory indefinitely, since the
+LRU-eviction path only triggers once the store is actually full (this was
+the exact gap v0.15's own "What's next" flagged: an id's lifetime
+shouldn't depend on how many *other* series get registered after it). A
+series not registered, resolved, or listed-and-still-present for more
+than `_SERIES_STORE_TTL_SECONDS` (3600s, i.e. one hour, by default) is now
+purged even when the store is nowhere near capacity. The sweep runs
+lazily — at the top of `POST /series`, `GET /series/{id}`, and `GET
+/series` — rather than on a background timer thread, which keeps the
+store's concurrency story exactly as simple as it already was (one lock,
+no second thread to start/stop, nothing to clean up on shutdown) at the
+honestly-stated cost that a series can outlive its nominal TTL by however
+long it takes for the next call of any kind to trigger a sweep. No
+response shape changed — a caller sees exactly what it already saw for an
+id that aged out by capacity: `GET /series/{id}` 404s, and the id is
+simply absent from `GET /series`'s listing. 6 new tests (161 → 167), all
+driven by a monkeypatched fake clock (the same reason `_SERIES_STORE_MAX_SIZE`
+above is monkeypatched to a small value rather than registering 32 real
+series): a series survives a check well inside its TTL; it expires and
+disappears from both `GET /series/{id}` and the listing once idle past
+it; resolving a series (`GET /series/{id}`) resets its idle clock, so
+periodic use keeps it alive indefinitely; one series expiring doesn't
+touch an unexpired sibling; and two bookkeeping tests confirming the
+parallel `_series_last_access` dict never leaks a dangling entry after
+either TTL eviction or capacity eviction (the latter was a real, if minor,
+pre-existing gap in the v0.14 capacity-eviction path, fixed as part of
+this change: the original `popitem(last=False)` dropped an id from
+`_series_store` without a matching cleanup step, since there was nothing
+else to clean up before this dict existed).
+
 ## Installable as a real dependency (v0.16)
 
 Through v0.15, `pyproject.toml` had no `[build-system]` table and no
@@ -1065,12 +1099,13 @@ forecasting/
                  # excluding alpha (v0.12, tagged v0.13); POST /series,
                  # GET /series (v0.15: list every registered series),
                  # GET /series/{id}, DELETE /series/{id} + a second, independently
-                 # bounded LRU storing raw series by their fit-cache hash (v0.14)
+                 # bounded LRU storing raw series by their fit-cache hash (v0.14),
+                 # now also idle-TTL evicted (v0.17), independent of capacity
   cli.py         # `python -m forecasting.cli benchmark [...]` /
                  # `sliding-window [...]` / `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]` / `serve [--host --port --reload]`
-tests/           # 161 tests, including the coverage-tracking statistical checks above
+tests/           # 167 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -1080,7 +1115,7 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 161 tests
+python -m pytest                                    # 167 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -1119,11 +1154,15 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   `POST /series` / `GET /series/{id}` / `DELETE /series/{id}`, plus
   opportunistic registration from `/forecast` itself — see the API
   section above. Its own follow-up, a `GET /series` listing endpoint, is
-  now shipped too (v0.15). The natural next step in this vein would be
-  giving the series store an actual TTL instead of pure LRU-by-capacity,
-  so an id's lifetime is predictable rather than dependent on how many
-  *other* series get registered after it — `GET /series` would then also
-  be the natural place to surface each entry's remaining TTL.
+  now shipped too (v0.15), and that endpoint's own follow-up — giving the
+  series store an actual idle TTL instead of pure LRU-by-capacity — is
+  now shipped too (v0.17). The natural remaining follow-up in this vein:
+  `GET /series` could surface each entry's remaining idle-TTL budget
+  (e.g. `idle_seconds`/`expires_in_seconds` per entry) rather than just
+  whether it's still present, so a client could tell the difference
+  between "fresh" and "about to age out" without this repo breaking the
+  deliberately exact, equality-based response-shape tests the current
+  listing has.
 - A WebSocket or streaming endpoint for a series that grows over time
   (e.g. one new point per request) instead of always being posted whole —
   would need an actual incremental-update story for the fit cache, which

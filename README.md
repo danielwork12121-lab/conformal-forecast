@@ -818,12 +818,12 @@ default, both remain independently opt-in exactly as before, and this
 finding only closes the open question of whether to recommend combining
 them (answer: no).
 
-## Serving it as an API (v0.11, caching in v0.12, user series in v0.13, dataset handles in v0.14)
+## Serving it as an API (v0.11, caching in v0.12, user series in v0.13, dataset handles in v0.14, listing in v0.15)
 
 Everything above is driven through the CLI, one process invocation at a
 time. `forecasting/api.py` wraps the exact same pipeline — `_prepare_split`
 / `_prepare_split_from_series` + `SplitConformalForecaster`, the code path
-`run_experiment` and 153 of this repo's tests already exercise — behind a
+`run_experiment` and 159 of this repo's tests already exercise — behind a
 minimal REST API, so another program can call it instead of parsing a
 markdown table:
 
@@ -833,8 +833,10 @@ python -m forecasting.cli serve --port 8000
 
 - `GET /health` — liveness check.
 - `GET /datasets` — static metadata for the 3 bundled datasets.
-- `POST /series` / `GET /series/{series_id}` / `DELETE /series/{series_id}`
-  — v0.14: register a series once, get back an id to reuse (below).
+- `POST /series` / `GET /series` / `GET /series/{series_id}` /
+  `DELETE /series/{series_id}` — v0.14: register a series once, get back an
+  id to reuse (below); v0.15: `GET /series` (no id) lists every series
+  currently registered.
 - `POST /forecast` — body is `{"dataset": "airline", "model": "lstm", "alpha": 0.1, "seed": 0, "max_points": 10}`,
   or, as of v0.13, `{"series": [50.1, 51.3, ...], "model": "lstm", "alpha": 0.1}`,
   or, as of v0.14, `{"series_id": "a1b2c3...", "model": "lstm", "alpha": 0.1}`
@@ -861,6 +863,28 @@ numeric agreement (`np.testing.assert_allclose`, `rtol=1e-5`) against the
 same forecast computed by calling `forecasting.conformal` /
 `forecasting.experiment` directly, so the API can't silently drift from
 the library it wraps.
+
+**Listing registered series (v0.15):** `GET /series` enumerates every
+series currently in the store — `series_id` and `length` for each, plus
+the store's `count` and `max_size` — most-recently-used first (the same
+recency a cache lookup or `GET /series/{id}` already bumps). This closes
+the gap v0.14 itself left open: a `series_id` is a content hash, not a
+sequence number, so there was previously no way to discover what's
+registered without already having kept an id from an earlier response —
+including the common case of an inline `series` `/forecast` call, which
+registers its series "silently" and only ever surfaces the id in that one
+response. 6 new tests (153 → 159), each isolating the module-level store
+behind a fresh, empty one via `monkeypatch` (the same technique the
+cache-eviction tests already use for `_CACHE_MAX_SIZE`, applied here to
+`_series_store`, so a listing assertion's exact contents never depend on
+what ran before it): an empty store lists as `{"series": [], "count": 0,
+"max_size": ...}`; two freshly registered series both appear with correct
+lengths; touching one via `GET /series/{id}` moves it to the front of the
+listing without reordering the other two; registering past a (monkeypatched,
+smaller) `max_size` leaves only the most-recently-used entries, matching
+`count`/`max_size` exactly; deleting a series removes it from the listing;
+and an inline-`series` `/forecast` call's opportunistically-registered
+series shows up in the listing with the right id and length.
 
 **Caching a fitted forecaster (v0.12):** v0.11 refit the requested model
 from scratch on every `/forecast` call, which the README flagged at the
@@ -997,13 +1021,14 @@ forecasting/
                  # a bounded-LRU fitted-forecaster cache keyed on (source-tag,
                  # dataset-or-series-hash, model, seed, lookback, period),
                  # excluding alpha (v0.12, tagged v0.13); POST /series,
+                 # GET /series (v0.15: list every registered series),
                  # GET /series/{id}, DELETE /series/{id} + a second, independently
                  # bounded LRU storing raw series by their fit-cache hash (v0.14)
   cli.py         # `python -m forecasting.cli benchmark [...]` /
                  # `sliding-window [...]` / `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]` / `serve [--host --port --reload]`
-tests/           # 153 tests, including the coverage-tracking statistical checks above
+tests/           # 159 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -1012,7 +1037,7 @@ results/         # generated plots (checked in so the README renders without rer
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                                    # 153 tests
+python -m pytest                                    # 159 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -1050,12 +1075,12 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
 - The "dataset handle" endpoint proposed here is now shipped (v0.14):
   `POST /series` / `GET /series/{id}` / `DELETE /series/{id}`, plus
   opportunistic registration from `/forecast` itself — see the API
-  section above. The natural next step in this vein would be a `GET
-  /series` listing endpoint (there's currently no way to enumerate what's
-  registered without already knowing an id), or giving the series store
-  an actual TTL instead of pure LRU-by-capacity, so an id's lifetime is
-  predictable rather than dependent on how many *other* series get
-  registered after it.
+  section above. Its own follow-up, a `GET /series` listing endpoint, is
+  now shipped too (v0.15). The natural next step in this vein would be
+  giving the series store an actual TTL instead of pure LRU-by-capacity,
+  so an id's lifetime is predictable rather than dependent on how many
+  *other* series get registered after it — `GET /series` would then also
+  be the natural place to surface each entry's remaining TTL.
 - A WebSocket or streaming endpoint for a series that grows over time
   (e.g. one new point per request) instead of always being posted whole —
   would need an actual incremental-update story for the fit cache, which

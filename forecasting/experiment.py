@@ -92,6 +92,28 @@ def _prepare_split_from_series(
     return X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period
 
 
+def prepare_split_from_series(
+    series: np.ndarray,
+    lookback: int,
+    period: int,
+    label: str = "series",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Normalizer, int]:
+    """Public entry point for the shared split/window/normalize/validate core (v0.16).
+
+    `_prepare_split_from_series` above does the real work and stays the
+    internal name this module's own API/CLI paths call; this is a
+    stable-name public wrapper around it with no behavior difference,
+    added specifically so a project depending on conformal-forecast as a
+    real library (e.g. a downstream forecasting application) can reuse the
+    exact same chronological-split + normalize + window pipeline this
+    library validates its own coverage guarantees against, instead of
+    reimplementing a second, potentially-drifting version of it. Returns
+    the same 8-tuple as `_prepare_split_from_series` -- see that
+    function's docstring for the full field-by-field explanation.
+    """
+    return _prepare_split_from_series(series, lookback, period, label=label)
+
+
 def _prepare_split(
     dataset: str,
     lookback: int | None,

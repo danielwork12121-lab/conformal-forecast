@@ -1,8 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "conformal-forecast"
-version = "0.1.0"
+version = "0.16.0"
 description = "Time-series forecasting with calibrated, verified uncertainty intervals via split conformal prediction."
 requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+# Only needed for the FastAPI serving layer (forecasting.api / `cli.py serve`),
+# not for using the core forecasting/conformal-calibration library directly.
+api = ["fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
+dev = ["pytest>=7.4", "matplotlib>=3.7"]
+
+[tool.setuptools]
+packages = ["forecasting"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -818,7 +818,7 @@ default, both remain independently opt-in exactly as before, and this
 finding only closes the open question of whether to recommend combining
 them (answer: no).
 
-## Serving it as an API (v0.11, caching in v0.12, user series in v0.13, dataset handles in v0.14, listing in v0.15, idle-TTL eviction in v0.17, per-entry TTL remaining in v0.18)
+## Serving it as an API (v0.11, caching in v0.12, user series in v0.13, dataset handles in v0.14, listing in v0.15, idle-TTL eviction in v0.17, per-entry TTL remaining in v0.18, PATCH-to-refresh in v0.19)
 
 Everything above is driven through the CLI, one process invocation at a
 time. `forecasting/api.py` wraps the exact same pipeline — `_prepare_split`
@@ -834,13 +834,14 @@ python -m forecasting.cli serve --port 8000
 - `GET /health` — liveness check.
 - `GET /datasets` — static metadata for the 3 bundled datasets.
 - `POST /series` / `GET /series` / `GET /series/{series_id}` /
-  `DELETE /series/{series_id}` — v0.14: register a series once, get back an
+  `PATCH /series/{series_id}` / `DELETE /series/{series_id}` — v0.14: register a series once, get back an
   id to reuse (below); v0.15: `GET /series` (no id) lists every series
   currently registered; v0.17: an entry also ages out automatically after
   an idle period, independent of the store's capacity (below); v0.18:
   `GET /series`'s listing reports each entry's `ttl_remaining_seconds`
   (below). `GET /series/{series_id}`'s own response shape is unchanged by
-  v0.18 — the new field is list-only.
+  v0.18 — the new field is list-only; v0.19: `PATCH /series/{series_id}`
+  refreshes that same idle-TTL clock directly, without requiring a GET.
 - `POST /forecast` — body is `{"dataset": "airline", "model": "lstm", "alpha": 0.1, "seed": 0, "max_points": 10}`,
   or, as of v0.13, `{"series": [50.1, 51.3, ...], "model": "lstm", "alpha": 0.1}`,
   or, as of v0.14, `{"series_id": "a1b2c3...", "model": "lstm", "alpha": 0.1}`
@@ -1067,6 +1068,33 @@ restored both — re-added as `tests/test_api.py`'s final 3 tests (170 →
 173) and the `now` parameter — on top of the version that's actually live,
 rather than reverting or force-pushing either prior run's history.
 
+**`PATCH /series/{series_id}`: refreshing idle-TTL without a throwaway GET
+(v0.19):** v0.17/v0.18's own "What's next" named this gap directly — the
+only way to keep a series alive past its idle TTL was to `GET` it (or
+resolve it via `/forecast`), forcing a caller with nothing new to ask yet
+to either discard a response it doesn't need or duplicate a lookup it's
+about to do anyway just to avoid losing the id to the idle sweep. `PATCH
+/series/{series_id}` refreshes the idle-TTL clock directly — "still
+interested in this one" without the series' data traveling back and forth
+for no reason. Shares `_resolve_series_id`'s exact purge → check → touch
+sequence under one lock acquisition (`_touch_series_ttl`), so a PATCH and
+a GET are indistinguishable in their effect on the store's bookkeeping:
+same 404 on an id that's already aged out (by capacity or by idle-TTL),
+same LRU-position bump. The response reuses `SeriesListItemResponse` (the
+v0.18 shape) rather than introducing a fourth response model — "one series
+plus how much idle time it has left" is exactly what both `GET /series`'s
+items and this endpoint's response already are, and since a successful
+PATCH always refreshes to the *full* TTL by construction, the response's
+`ttl_remaining_seconds` is always exactly `_SERIES_STORE_TTL_SECONDS`, not
+a value that needs a second clock read to compute. 6 new tests (173 →
+179): refreshing resets the clock to the full budget (checked both in the
+PATCH response and in a later listing); a PATCH on an unknown id 404s;
+a PATCH on an id that's already aged out by idle-TTL 404s (doesn't
+resurrect it); PATCHing bumps LRU position exactly like a GET does;
+PATCHing one entry doesn't touch an unrelated sibling's own remaining
+TTL; and the response shape is exactly the three `SeriesListItemResponse`
+fields, no more, no less.
+
 ## Installable as a real dependency (v0.16)
 
 Through v0.15, `pyproject.toml` had no `[build-system]` table and no
@@ -1142,15 +1170,17 @@ forecasting/
                  # dataset-or-series-hash, model, seed, lookback, period),
                  # excluding alpha (v0.12, tagged v0.13); POST /series,
                  # GET /series (v0.15: list every registered series),
-                 # GET /series/{id}, DELETE /series/{id} + a second, independently
-                 # bounded LRU storing raw series by their fit-cache hash (v0.14),
-                 # now also idle-TTL evicted (v0.17), independent of capacity,
-                 # with GET /series reporting each entry's own TTL remaining (v0.18)
+                 # GET /series/{id}, PATCH /series/{id}, DELETE /series/{id} + a
+                 # second, independently bounded LRU storing raw series by their
+                 # fit-cache hash (v0.14), now also idle-TTL evicted (v0.17),
+                 # independent of capacity, with GET /series reporting each
+                 # entry's own TTL remaining (v0.18) and PATCH refreshing that
+                 # same TTL directly, without a throwaway GET (v0.19)
   cli.py         # `python -m forecasting.cli benchmark [...]` /
                  # `sliding-window [...]` / `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]` / `serve [--host --port --reload]`
-tests/           # 173 tests, including the coverage-tracking statistical checks above
+tests/           # 179 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -1160,7 +1190,7 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 173 tests
+python -m pytest                                    # 179 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -1204,11 +1234,11 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   now shipped too (v0.17), and that one's own natural follow-up — surfacing
   each entry's remaining idle-TTL budget in the listing — is now shipped
   too (v0.18, `ttl_remaining_seconds`), without breaking the single-entry
-  endpoint's own exact-equality test (the new field is list-only). The
-  natural remaining follow-up in this vein: a `PATCH /series/{id}` (or a
-  query flag on `GET /series/{id}`) to let a client explicitly "touch"
-  (refresh the TTL of) a series it cares about without needing to run a
-  real `/forecast` or re-register it.
+  endpoint's own exact-equality test (the new field is list-only). That
+  one's own natural follow-up — a `PATCH /series/{id}` to let a client
+  explicitly "touch" (refresh the TTL of) a series it cares about without
+  needing to run a real `/forecast` or re-register it — is now shipped too
+  (v0.19).
 - A WebSocket or streaming endpoint for a series that grows over time
   (e.g. one new point per request) instead of always being posted whole —
   would need an actual incremental-update story for the fit cache, which

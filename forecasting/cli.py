@@ -76,6 +76,13 @@ over the test window:
 
     python -m forecasting.cli enbpi --dataset airline --plot results/airline_enbpi.png
 
+Sweep EnbPI's own `window` size the same way `window-sweep` already does
+for ACI's sliding window (the bootstrap ensemble is trained once and
+reused across every value, since window has no effect on fitting -- see
+`forecasting/experiment.py`'s `run_enbpi_window_sweep_comparison`):
+
+    python -m forecasting.cli enbpi-window-sweep --dataset airline --windows 5,10,15,20,30,50,unbounded --plot results/airline_enbpi_window_sweep.png
+
 Serve the calibrated forecasts over a minimal REST API (see
 `forecasting/api.py` and the README's "Serving it as an API" section --
 demo-quality, not production: the LSTM refits per request):
@@ -91,6 +98,7 @@ from forecasting.experiment import (
     format_auto_window_selection,
     format_cv_window_selection,
     format_enbpi_comparison,
+    format_enbpi_window_sweep_comparison,
     format_results_table,
     format_sliding_window_comparison,
     format_window_sweep_comparison,
@@ -98,6 +106,7 @@ from forecasting.experiment import (
     run_auto_window_selection,
     run_cv_window_selection,
     run_enbpi_comparison,
+    run_enbpi_window_sweep_comparison,
     run_experiment,
     run_sliding_window_comparison,
     run_window_sweep_comparison,
@@ -216,6 +225,45 @@ def _plot_enbpi(dataset: str, comparison, path: str) -> None:
         fontsize=10,
     )
     ax1.legend(loc="upper left")
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def _plot_enbpi_window_sweep(dataset: str, comparison, path: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    windows = [r.window for r in comparison.results]
+    gaps = [r.enbpi["coverage_gap"] * 100 for r in comparison.results]
+    x = range(len(windows))
+    labels = ["unbounded" if w is None else str(w) for w in windows]
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(x, gaps, color="#9467bd", linewidth=1.5, marker="o", label="EnbPI")
+    ax.axhline(
+        comparison.fixed_pool["coverage_gap"] * 100,
+        color="#1f77b4",
+        linewidth=1.2,
+        linestyle="--",
+        label="fixed-pool ACI (window-independent)",
+    )
+    ax.axhline(
+        comparison.static["coverage_gap"] * 100,
+        color="#888888",
+        linewidth=1.0,
+        linestyle=":",
+        label="static split conformal",
+    )
+    ax.axhline(0.0, color="#222222", linewidth=0.8)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels)
+    ax.set_xlabel("window (max residual-pool size)")
+    ax.set_ylabel("coverage gap (pp, closer to 0 is better)")
+    ax.set_title(f"{dataset}: EnbPI coverage gap by window size")
+    ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=140)
     plt.close(fig)
@@ -390,6 +438,23 @@ def main() -> None:
     enbpi.add_argument("--plot", type=str, default=None, help="save a plot of EnbPI's residual pool size over the test window")
     enbpi.add_argument("--seed", type=int, default=0)
 
+    enbpi_sweep = sub.add_parser(
+        "enbpi-window-sweep",
+        help="sweep EnbPI's window size and compare coverage gap across values (mirrors window-sweep for ACI)",
+    )
+    enbpi_sweep.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    enbpi_sweep.add_argument("--alpha", type=float, default=0.1)
+    enbpi_sweep.add_argument("--gamma", type=float, default=0.05, help="fixed-pool ACI's step size (reference line only)")
+    enbpi_sweep.add_argument("--n-bootstrap", type=int, default=20, help="number of bootstrap ensemble members")
+    enbpi_sweep.add_argument(
+        "--windows",
+        type=str,
+        default="5,10,15,20,30,50,unbounded",
+        help="comma-separated list of window sizes to try; include 'unbounded' for the growing buffer",
+    )
+    enbpi_sweep.add_argument("--plot", type=str, default=None, help="save a plot of coverage gap vs. window size")
+    enbpi_sweep.add_argument("--seed", type=int, default=0)
+
     sweep = sub.add_parser(
         "window-sweep",
         help="sweep the sliding-pool ACI's window size and compare coverage gap across values",
@@ -512,6 +577,21 @@ def main() -> None:
         print()
         if args.plot:
             _plot_enbpi(args.dataset, comparison, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "enbpi-window-sweep":
+        windows = [None if w.strip().lower() == "unbounded" else int(w) for w in args.windows.split(",")]
+        comparison = run_enbpi_window_sweep_comparison(
+            args.dataset,
+            windows=windows,
+            alpha=args.alpha,
+            gamma=args.gamma,
+            n_bootstrap=args.n_bootstrap,
+            seed=args.seed,
+        )
+        print(format_enbpi_window_sweep_comparison(comparison))
+        print()
+        if args.plot:
+            _plot_enbpi_window_sweep(args.dataset, comparison, args.plot)
             print(f"Saved plot to {args.plot}")
     elif args.command == "window-sweep":
         windows = [None if w.strip().lower() == "unbounded" else int(w) for w in args.windows.split(",")]

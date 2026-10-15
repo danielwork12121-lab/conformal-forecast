@@ -83,6 +83,19 @@ again. No response shape changed: a caller sees exactly what it already
 saw for a `series_id` that aged out by capacity -- `GET /series/{id}`
 returns 404, and the id is absent from `GET /series`'s listing.
 
+v0.18: v0.17 added the idle-TTL mechanism but gave a caller no way to see
+it coming -- a series could be 1 second or 3599 seconds from expiring and
+`GET /series` looked identical either way. `GET /series` now reports each
+entry's `ttl_remaining_seconds` (computed from the same `_series_last_access`
+bookkeeping the purge sweep itself already reads, so it can never drift
+from the real eviction decision) via a new `SeriesListEntry` model, so a
+caller can e.g. proactively re-resolve a series that's about to age out
+instead of discovering it's gone on the next call. `GET /series/{series_id}`
+(`SeriesInfoResponse`) is deliberately left unchanged -- it already answers
+the sharper question ("is this id still here, right now") a single-series
+check actually needs, and extending it too would have broken its existing
+exact-dict-equality test for no real benefit to that endpoint.
+
 Honest scope, stated here and in the README: this is still a demo-quality
 serving layer. No auth, no rate limiting, no persistence across process
 restarts -- both the fit cache and the series store are in-memory only and
@@ -101,11 +114,12 @@ POST   /series               -- register a series, get back its `series_id`
                                  (idempotent: registering the same series
                                  twice returns the same id).
 GET    /series                -- list every series currently in the store
-                                 (series_id, length), most-recently-used
-                                 first, plus the store's count/max_size.
-                                 An idle-TTL sweep (v0.17) runs before the
-                                 listing, so an entry that's aged out is
-                                 already gone from it.
+                                 (series_id, length, ttl_remaining_seconds
+                                 (v0.18)), most-recently-used first, plus
+                                 the store's count/max_size. An idle-TTL
+                                 sweep (v0.17) runs before the listing, so
+                                 an entry that's aged out is already gone
+                                 from it.
 GET    /series/{series_id}   -- check whether a `series_id` is still in the
                                  store, and its length. 404 if it's aged out
                                  either by capacity or by idle-TTL (v0.17).
@@ -147,7 +161,7 @@ app = FastAPI(
         "you've registered once and referenced by id. "
         "Demo-quality: see the repo README for honest scope notes."
     ),
-    version="0.17",
+    version="0.18",
 )
 
 # Generic defaults used for a user-supplied series, which has no dataset
@@ -205,12 +219,19 @@ def _clock() -> float:
     return time.monotonic()
 
 
-def _purge_expired_series_locked() -> None:
+def _purge_expired_series_locked(now: float | None = None) -> None:
     """Evict every series idle longer than `_SERIES_STORE_TTL_SECONDS`.
 
-    Caller must already hold `_series_lock`.
+    Caller must already hold `_series_lock`. `now` lets a caller that also
+    needs "the current time" for its own purposes right after purging
+    (e.g. `list_series`'s per-entry `ttl_remaining_seconds`, v0.18) pass in
+    one already-read clock value instead of this function reading a second,
+    technically-later one -- harmless in practice (purging and `now` both
+    happen under the same lock, microseconds apart) but one clock read per
+    request is simpler to reason about than two. Defaults to a fresh
+    `_clock()` read for every other caller, unchanged from before.
     """
-    now = _clock()
+    now = _clock() if now is None else now
     expired = [
         sid
         for sid, last_seen in _series_last_access.items()
@@ -478,8 +499,27 @@ class SeriesInfoResponse(BaseModel):
     length: int
 
 
+class SeriesListEntry(BaseModel):
+    series_id: str
+    length: int
+    ttl_remaining_seconds: float = Field(
+        description=(
+            "seconds until this entry is purged by idle-TTL (v0.17) if nothing touches it again -- "
+            "i.e. `_SERIES_STORE_TTL_SECONDS - (now - last_access)`, computed from the exact same "
+            "bookkeeping the purge sweep itself reads, so it can never disagree with the real eviction "
+            "decision. Always >= 0: an entry whose remaining time hit 0 was purged by the sweep that "
+            "runs at the top of this same request, before this list is built, so it's never listed with "
+            "a negative or zero value; a GET /series/{id} or /forecast cache hit on this id resets it "
+            "back to the full TTL (v0.17's existing 'resolving resets the idle clock' behavior). Can "
+            "exceed the nominal TTL while still being accurate if a run has `_SERIES_STORE_TTL_SECONDS` "
+            "monkeypatched lower *after* this entry was last touched -- not a case a real deployment hits, "
+            "since the constant doesn't change at runtime there."
+        )
+    )
+
+
 class SeriesListResponse(BaseModel):
-    series: list[SeriesInfoResponse] = Field(
+    series: list[SeriesListEntry] = Field(
         description="every series currently in the store, most-recently-used first"
     )
     count: int = Field(description="len(series) -- how many are currently registered")
@@ -516,12 +556,19 @@ def list_series() -> SeriesListResponse:
     most-recently-used first, the same recency `GET /series/{id}` and a
     cache lookup already bump, so the most likely-relevant entries lead.
     Runs the idle-TTL sweep (v0.17) first, so an entry that's aged out
-    never appears in the listing.
+    never appears in the listing. Each entry's `ttl_remaining_seconds`
+    (v0.18) is computed against the same `now` used for that sweep, so a
+    listing is never built from two different clock reads.
     """
     with _series_lock:
-        _purge_expired_series_locked()
+        now = _clock()
+        _purge_expired_series_locked(now=now)
         items = [
-            SeriesInfoResponse(series_id=sid, length=len(series))
+            SeriesListEntry(
+                series_id=sid,
+                length=len(series),
+                ttl_remaining_seconds=max(0.0, _SERIES_STORE_TTL_SECONDS - (now - _series_last_access[sid])),
+            )
             for sid, series in reversed(list(_series_store.items()))
         ]
     return SeriesListResponse(series=items, count=len(items), max_size=_SERIES_STORE_MAX_SIZE)

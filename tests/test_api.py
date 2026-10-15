@@ -725,7 +725,14 @@ def test_list_series_includes_opportunistically_registered_inline_series(monkeyp
 
     body = client.get("/series").json()
     assert body["count"] == 1
-    assert body["series"] == [{"series_id": series_id, "length": 250}]
+    # Exact-equality on series_id/length only (unchanged from before v0.18)
+    # -- ttl_remaining_seconds (v0.18) is checked for presence/sanity
+    # separately below, not folded into this dict-equality assertion, so
+    # this test keeps verifying exactly what it always verified.
+    [entry] = body["series"]
+    assert entry["series_id"] == series_id
+    assert entry["length"] == 250
+    assert entry["ttl_remaining_seconds"] > 0
 
     client.delete("/cache")
 
@@ -854,3 +861,109 @@ def test_capacity_eviction_also_cleans_up_last_access_bookkeeping(monkeypatch):
 
     assert len(api_module._series_store) == 1
     assert len(api_module._series_last_access) == 1
+
+
+# --- Surfacing ttl_remaining_seconds in GET /series (v0.18) -----------------
+
+
+def test_list_series_reports_full_ttl_remaining_right_after_registration(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_TTL_SECONDS", 100.0)
+    _fake_clock(monkeypatch)  # time frozen at the default start value
+
+    client.post("/series", json={"series": _make_synthetic_series(n=40, seed=49)})
+
+    [entry] = client.get("/series").json()["series"]
+    # No time has advanced since registration -- the full TTL is remaining.
+    assert entry["ttl_remaining_seconds"] == 100.0
+
+
+def test_list_series_ttl_remaining_counts_down_with_idle_time(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_TTL_SECONDS", 100.0)
+    advance = _fake_clock(monkeypatch)
+
+    client.post("/series", json={"series": _make_synthetic_series(n=40, seed=50)})
+    advance(37.0)
+
+    [entry] = client.get("/series").json()["series"]
+    assert entry["ttl_remaining_seconds"] == 63.0
+
+
+def test_list_series_ttl_remaining_resets_when_resolved(monkeypatch):
+    """Touching a series (GET /series/{id}) resets its idle clock -- the
+    same recency semantics v0.17's own `test_resolving_a_series_resets_its_ttl`
+    already pins down -- and that reset should be visible in the listing's
+    ttl_remaining_seconds, not just in whether the id survives.
+    """
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_TTL_SECONDS", 100.0)
+    advance = _fake_clock(monkeypatch)
+
+    series_id = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=51)}).json()["series_id"]
+    advance(80.0)
+    client.get(f"/series/{series_id}")  # touches it, resets the idle clock
+
+    [entry] = client.get("/series").json()["series"]
+    assert entry["ttl_remaining_seconds"] == 100.0
+
+
+def test_list_series_ttl_remaining_never_negative_for_a_listed_entry(monkeypatch):
+    """An entry that's actually aged out is purged before the listing is
+    built (existing v0.17 behavior, re-confirmed here) -- so every entry
+    that *does* show up must have non-negative time left, never a value
+    that implies it should have already been evicted.
+    """
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_TTL_SECONDS", 100.0)
+    advance = _fake_clock(monkeypatch)
+
+    client.post("/series", json={"series": _make_synthetic_series(n=40, seed=52)})
+    advance(99.9)  # just under the TTL -- still listed
+
+    body = client.get("/series").json()
+    assert body["count"] == 1
+    [entry] = body["series"]
+    assert entry["ttl_remaining_seconds"] >= 0.0
+
+
+def test_list_series_ttl_remaining_is_independent_per_entry(monkeypatch):
+    """Two entries idle for different amounts of time should report
+    different remaining TTLs, each computed from its own last-access time
+    -- not, say, a single shared clock read applied uniformly."""
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_TTL_SECONDS", 100.0)
+    advance = _fake_clock(monkeypatch)
+
+    id_old = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=53)}).json()["series_id"]
+    advance(30.0)
+    id_new = client.post("/series", json={"series": _make_synthetic_series(n=41, seed=54)}).json()["series_id"]
+    advance(10.0)  # id_old idle 40s total, id_new idle 10s
+
+    body = client.get("/series").json()
+    remaining_by_id = {e["series_id"]: e["ttl_remaining_seconds"] for e in body["series"]}
+    assert remaining_by_id[id_old] == 60.0
+    assert remaining_by_id[id_new] == 90.0
+
+
+def test_series_info_response_shape_unchanged_by_v0_18(monkeypatch):
+    """GET /series/{id} (SeriesInfoResponse) deliberately did NOT grow a
+    ttl_remaining_seconds field -- only the listing (SeriesListEntry) did
+    (see the api.py v0.18 module-docstring note) -- so this exact-equality
+    shape, already pinned by `test_series_info_reports_registered_series`,
+    must still hold byte-for-byte.
+    """
+    series = _make_synthetic_series(n=70, seed=55)
+    series_id = client.post("/series", json={"series": series}).json()["series_id"]
+    resp = client.get(f"/series/{series_id}")
+    assert resp.json() == {"series_id": series_id, "length": 70}

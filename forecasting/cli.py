@@ -67,6 +67,15 @@ actually select better windows:
 
     python -m forecasting.cli cv-window-select --dataset temperature --candidates 5,7,10,15,20,30,50,unbounded --auto-folds --plot results/temperature_cv_window_select_auto.png
 
+Compare static split conformal, fixed-pool ACI, and EnbPI (a bootstrap
+ensemble of independently-trained LSTMs, whose online adaptivity comes from
+sliding each member's out-of-bag residuals forward, instead of adapting a
+single model's significance level the way ACI does -- see
+`forecasting/enbpi.py`) and save a plot of EnbPI's own residual pool size
+over the test window:
+
+    python -m forecasting.cli enbpi --dataset airline --plot results/airline_enbpi.png
+
 Serve the calibrated forecasts over a minimal REST API (see
 `forecasting/api.py` and the README's "Serving it as an API" section --
 demo-quality, not production: the LSTM refits per request):
@@ -81,12 +90,14 @@ from forecasting.experiment import (
     format_adaptive_comparison,
     format_auto_window_selection,
     format_cv_window_selection,
+    format_enbpi_comparison,
     format_results_table,
     format_sliding_window_comparison,
     format_window_sweep_comparison,
     run_adaptive_comparison,
     run_auto_window_selection,
     run_cv_window_selection,
+    run_enbpi_comparison,
     run_experiment,
     run_sliding_window_comparison,
     run_window_sweep_comparison,
@@ -173,6 +184,35 @@ def _plot_sliding_window(dataset: str, comparison, path: str) -> None:
         f"{dataset}: sliding-pool ACI's residual pool size over the test window (window={window_desc})\n"
         f"coverage -- static {s['empirical_coverage'] * 100:.1f}%, fixed-pool ACI {f['empirical_coverage'] * 100:.1f}%, "
         f"sliding-pool ACI {w['empirical_coverage'] * 100:.1f}% (nominal {int(round((1 - comparison.alpha) * 100))}%)",
+        fontsize=10,
+    )
+    ax1.legend(loc="upper left")
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def _plot_enbpi(dataset: str, comparison, path: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pool_size = comparison.pool_size
+    x = range(len(pool_size))
+
+    fig, ax1 = plt.subplots(figsize=(9, 4.5))
+    ax1.plot(x, pool_size, color="#9467bd", linewidth=1.5, label="EnbPI residual pool size")
+    ax1.set_xlabel("test-set time step")
+    ax1.set_ylabel("pool size (# residuals)", color="#9467bd")
+    ax1.tick_params(axis="y", labelcolor="#9467bd")
+    window_desc = "unbounded" if comparison.window is None else str(comparison.window)
+    s, f, e = comparison.static, comparison.fixed_pool, comparison.enbpi
+    ax1.set_title(
+        f"{dataset}: EnbPI's residual pool size over the test window "
+        f"(n_bootstrap={comparison.n_bootstrap}, window={window_desc})\n"
+        f"coverage -- static {s['empirical_coverage'] * 100:.1f}%, fixed-pool ACI {f['empirical_coverage'] * 100:.1f}%, "
+        f"EnbPI {e['empirical_coverage'] * 100:.1f}% (nominal {int(round((1 - comparison.alpha) * 100))}%)",
         fontsize=10,
     )
     ax1.legend(loc="upper left")
@@ -333,6 +373,23 @@ def main() -> None:
     sliding.add_argument("--plot", type=str, default=None, help="save a plot of the residual pool size over the test window")
     sliding.add_argument("--seed", type=int, default=0)
 
+    enbpi = sub.add_parser(
+        "enbpi",
+        help="compare static split conformal, fixed-pool ACI, and EnbPI (bootstrap-ensemble conformal) on the LSTM model",
+    )
+    enbpi.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    enbpi.add_argument("--alpha", type=float, default=0.1)
+    enbpi.add_argument("--gamma", type=float, default=0.05, help="fixed-pool ACI's step size (reference line only)")
+    enbpi.add_argument("--n-bootstrap", type=int, default=20, help="number of bootstrap ensemble members")
+    enbpi.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        help="max residual-pool size (default: unbounded growing buffer)",
+    )
+    enbpi.add_argument("--plot", type=str, default=None, help="save a plot of EnbPI's residual pool size over the test window")
+    enbpi.add_argument("--seed", type=int, default=0)
+
     sweep = sub.add_parser(
         "window-sweep",
         help="sweep the sliding-pool ACI's window size and compare coverage gap across values",
@@ -441,6 +498,20 @@ def main() -> None:
         print()
         if args.plot:
             _plot_sliding_window(args.dataset, comparison, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "enbpi":
+        comparison = run_enbpi_comparison(
+            args.dataset,
+            alpha=args.alpha,
+            gamma=args.gamma,
+            n_bootstrap=args.n_bootstrap,
+            window=args.window,
+            seed=args.seed,
+        )
+        print(format_enbpi_comparison(comparison))
+        print()
+        if args.plot:
+            _plot_enbpi(args.dataset, comparison, args.plot)
             print(f"Saved plot to {args.plot}")
     elif args.command == "window-sweep":
         windows = [None if w.strip().lower() == "unbounded" else int(w) for w in args.windows.split(",")]

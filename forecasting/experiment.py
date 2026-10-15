@@ -695,6 +695,234 @@ def format_enbpi_window_sweep_comparison(comparison: EnbPIWindowSweepComparison)
 
 
 # ---------------------------------------------------------------------------
+# EnbPI CV window selection (v0.22) -- the held-out-data half of EnbPI's own
+# "What's next" item (the simpler CLI-sweep half shipped as v0.21's
+# `run_enbpi_window_sweep_comparison` above). Mirrors `run_cv_window_selection`'s
+# rolling-origin cross-validation method exactly (same `_make_rolling_folds`/
+# `_fold_seed_start`/`_select_best_window` machinery, same never-touch-X_test
+# discipline, same honest post-hoc check against the real test set
+# afterward), adapted to EnbPI's own residual pool.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EnbPICVWindowCandidate:
+    window: int | None  # None = unbounded growing buffer
+    mean_abs_fold_gap: float  # mean of |coverage gap| across folds -- used to select
+    mean_fold_gap: float  # mean of SIGNED coverage gap across folds -- display only
+    mean_fold_width: float
+    test_coverage_gap: float  # real test-set gap, honest post-hoc check only
+
+
+@dataclass
+class EnbPICVWindowSelectionResult:
+    dataset: str
+    alpha: float
+    n_bootstrap: int
+    fold_scheme: str  # 'expanding' or 'sliding' -- see _fold_seed_start
+    auto_folds: bool  # if True, n_folds/min_initial_frac/min_fold_frac came from _auto_cv_fold_params(n_cal)
+    n_folds: int  # actually achieved; may be less than requested, see _make_rolling_folds
+    min_initial_frac: float  # actually used (caller-given, or auto-selected if auto_folds)
+    min_fold_frac: float  # actually used (caller-given, or auto-selected if auto_folds)
+    fold_bounds: list[tuple[int, int]]  # (train_end, test_end) indices into the calibration set
+    candidates: list[EnbPICVWindowCandidate]  # one per candidate window, in the order given
+    selected_window: int | None  # chosen using the fold columns only
+    best_test_window: int | None  # oracle: smallest |test gap| in hindsight -- comparison only
+    static: dict  # evaluate_coverage() output, reference line (from the real test set)
+    fixed_pool: dict  # evaluate_adaptive_coverage() output, reference line (from the real test set)
+    selected_test_result: dict  # evaluate_enbpi_coverage() output for `selected_window` on the real test set
+
+
+def run_enbpi_cv_window_selection(
+    dataset: str,
+    windows: list[int | None],
+    alpha: float = 0.1,
+    gamma: float = 0.05,
+    n_bootstrap: int = 20,
+    n_folds: int = 4,
+    min_initial_frac: float = 0.2,
+    min_fold_frac: float = 0.1,
+    fold_scheme: str = "expanding",
+    auto_folds: bool = False,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> EnbPICVWindowSelectionResult:
+    """Select EnbPI's `window` using rolling-origin cross-validation over the
+    calibration set -- the principled, held-out-data alternative to v0.21's
+    CLI sweep (which requires a human to eyeball a table), exactly mirroring
+    `run_cv_window_selection`'s method for ACI's sliding window.
+
+    What differs from the ACI version is EnbPI's own residual pool (see
+    `forecasting/enbpi.py`): where ACI's CV seeds each fold purely from a
+    prefix of calibration residuals, EnbPI's pool is always [LOO training
+    residuals] + [calibration residuals up to train_end]. The LOO part is
+    fixed -- it never depends on which fold is being scored, only on the
+    bootstrap ensemble, which is fit exactly once here -- and only the
+    calibration prefix varies by fold/`fold_scheme`, exactly the same way
+    ACI's own calibration-only prefix does. `fitted._residuals` (the list
+    `fit()` builds) is `[LOO residuals] + [full-calibration residuals]` in
+    that order, so `fitted.n_loo_skipped_` (training points with no
+    out-of-bag model at all) gives the exact split point:
+    `loo_len = len(X_train) - fitted.n_loo_skipped_`.
+
+    Never touches X_test/y_test to make the selection -- same discipline as
+    `run_cv_window_selection` and `run_auto_window_selection`. X_test is
+    used only afterward, via the already-tested `run_enbpi_window_sweep_comparison`,
+    to honestly report whether the selection generalized.
+
+    Raises ValueError if the calibration set is too small to form even one
+    fold of `min_fold_frac * n_cal` points after reserving
+    `min_initial_frac * n_cal` points for the first fold's seed -- same
+    error condition as `run_cv_window_selection`.
+    """
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+    n_cal = len(X_cal)
+
+    if fold_scheme not in ("expanding", "sliding"):
+        raise ValueError("fold_scheme must be 'expanding' or 'sliding'")
+
+    if auto_folds:
+        n_folds, min_initial_frac, min_fold_frac = _auto_cv_fold_params(n_cal)
+    else:
+        if n_folds < 1:
+            raise ValueError("n_folds must be a positive integer")
+        if not (0.0 < min_initial_frac < 1.0) or not (0.0 < min_fold_frac < 1.0):
+            raise ValueError("min_initial_frac and min_fold_frac must be in (0, 1)")
+
+    min_initial = max(5, round(n_cal * min_initial_frac))
+    min_fold_size = max(3, round(n_cal * min_fold_frac))
+    fold_bounds = _make_rolling_folds(n_cal, n_folds, min_initial, min_fold_size)
+    if fold_bounds is None:
+        raise ValueError(
+            f"Calibration set too small for rolling-origin CV: n_cal={n_cal}, "
+            f"min_initial={min_initial}, min_fold_size={min_fold_size} (from min_initial_frac="
+            f"{min_initial_frac}, min_fold_frac={min_fold_frac}) -- try a smaller n_folds / "
+            "min_initial_frac / min_fold_frac, or a dataset/lookback with a larger calibration set"
+        )
+
+    def _ensemble_member(member_seed: int):
+        return DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=member_seed))
+
+    # Fit the ensemble exactly once -- window has no effect on fitting (see
+    # forecasting/enbpi.py), so this is reused across every fold and every
+    # candidate window below, never refit.
+    fitted = EnbPIForecaster(_ensemble_member, n_bootstrap=n_bootstrap, alpha=alpha, window=None, seed=seed).fit(
+        X_train, y_train, X_cal, y_cal
+    )
+    loo_len = len(X_train) - fitted.n_loo_skipped_
+    loo_residuals = fitted._residuals[:loo_len]
+    cal_residuals = fitted._residuals[loo_len:]  # length n_cal, same order as X_cal
+
+    mean_abs_gap_by_window: dict = {}
+    mean_gap_by_window: dict = {}
+    mean_width_by_window: dict = {}
+    for window in windows:
+        abs_gaps, signed_gaps, widths = [], [], []
+        for train_end, test_end in fold_bounds:
+            seed_start = _fold_seed_start(train_end, min_initial, fold_scheme)
+            forecaster = EnbPIForecaster(
+                _ensemble_member, n_bootstrap=n_bootstrap, alpha=alpha, window=window, seed=seed
+            )
+            forecaster._models = fitted._models
+            forecaster._residuals = loo_residuals + cal_residuals[seed_start:train_end]
+            X_fold, y_fold = X_cal[train_end:test_end], y_cal[train_end:test_end]
+            pred = forecaster.predict_sequential(X_fold, y_fold.reshape(-1))
+            result = evaluate_enbpi_coverage(pred, y_fold)
+            abs_gaps.append(abs(result["coverage_gap"]))
+            signed_gaps.append(result["coverage_gap"])
+            widths.append(result["mean_interval_width"])
+        mean_abs_gap_by_window[window] = float(np.mean(abs_gaps))
+        mean_gap_by_window[window] = float(np.mean(signed_gaps))
+        mean_width_by_window[window] = float(np.mean(widths))
+
+    selected_window = _select_best_window(windows, mean_abs_gap_by_window, mean_width_by_window)
+
+    # Honest post-hoc check, using the already-tested v0.21 sweep machinery --
+    # same pattern as run_cv_window_selection's own use of run_window_sweep_comparison.
+    sweep = run_enbpi_window_sweep_comparison(
+        dataset,
+        windows=windows,
+        alpha=alpha,
+        gamma=gamma,
+        n_bootstrap=n_bootstrap,
+        lookback=lookback,
+        period=period,
+        seed=seed,
+    )
+    test_gap_by_window = {r.window: r.enbpi["coverage_gap"] for r in sweep.results}
+    test_width_by_window = {r.window: r.enbpi["mean_interval_width"] for r in sweep.results}
+    test_result_by_window = {r.window: r.enbpi for r in sweep.results}
+
+    candidates = [
+        EnbPICVWindowCandidate(
+            window=w,
+            mean_abs_fold_gap=mean_abs_gap_by_window[w],
+            mean_fold_gap=mean_gap_by_window[w],
+            mean_fold_width=mean_width_by_window[w],
+            test_coverage_gap=test_gap_by_window[w],
+        )
+        for w in windows
+    ]
+    best_test_window = _select_best_window(windows, test_gap_by_window, test_width_by_window)
+
+    return EnbPICVWindowSelectionResult(
+        dataset=dataset,
+        alpha=alpha,
+        n_bootstrap=n_bootstrap,
+        fold_scheme=fold_scheme,
+        auto_folds=auto_folds,
+        n_folds=len(fold_bounds),
+        min_initial_frac=min_initial_frac,
+        min_fold_frac=min_fold_frac,
+        fold_bounds=fold_bounds,
+        candidates=candidates,
+        selected_window=selected_window,
+        best_test_window=best_test_window,
+        static=sweep.static,
+        fixed_pool=sweep.fixed_pool,
+        selected_test_result=test_result_by_window[selected_window],
+    )
+
+
+def format_enbpi_cv_window_selection(result: EnbPICVWindowSelectionResult) -> str:
+    nominal_pct = int(round((1 - result.alpha) * 100))
+    s, f = result.static, result.fixed_pool
+    fold_desc = ", ".join(f"[{a}:{b})" for a, b in result.fold_bounds)
+    folds_label = f"n_folds={result.n_folds} (auto)" if result.auto_folds else f"n_folds={result.n_folds}"
+    lines = [
+        f"### {result.dataset}: EnbPI rolling-origin CV window selection "
+        f"(nominal {nominal_pct}%, n_bootstrap={result.n_bootstrap}, "
+        f"fold_scheme={result.fold_scheme}, {folds_label}, folds={fold_desc})",
+        "",
+        "| Window | Mean &#124;fold gap&#124; (used to select) | Mean fold gap (signed) | Real test gap (post-hoc check) |",
+        "|---|---|---|---|",
+    ]
+    for c in result.candidates:
+        wlabel = "unbounded (growing buffer)" if c.window is None else str(c.window)
+        marker = ""
+        if c.window == result.selected_window:
+            marker += " **<- selected**"
+        if c.window == result.best_test_window:
+            marker += " *(best in hindsight)*"
+        lines.append(
+            f"| {wlabel}{marker} | {c.mean_abs_fold_gap * 100:.1f}pp | {c.mean_fold_gap * 100:+.1f}pp | "
+            f"{c.test_coverage_gap * 100:+.1f}pp |"
+        )
+    lines += [
+        "",
+        f"*Reference, real test set:* static split conformal {s['coverage_gap'] * 100:+.1f}pp, "
+        f"fixed-pool ACI {f['coverage_gap'] * 100:+.1f}pp.",
+        "",
+        f"**Selected window: {('unbounded' if result.selected_window is None else result.selected_window)}** "
+        f"(chosen from the {result.n_folds} fold columns only) -> real test-set gap "
+        f"{result.selected_test_result['coverage_gap'] * 100:+.1f}pp, mean interval width "
+        f"{result.selected_test_result['mean_interval_width']:.3f}."
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Automatic window selection (v0.5) -- the README's own "What's next" item:
 # "pick the window minimizing |coverage gap| on a held-out slice of the
 # calibration data ... instead of requiring a user to eyeball a window-sweep

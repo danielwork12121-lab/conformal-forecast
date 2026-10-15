@@ -818,7 +818,7 @@ default, both remain independently opt-in exactly as before, and this
 finding only closes the open question of whether to recommend combining
 them (answer: no).
 
-## Serving it as an API (v0.11, caching in v0.12, user series in v0.13, dataset handles in v0.14, listing in v0.15, idle-TTL eviction in v0.17, TTL-remaining in the listing in v0.18)
+## Serving it as an API (v0.11, caching in v0.12, user series in v0.13, dataset handles in v0.14, listing in v0.15, idle-TTL eviction in v0.17, per-entry TTL remaining in v0.18)
 
 Everything above is driven through the CLI, one process invocation at a
 time. `forecasting/api.py` wraps the exact same pipeline — `_prepare_split`
@@ -837,8 +837,10 @@ python -m forecasting.cli serve --port 8000
   `DELETE /series/{series_id}` — v0.14: register a series once, get back an
   id to reuse (below); v0.15: `GET /series` (no id) lists every series
   currently registered; v0.17: an entry also ages out automatically after
-  an idle period, independent of the store's capacity (below); v0.18: each
-  listed entry also reports `ttl_remaining_seconds` (below).
+  an idle period, independent of the store's capacity (below); v0.18:
+  `GET /series`'s listing reports each entry's `ttl_remaining_seconds`
+  (below). `GET /series/{series_id}`'s own response shape is unchanged by
+  v0.18 — the new field is list-only.
 - `POST /forecast` — body is `{"dataset": "airline", "model": "lstm", "alpha": 0.1, "seed": 0, "max_points": 10}`,
   or, as of v0.13, `{"series": [50.1, 51.3, ...], "model": "lstm", "alpha": 0.1}`,
   or, as of v0.14, `{"series_id": "a1b2c3...", "model": "lstm", "alpha": 0.1}`
@@ -1024,36 +1026,29 @@ this change: the original `popitem(last=False)` dropped an id from
 `_series_store` without a matching cleanup step, since there was nothing
 else to clean up before this dict existed).
 
-**Surfacing `ttl_remaining_seconds` in `GET /series` (v0.18):** v0.17 added
-the idle-TTL mechanism itself but gave a caller no way to see it coming —
-an entry one second from expiring looked identical in the listing to one
-with 59 minutes left. `GET /series` now reports each entry's
-`ttl_remaining_seconds` — `_SERIES_STORE_TTL_SECONDS - (now - last_access)`,
-clamped at `0.0`, computed from the exact same `_series_last_access`
-bookkeeping the purge sweep itself reads one line earlier in the same
-request, so the two can never disagree. Deliberately done *without*
-touching `GET /series/{series_id}` (`SeriesInfoResponse`) at all — that
-endpoint already answers the sharper question a single lookup actually
-needs ("is this id still here, right now"), and extending it would have
-broken `test_series_info_reports_registered_series`'s existing
-exact-dict-equality assertion for no benefit to that endpoint. Instead,
-the listing's entries moved to a new `SeriesListEntry` model (adds
-`ttl_remaining_seconds` to `series_id`/`length`), used only by
-`SeriesListResponse.series`. One existing listing test did do
-whole-dict equality on an entry
-(`test_list_series_includes_opportunistically_registered_inline_series`) —
-updated deliberately (checking `series_id`/`length` plus
-`ttl_remaining_seconds > 0` separately) rather than left to fail, which is
-what "without breaking the existing exact-equality response tests" meant
-in practice here: the tests that didn't need to change, didn't; the one
-that genuinely did, was updated on purpose, not by accident. 6 new tests
-(167 → 173): full TTL remaining right after registration; counts down
-correctly with idle time (monkeypatched fake clock, no real sleep);
-resolving a series resets it back to the full TTL in the listing, not just
-in whether the id survives; a listed entry's remaining time is never
-negative; two entries idle for different amounts of time report
-independent values, not one shared clock reading; and
-`GET /series/{series_id}`'s own response shape is re-pinned unchanged.
+**Per-entry TTL remaining in the listing (v0.18):** v0.17 itself flagged
+the natural follow-up — a caller could see *that* an entry would
+eventually age out by idle time, but not *how close* it was. `GET /series`
+now reports a `ttl_remaining_seconds` field per entry (seconds until that
+id would be purged by idle time alone, assuming nothing touches it again
+first). Deliberately scoped to the list endpoint only: `GET
+/series/{series_id}`'s response (`SeriesInfoResponse`, exactly
+`{series_id, length}`) is untouched, so its pre-existing exact-equality
+test (`test_series_info_reports_registered_series`) keeps passing
+byte-for-byte unchanged. `GET /series`'s items now use a new
+`SeriesListItemResponse` model (`SeriesInfoResponse` plus
+`ttl_remaining_seconds`) instead — the one existing test that asserted an
+exact dict for a list entry
+(`test_list_series_includes_opportunistically_registered_inline_series`)
+was updated to match, since surfacing real information into that response
+necessarily changes its shape; every other list-endpoint test already
+extracted fields individually (`s["series_id"]`, a dict/set comprehension)
+and needed no change at all. 3 new tests (167 → 170), all driven by the
+same monkeypatched fake clock as the idle-TTL tests above: a freshly
+registered entry reports the full TTL; `ttl_remaining_seconds` decreases
+by exactly the amount of idle time that passes; and touching an entry
+(`GET /series/{id}`) resets it back toward the full TTL, measured from the
+touch rather than from the original registration.
 
 ## Installable as a real dependency (v0.16)
 
@@ -1133,12 +1128,12 @@ forecasting/
                  # GET /series/{id}, DELETE /series/{id} + a second, independently
                  # bounded LRU storing raw series by their fit-cache hash (v0.14),
                  # now also idle-TTL evicted (v0.17), independent of capacity,
-                 # with each listed entry's own ttl_remaining_seconds (v0.18)
+                 # with GET /series reporting each entry's own TTL remaining (v0.18)
   cli.py         # `python -m forecasting.cli benchmark [...]` /
                  # `sliding-window [...]` / `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]` / `serve [--host --port --reload]`
-tests/           # 173 tests, including the coverage-tracking statistical checks above
+tests/           # 170 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -1148,7 +1143,7 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 173 tests
+python -m pytest                                    # 170 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -1187,16 +1182,16 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   `POST /series` / `GET /series/{id}` / `DELETE /series/{id}`, plus
   opportunistic registration from `/forecast` itself — see the API
   section above. Its own follow-up, a `GET /series` listing endpoint, is
-  now shipped too (v0.15); that endpoint's own follow-up — giving the
+  now shipped too (v0.15), and that endpoint's own follow-up — giving the
   series store an actual idle TTL instead of pure LRU-by-capacity — is
-  now shipped too (v0.17); and *that* follow-up — surfacing each listed
-  entry's remaining idle-TTL budget (`ttl_remaining_seconds`) instead of
-  just whether it's still present — is now shipped too (v0.18). This
-  particular chain of small, honestly-flagged follow-ups feels played
-  out for now; the natural next step for the series store is a different
-  kind of improvement — e.g. a `PATCH /series/{id}` to extend/refresh a
-  series' TTL without a full re-resolve, or moving on to one of the
-  items below instead.
+  now shipped too (v0.17), and that one's own natural follow-up — surfacing
+  each entry's remaining idle-TTL budget in the listing — is now shipped
+  too (v0.18, `ttl_remaining_seconds`), without breaking the single-entry
+  endpoint's own exact-equality test (the new field is list-only). The
+  natural remaining follow-up in this vein: a `PATCH /series/{id}` (or a
+  query flag on `GET /series/{id}`) to let a client explicitly "touch"
+  (refresh the TTL of) a series it cares about without needing to run a
+  real `/forecast` or re-register it.
 - A WebSocket or streaming endpoint for a series that grows over time
   (e.g. one new point per request) instead of always being posted whole —
   would need an actual incremental-update story for the fit cache, which

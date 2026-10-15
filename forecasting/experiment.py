@@ -17,6 +17,7 @@ from forecasting.adaptive import (
 )
 from forecasting.conformal import SplitConformalForecaster, evaluate_coverage
 from forecasting.data import Normalizer, chronological_split, load_dataset, make_windows
+from forecasting.enbpi import EnbPIForecaster, evaluate_enbpi_coverage
 from forecasting.metrics import mae, mape, rmse
 from forecasting.models import (
     DeltaWrapper,
@@ -450,6 +451,122 @@ def format_sliding_window_comparison(comparison: SlidingWindowComparison) -> str
         f"{f['coverage_gap'] * 100:+.1f}pp | {f['mean_interval_width']:.3f} |",
         f"| Sliding/growing-pool ACI | {w['empirical_coverage'] * 100:.1f}% | "
         f"{w['coverage_gap'] * 100:+.1f}pp | {w['mean_interval_width']:.3f} |",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# EnbPI (v0.20) -- the README's/`forecasting.conformal`'s own "What's next"
+# item: a structurally different answer to the exchangeability problem than
+# ACI. Where ACI keeps one fitted model and adapts the significance level
+# online, EnbPI trains a bootstrap ensemble once and gets its online
+# adaptivity entirely from sliding the residual pool forward with each
+# newly-observed test residual (see `forecasting/enbpi.py`'s module
+# docstring for the full mechanism and the two disclosed simplifications
+# versus the original paper). This section answers the same "does it
+# actually help, measured on the real airline under-coverage case, not
+# assumed" question the sliding-window ACI section already answered for its
+# own mechanism -- same model family (LSTM (delta)), same split, same test
+# window, so any difference is attributable to the calibration method.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EnbPIComparison:
+    dataset: str
+    alpha: float
+    n_bootstrap: int
+    window: int | None  # None = unbounded growing buffer (this module's default)
+    static: dict  # evaluate_coverage() output for static split conformal
+    fixed_pool: dict  # evaluate_adaptive_coverage() output for fixed-pool ACI (reference line)
+    enbpi: dict  # evaluate_enbpi_coverage() output
+    pool_size: np.ndarray  # (n_test,) -- EnbPI's own residual pool size at each step
+    n_loo_skipped: int  # training points with no out-of-bag model at all
+
+
+def run_enbpi_comparison(
+    dataset: str,
+    alpha: float = 0.1,
+    gamma: float = 0.05,
+    n_bootstrap: int = 20,
+    window: int | None = None,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> EnbPIComparison:
+    """Three-way, same-split comparison: static split conformal, fixed-pool
+    ACI (both already established reference lines for this model/dataset),
+    and EnbPI -- all on the LSTM (delta) model, so a difference in coverage
+    is attributable to the calibration method, not to a different model.
+
+    Note on units (see Known issue #10 in the project docs, not yet
+    resolved as of this function's own addition): this function's
+    `mean_interval_width` figures are computed via `evaluate_coverage` /
+    `evaluate_adaptive_coverage` / `evaluate_enbpi_coverage` directly on
+    the *normalized* test split, exactly the same convention every other
+    comparison function in this module already uses (`run_experiment` is
+    the one exception, which denormalizes before computing coverage).
+    Deliberately kept consistent with this module's own sibling functions
+    rather than unilaterally denormalizing only this new one -- which would
+    create a *second*, more confusing inconsistency (correct in one new
+    table, wrong in every older one) on top of the existing open question,
+    instead of just leaving the existing open question exactly as open as
+    it already was. Don't read these width figures as literal real-dataset
+    units until Known issue #10 is resolved one way or another.
+    """
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+
+    static_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    static = SplitConformalForecaster(static_model, alpha=alpha).fit(X_train, y_train, X_cal, y_cal)
+    static_result = evaluate_coverage(static.predict(X_test), y_test)
+
+    fixed_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    fixed = AdaptiveConformalForecaster(fixed_model, alpha=alpha, gamma=gamma).fit(X_train, y_train, X_cal, y_cal)
+    fixed_pred = fixed.predict_sequential(X_test, y_test.reshape(-1))
+    fixed_result = evaluate_adaptive_coverage(fixed_pred, y_test)
+
+    def _ensemble_member(member_seed: int):
+        # A fresh LSTM (delta) instance per ensemble member, with its own
+        # seed -- both the bootstrap data draw AND the weight init differ
+        # member-to-member, which is this module's own documented choice
+        # for genuine ensemble diversity (see `forecasting/enbpi.py`).
+        return DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=member_seed))
+
+    enbpi = EnbPIForecaster(_ensemble_member, n_bootstrap=n_bootstrap, alpha=alpha, window=window, seed=seed).fit(
+        X_train, y_train, X_cal, y_cal
+    )
+    enbpi_pred = enbpi.predict_sequential(X_test, y_test.reshape(-1))
+    enbpi_result = evaluate_enbpi_coverage(enbpi_pred, y_test)
+
+    return EnbPIComparison(
+        dataset=dataset,
+        alpha=alpha,
+        n_bootstrap=n_bootstrap,
+        window=window,
+        static=static_result,
+        fixed_pool=fixed_result,
+        enbpi=enbpi_result,
+        pool_size=enbpi_pred.pool_size,
+        n_loo_skipped=enbpi_pred.n_loo_skipped,
+    )
+
+
+def format_enbpi_comparison(comparison: EnbPIComparison) -> str:
+    nominal_pct = int(round((1 - comparison.alpha) * 100))
+    window_desc = "unbounded (growing buffer)" if comparison.window is None else f"{comparison.window} (sliding)"
+    s, f, e = comparison.static, comparison.fixed_pool, comparison.enbpi
+    lines = [
+        f"### {comparison.dataset}: static vs. fixed-pool ACI vs. EnbPI "
+        f"(LSTM (delta), nominal {nominal_pct}%, n_bootstrap={comparison.n_bootstrap}, window={window_desc})",
+        "",
+        "| Method | Empirical coverage | Coverage gap | Mean interval width |",
+        "|---|---|---|---|",
+        f"| Static split conformal | {s['empirical_coverage'] * 100:.1f}% | "
+        f"{s['coverage_gap'] * 100:+.1f}pp | {s['mean_interval_width']:.3f} |",
+        f"| Fixed-pool ACI | {f['empirical_coverage'] * 100:.1f}% | "
+        f"{f['coverage_gap'] * 100:+.1f}pp | {f['mean_interval_width']:.3f} |",
+        f"| EnbPI | {e['empirical_coverage'] * 100:.1f}% | "
+        f"{e['coverage_gap'] * 100:+.1f}pp | {e['mean_interval_width']:.3f} |",
     ]
     return "\n".join(lines)
 

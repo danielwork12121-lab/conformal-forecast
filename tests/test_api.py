@@ -974,3 +974,92 @@ def test_series_info_response_shape_unchanged_by_v0_18(monkeypatch):
     assert resp.json() == {"series_id": series_id, "length": 40}
 
 
+# --- PATCH /series/{series_id}: idle-TTL refresh without a full GET (v0.19) -
+
+
+def test_patch_series_refreshes_ttl_to_the_full_budget(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_TTL_SECONDS", 100.0)
+    advance = _fake_clock(monkeypatch)
+
+    series_id = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=56)}).json()["series_id"]
+    advance(80.0)  # only 20s of idle budget left without a refresh
+
+    resp = client.patch(f"/series/{series_id}")
+    assert resp.status_code == 200
+    assert resp.json() == {"series_id": series_id, "length": 40, "ttl_remaining_seconds": 100.0}
+
+    # The refresh actually reset the clock, not just the reported number:
+    # another 80s (160s since registration, but only 80s since the PATCH)
+    # should still leave 20s of real budget -- checked via a listing, not a
+    # GET of this id, since a GET would itself touch (and reset) the clock
+    # again and defeat the point of this check.
+    advance(80.0)
+    body = client.get("/series").json()
+    assert body["series"][0]["ttl_remaining_seconds"] == pytest.approx(20.0)
+
+
+def test_patch_series_404s_for_unknown_id(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    resp = client.patch("/series/not-a-real-id")
+    assert resp.status_code == 404
+
+
+def test_patch_series_404s_for_an_already_expired_id(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_TTL_SECONDS", 100.0)
+    advance = _fake_clock(monkeypatch)
+
+    series_id = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=57)}).json()["series_id"]
+    advance(150.0)  # past the TTL, nothing touched it since registration
+
+    resp = client.patch(f"/series/{series_id}")
+    assert resp.status_code == 404
+
+
+def test_patch_series_bumps_lru_position_same_as_a_get(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    id_a = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=58)}).json()["series_id"]
+    id_b = client.post("/series", json={"series": _make_synthetic_series(n=41, seed=59)}).json()["series_id"]
+    id_c = client.post("/series", json={"series": _make_synthetic_series(n=42, seed=60)}).json()["series_id"]
+    # Registration order (oldest -> newest use): a, b, c. PATCHing a should
+    # bump it to most-recently-used, exactly like GET /series/{id} already
+    # does (see test_list_series_orders_most_recently_used_first).
+    client.patch(f"/series/{id_a}")
+
+    body = client.get("/series").json()
+    assert [s["series_id"] for s in body["series"]] == [id_a, id_c, id_b]
+
+
+def test_patch_series_does_not_affect_unrelated_siblings_ttl(monkeypatch):
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_TTL_SECONDS", 100.0)
+    advance = _fake_clock(monkeypatch)
+
+    id_a = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=61)}).json()["series_id"]
+    id_b = client.post("/series", json={"series": _make_synthetic_series(n=41, seed=62)}).json()["series_id"]
+    advance(50.0)
+
+    client.patch(f"/series/{id_a}")  # refresh only a, not b
+
+    body = client.get("/series").json()
+    remaining_by_id = {s["series_id"]: s["ttl_remaining_seconds"] for s in body["series"]}
+    assert remaining_by_id[id_a] == pytest.approx(100.0)
+    assert remaining_by_id[id_b] == pytest.approx(50.0)
+
+
+def test_patch_series_response_model_matches_list_item_shape(monkeypatch):
+    """PATCH deliberately reuses SeriesListItemResponse (the v0.18 shape) --
+    exactly {series_id, length, ttl_remaining_seconds}, no more, no less."""
+    _fresh_series_store(monkeypatch)
+    series_id = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=63)}).json()["series_id"]
+    resp = client.patch(f"/series/{series_id}")
+    assert set(resp.json().keys()) == {"series_id", "length", "ttl_remaining_seconds"}
+
+

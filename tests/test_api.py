@@ -918,3 +918,59 @@ def test_list_series_ttl_remaining_resets_on_touch(monkeypatch):
     assert body["series"][0]["ttl_remaining_seconds"] == pytest.approx(90.0)
 
 
+def test_list_series_ttl_remaining_never_negative_for_a_listed_entry(monkeypatch):
+    """An entry that's actually aged out is purged before the listing is
+    built (existing v0.17 behavior, re-confirmed here) -- so every entry
+    that *does* show up must have non-negative time left, never a value
+    that implies it should have already been evicted.
+    """
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_TTL_SECONDS", 100.0)
+    advance = _fake_clock(monkeypatch)
+
+    client.post("/series", json={"series": _make_synthetic_series(n=40, seed=52)})
+    advance(99.9)  # just under the TTL -- still listed
+
+    body = client.get("/series").json()
+    assert body["count"] == 1
+    [entry] = body["series"]
+    assert entry["ttl_remaining_seconds"] >= 0.0
+
+
+def test_list_series_ttl_remaining_is_independent_per_entry(monkeypatch):
+    """Two entries idle for different amounts of time should report
+    different remaining TTLs, each computed from its own last-access time
+    -- not, say, a single shared clock read applied uniformly."""
+    _fresh_series_store(monkeypatch)
+    import forecasting.api as api_module
+
+    monkeypatch.setattr(api_module, "_SERIES_STORE_TTL_SECONDS", 100.0)
+    advance = _fake_clock(monkeypatch)
+
+    id_old = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=53)}).json()["series_id"]
+    advance(30.0)
+    id_new = client.post("/series", json={"series": _make_synthetic_series(n=41, seed=54)}).json()["series_id"]
+    advance(10.0)  # id_old idle 40s total, id_new idle 10s
+
+    body = client.get("/series").json()
+    remaining_by_id = {e["series_id"]: e["ttl_remaining_seconds"] for e in body["series"]}
+    assert remaining_by_id[id_old] == 60.0
+    assert remaining_by_id[id_new] == 90.0
+
+
+def test_series_info_response_shape_unchanged_by_v0_18(monkeypatch):
+    """GET /series/{id} (SeriesInfoResponse) deliberately did NOT grow a
+    ttl_remaining_seconds field -- only the listing (SeriesListItemResponse)
+    did -- so this exact-equality shape, already pinned by
+    `test_series_info_reports_registered_series`, must still hold
+    byte-for-byte even after both v0.18 ship attempts.
+    """
+    _fresh_series_store(monkeypatch)
+
+    series_id = client.post("/series", json={"series": _make_synthetic_series(n=40, seed=55)}).json()["series_id"]
+    resp = client.get(f"/series/{series_id}")
+    assert resp.json() == {"series_id": series_id, "length": 40}
+
+

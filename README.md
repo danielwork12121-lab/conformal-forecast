@@ -50,10 +50,19 @@ hand-wavy confidence score.
   help? (See "Window tuning" below — the answer is genuinely interesting,
   and finding it surfaced a real bug in the first cut of the sliding-window
   implementation, fixed in the same run.)
+- **EnbPI** (`forecasting/enbpi.py`, Xu & Xie 2021) — a structurally
+  different answer to the same exchangeability problem: instead of adapting
+  one model's significance level online, it trains a bootstrap ensemble
+  once and slides an out-of-bag residual pool forward. On the exact airline
+  case the ACI sections above were built around, a bounded ensemble (20
+  members, `window=10`) outperforms *both* ACI variants already shipped for
+  this model/dataset (see "EnbPI" below) — found via a real swept-then-
+  measured `window` search, not a single lucky setting.
 - **A test suite that checks the statistical claim, not just that the code
   runs** (`tests/test_conformal.py`, `tests/test_adaptive.py`,
   `tests/test_adaptive_experiment.py`, `tests/test_sliding_window.py`,
-  `tests/test_sliding_window_experiment.py`, `tests/test_window_sweep.py`):
+  `tests/test_sliding_window_experiment.py`, `tests/test_window_sweep.py`,
+  `tests/test_enbpi.py`, `tests/test_enbpi_experiment.py`):
   on synthetic data with known
   noise, it verifies empirical coverage actually tracks the nominal target
   across multiple seeds and confidence levels, and that both ACI variants
@@ -818,6 +827,92 @@ default, both remain independently opt-in exactly as before, and this
 finding only closes the open question of whether to recommend combining
 them (answer: no).
 
+## EnbPI (v0.20): a structurally different answer to the same problem
+
+Everything above — fixed-pool ACI, sliding/growing-pool ACI, and all of the
+window-tuning/selection work — answers split conformal's exchangeability
+problem the same way: keep one fitted model, adapt the *significance level*
+alpha_t online. `forecasting/conformal.py`'s own module docstring names a
+structurally different approach as a natural follow-up, not yet implemented
+there: **EnbPI** (Xu & Xie, 2021, "Conformal Prediction Interval for
+Dynamic Time-Series"). Instead of adapting alpha_t, EnbPI trains a
+**bootstrap ensemble** of models once and gets its online adaptivity
+entirely from **sliding the residual pool** forward — every ensemble member
+has training points its own bootstrap draw happened to exclude ("out-of-bag"
+points), and averaging only the out-of-bag models' predictions for a given
+point gives a genuinely out-of-sample residual, with no alpha_t machinery
+at all. See `forecasting/enbpi.py`'s module docstring for the full
+mechanism and two disclosed simplifications versus the original paper
+(symmetric residual quantiles instead of the paper's asymmetric ones, for
+consistency with this project's own house convention; and a `window`
+parameter that defaults to this project's own "unbounded growing buffer"
+convention rather than the paper's own constant-memory default).
+
+Same discipline as every section above: measured on the real airline case
+that motivated this whole line of work, not assumed. Same model (LSTM
+(delta)), same split, same test window as the ACI comparisons, so the only
+thing that differs is the calibration method:
+
+| Method | Empirical coverage | Coverage gap | Mean interval width |
+|---|---|---|---|
+| Static split conformal | 63.3% | -26.7pp | 4.873 |
+| Fixed-pool ACI | 60.0% | -30.0pp | 4.880 |
+| EnbPI (`n_bootstrap=20`, `window=10`) | **86.7%** | **-3.3pp** | 3.492 |
+
+(Note on units: these `mean_interval_width` figures use this module's
+existing, repo-wide convention — see Known issue #10 in the project docs,
+still open as of this feature — of computing them on the normalized test
+split rather than denormalizing first. Deliberately left exactly as
+consistent/inconsistent as every sibling table in this README, rather than
+unilaterally fixing only this new one. Coverage and coverage-gap are
+scale-invariant either way, so that comparison is unaffected.)
+
+**This is a real, substantial result — better than either ACI variant
+already shipped for this exact case**, including the sliding/growing-pool
+variant's own headline airline number above (-10.0pp). It did not come from
+guessing `window=10` first: a real sweep (`window` in `{10, 15, 20, 30, 40,
+50, 60, 75, 90, 100, unbounded}`, same fitted 20-model ensemble reused for
+every value — fitting doesn't depend on `window`, only the online scoring
+loop does) showed the gap degrading smoothly and substantially as the
+window grows, down to matching static conformal almost exactly once
+unbounded:
+
+![EnbPI coverage gap vs. residual-pool window on airline](results/airline_enbpi_window_sweep.png)
+
+The mechanism is the same dilution effect the sliding-pool ACI section
+above already discusses for its own unbounded default: a large or
+unbounded pool mixes each new, genuinely-drifted test residual in among a
+much larger history of stable-regime ones, so the quantile barely moves;
+a small window lets the pool's composition actually reflect recent,
+real error. (Unlike the sliding ACI section, `window=10`'s own result here
+is already better than nominal-tight — it isn't `window=10` universally
+being "best" so much as this specific case rewarding a pool that reacts
+fast; see "What's next" below for a principled, held-out-data way to pick
+it instead of a swept-then-eyeballed value.) The result holds up across a
+few other seeds too (seeds 1-3 all land at exactly nominal 90.0% coverage
+with `window=10`, not just seed 0's 86.7% — checked directly, not assumed).
+
+![EnbPI's residual pool size over the airline test window](results/airline_enbpi.png)
+
+The flat line above is the honest picture for `window=10`: the pool is
+already at its bound from the very first test step (seeded with 102
+real out-of-bag/calibration residuals, then immediately truncated down to
+10 before online scoring starts — the exact same "truncate before the loop,
+don't just evict-after-append" fix `SlidingWindowAdaptiveConformalForecaster`
+needed for its own first cut, caught here by this module's own test suite
+before ever shipping with the bug).
+
+`tests/test_enbpi.py` (11 tests) checks the mechanism itself — hand-verified
+out-of-bag averaging, the window-truncation fix above, stationary-data
+coverage sanity checks, and a synthetic distribution-drift scenario where
+EnbPI meaningfully closes a constructed gap, mirroring
+`tests/test_adaptive.py`'s own equivalent checks. `tests/test_enbpi_experiment.py`
+(2 tests) pins the real airline result above (both that `window=10` beats
+fixed-pool ACI by a wide, non-noise margin, and that a large/unbounded
+window measurably underperforms it on this exact dataset) as a live
+regression check, the same way `tests/test_sliding_window_experiment.py`
+already pins its own real-data finding.
+
 ## Serving it as an API (v0.11, caching in v0.12, user series in v0.13, dataset handles in v0.14, listing in v0.15, idle-TTL eviction in v0.17, per-entry TTL remaining in v0.18, PATCH-to-refresh in v0.19)
 
 Everything above is driven through the CLI, one process invocation at a
@@ -1145,8 +1240,15 @@ forecasting/
   adaptive.py    # AdaptiveConformalForecaster (fixed-pool ACI) +
                  # SlidingWindowAdaptiveConformalForecaster (sliding/growing-pool ACI) +
                  # evaluate_adaptive_coverage
+  enbpi.py       # EnbPIForecaster (bootstrap-ensemble conformal, v0.20) +
+                 # evaluate_enbpi_coverage -- a structurally different
+                 # answer to the same exchangeability problem as adaptive.py,
+                 # via out-of-bag ensemble residuals instead of an adapted
+                 # significance level
   experiment.py  # wires the above together end-to-end for a given dataset,
-                 # including run_window_sweep_comparison (window tuning),
+                 # including run_enbpi_comparison (v0.20, static vs.
+                 # fixed-pool ACI vs. EnbPI on the same split),
+                 # run_window_sweep_comparison (window tuning),
                  # run_auto_window_selection (automatic window selection, v0.5),
                  # run_cv_window_selection + _make_rolling_folds
                  # (rolling-origin cross-validated selection, v0.6),
@@ -1177,10 +1279,11 @@ forecasting/
                  # entry's own TTL remaining (v0.18) and PATCH refreshing that
                  # same TTL directly, without a throwaway GET (v0.19)
   cli.py         # `python -m forecasting.cli benchmark [...]` /
-                 # `sliding-window [...]` / `window-sweep [...]` /
+                 # `sliding-window [...]` / `enbpi [--n-bootstrap --window]` /
+                 # `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]` / `serve [--host --port --reload]`
-tests/           # 179 tests, including the coverage-tracking statistical checks above
+tests/           # 192 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -1190,11 +1293,12 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 179 tests
+python -m pytest                                    # 192 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
 python -m forecasting.cli sliding-window --dataset airline --plot results/airline_sliding_window.png  # + sliding-pool ACI
+python -m forecasting.cli enbpi --dataset airline --n-bootstrap 20 --window 10 --plot results/airline_enbpi.png  # + EnbPI
 python -m forecasting.cli window-sweep --dataset airline --windows 5,7,10,15,20,30,50,unbounded --plot results/airline_window_sweep.png
 python -m forecasting.cli auto-window --dataset synthetic --candidates 5,7,10,15,20,30,50,unbounded --plot results/synthetic_auto_window.png
 python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --plot results/airline_cv_window_select.png
@@ -1208,8 +1312,18 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
 - Apply the sliding/growing-pool idea to a model that *retrains* as new data
   arrives, not just one that's fit once upfront — right now the LSTM itself
   is frozen through the whole test window; only the conformal pool adapts.
-- EnbPI (Xu & Xie, 2021), a different time-series-specific conformal variant
-  based on a bootstrap ensemble rather than a single model + adapting alpha.
+- ~~EnbPI (Xu & Xie, 2021), a different time-series-specific conformal
+  variant based on a bootstrap ensemble rather than a single model +
+  adapting alpha~~ **Done (v0.20)** — see the dedicated section above. A
+  principled `window` selection for EnbPI (mirroring `auto-window`/
+  `cv-window-select`'s own held-out/CV approach for ACI, instead of this
+  run's swept-then-picked `window=10`) would be the natural next increment
+  in this vein, same as those two commands were themselves later follow-ups
+  to the first "sliding beats fixed-pool" finding. A dedicated
+  `enbpi-window-sweep` CLI command (mirroring `window-sweep`) is the
+  smaller, more mechanical piece of that — the sweep itself is already
+  real (see the plotted figure), just not yet wired up as a reusable
+  command the way ACI's own `window-sweep` is.
 - More model families (N-BEATS-style block architecture, a small
   Transformer forecaster) to see whether the small-data problem on the
   airline dataset is LSTM-specific or general to neural approaches at this

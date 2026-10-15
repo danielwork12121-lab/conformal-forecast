@@ -83,6 +83,18 @@ reused across every value, since window has no effect on fitting -- see
 
     python -m forecasting.cli enbpi-window-sweep --dataset airline --windows 5,10,15,20,30,50,unbounded --plot results/airline_enbpi_window_sweep.png
 
+Select EnbPI's own `window` via the same rolling-origin cross-validation
+`cv-window-select` already does for ACI's sliding window, instead of
+eyeballing an `enbpi-window-sweep` table: the calibration set is split into
+several folds, each candidate window is scored by the mean of |coverage
+gap| across every fold's residual pool (seeded from EnbPI's own
+out-of-bag training residuals plus that fold's calibration prefix -- see
+`forecasting/experiment.py`'s `run_enbpi_cv_window_selection`), and the
+smallest-mean-|gap| window is selected -- then, as an honest post-hoc
+check, the real test-set gap for every candidate is reported too:
+
+    python -m forecasting.cli enbpi-cv-window-select --dataset airline --candidates 5,10,15,20,30,50,unbounded --plot results/airline_enbpi_cv_window_select.png
+
 Serve the calibrated forecasts over a minimal REST API (see
 `forecasting/api.py` and the README's "Serving it as an API" section --
 demo-quality, not production: the LSTM refits per request):
@@ -98,6 +110,7 @@ from forecasting.experiment import (
     format_auto_window_selection,
     format_cv_window_selection,
     format_enbpi_comparison,
+    format_enbpi_cv_window_selection,
     format_enbpi_window_sweep_comparison,
     format_results_table,
     format_sliding_window_comparison,
@@ -106,6 +119,7 @@ from forecasting.experiment import (
     run_auto_window_selection,
     run_cv_window_selection,
     run_enbpi_comparison,
+    run_enbpi_cv_window_selection,
     run_enbpi_window_sweep_comparison,
     run_experiment,
     run_sliding_window_comparison,
@@ -381,6 +395,49 @@ def _plot_cv_window_selection(dataset: str, result, path: str) -> None:
     plt.close(fig)
 
 
+def _plot_enbpi_cv_window_selection(dataset: str, result, path: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    windows = [c.window for c in result.candidates]
+    fold_gaps = [c.mean_abs_fold_gap * 100 for c in result.candidates]
+    test_gaps = [c.test_coverage_gap * 100 for c in result.candidates]
+    x = list(range(len(windows)))
+    labels = ["unbounded" if w is None else str(w) for w in windows]
+    selected_idx = windows.index(result.selected_window)
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(
+        x,
+        fold_gaps,
+        color="#9467bd",
+        linewidth=1.5,
+        marker="o",
+        label=f"mean |gap| across {result.n_folds} folds (used to select)",
+    )
+    ax.plot(x, test_gaps, color="#2ca02c", linewidth=1.5, marker="s", label="real test-set gap (post-hoc check)")
+    ax.axhline(0.0, color="#222222", linewidth=0.8)
+    ax.axvline(selected_idx, color="#d62728", linewidth=1.0, linestyle="--", label=f"selected (window={labels[selected_idx]})")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_xlabel("window (max residual-pool size)")
+    ax.set_ylabel("coverage gap (pp; fold column is |gap|, test column is signed)")
+    folds_label = f"{result.n_folds} folds, auto" if result.auto_folds else f"{result.n_folds} folds"
+    ax.set_title(
+        f"{dataset}: EnbPI rolling-origin CV window selection ({result.fold_scheme}, {folds_label}) "
+        f"vs. real test-set outcome\n"
+        f"selected window={labels[selected_idx]}, real test-set gap "
+        f"{result.selected_test_result['coverage_gap'] * 100:+.1f}pp",
+        fontsize=10,
+    )
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="conformal-forecast benchmark runner")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -527,6 +584,39 @@ def main() -> None:
     cv.add_argument("--plot", type=str, default=None, help="save a plot comparing mean fold |gap| vs. real test-set gap by window")
     cv.add_argument("--seed", type=int, default=0)
 
+    enbpi_cv = sub.add_parser(
+        "enbpi-cv-window-select",
+        help="select EnbPI's window size via rolling-origin cross-validation over the calibration set (mirrors cv-window-select for ACI)",
+    )
+    enbpi_cv.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    enbpi_cv.add_argument("--alpha", type=float, default=0.1)
+    enbpi_cv.add_argument("--gamma", type=float, default=0.05, help="fixed-pool ACI's step size (reference line only)")
+    enbpi_cv.add_argument("--n-bootstrap", type=int, default=20, help="number of bootstrap ensemble members")
+    enbpi_cv.add_argument(
+        "--candidates",
+        type=str,
+        default="5,7,10,15,20,30,50,unbounded",
+        help="comma-separated list of candidate window sizes to select from; include 'unbounded' for the growing buffer",
+    )
+    enbpi_cv.add_argument("--n-folds", type=int, default=4, help="requested number of rolling-origin folds (may be fewer if the calibration set is small)")
+    enbpi_cv.add_argument("--min-initial-frac", type=float, default=0.2, help="fraction of the calibration set reserved as the first fold's seed")
+    enbpi_cv.add_argument("--min-fold-frac", type=float, default=0.1, help="minimum fraction of the calibration set each fold's validation chunk must have")
+    enbpi_cv.add_argument(
+        "--fold-scheme",
+        choices=["expanding", "sliding"],
+        default="expanding",
+        help="'expanding' (default): every fold's seed grows from the start of the calibration set. "
+        "'sliding': each fold's seed is capped at the most recent min-initial-frac residuals",
+    )
+    enbpi_cv.add_argument(
+        "--auto-folds",
+        action="store_true",
+        help="pick n-folds/min-initial-frac/min-fold-frac automatically from the calibration set's size "
+        "instead of the fixed defaults above (which are then ignored)",
+    )
+    enbpi_cv.add_argument("--plot", type=str, default=None, help="save a plot comparing mean fold |gap| vs. real test-set gap by window")
+    enbpi_cv.add_argument("--seed", type=int, default=0)
+
     serve = sub.add_parser(
         "serve",
         help="run forecasting/api.py (GET /health, GET /datasets, POST /forecast) with uvicorn",
@@ -636,6 +726,26 @@ def main() -> None:
         print()
         if args.plot:
             _plot_cv_window_selection(args.dataset, result, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "enbpi-cv-window-select":
+        candidates = [None if w.strip().lower() == "unbounded" else int(w) for w in args.candidates.split(",")]
+        result = run_enbpi_cv_window_selection(
+            args.dataset,
+            windows=candidates,
+            alpha=args.alpha,
+            gamma=args.gamma,
+            n_bootstrap=args.n_bootstrap,
+            n_folds=args.n_folds,
+            min_initial_frac=args.min_initial_frac,
+            min_fold_frac=args.min_fold_frac,
+            fold_scheme=args.fold_scheme,
+            auto_folds=args.auto_folds,
+            seed=args.seed,
+        )
+        print(format_enbpi_cv_window_selection(result))
+        print()
+        if args.plot:
+            _plot_enbpi_cv_window_selection(args.dataset, result, args.plot)
             print(f"Saved plot to {args.plot}")
     elif args.command == "serve":
         import uvicorn

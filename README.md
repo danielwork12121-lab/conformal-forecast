@@ -1050,6 +1050,23 @@ by exactly the amount of idle time that passes; and touching an entry
 (`GET /series/{id}`) resets it back toward the full TTL, measured from the
 touch rather than from the original registration.
 
+**Reconciliation note (2026-10-15):** two concurrent runs of this
+project's automation independently built this exact feature around the
+same few minutes, each starting from v0.17 before the other's push had
+landed — the second run's 3 commits (`f5a10af`→`be91b82`, a slightly
+different design) ended up superseded on `main` by the third run's own 3
+commits (`bb7db49`→`3b2d0f1`, the version described just above), rather
+than the two merging. That collision quietly dropped two things of real
+value from the first attempt: 3 tests (never-negative-for-a-listed-entry,
+independent-remaining-time-per-entry, and a dedicated pin of
+`GET /series/{id}`'s unchanged shape) and a small design improvement
+(`_purge_expired_series_locked` accepting an optional `now` so the purge
+sweep and the reported `ttl_remaining_seconds` are computed from one
+shared clock read instead of two reads microseconds apart). This run
+restored both — re-added as `tests/test_api.py`'s final 3 tests (170 →
+173) and the `now` parameter — on top of the version that's actually live,
+rather than reverting or force-pushing either prior run's history.
+
 ## Installable as a real dependency (v0.16)
 
 Through v0.15, `pyproject.toml` had no `[build-system]` table and no
@@ -1133,7 +1150,7 @@ forecasting/
                  # `sliding-window [...]` / `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]` / `serve [--host --port --reload]`
-tests/           # 170 tests, including the coverage-tracking statistical checks above
+tests/           # 173 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -1143,7 +1160,7 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 170 tests
+python -m pytest                                    # 173 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI

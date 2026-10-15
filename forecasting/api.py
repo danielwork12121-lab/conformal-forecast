@@ -99,6 +99,22 @@ is updated accordingly, since adding real information to that response
 necessarily changes its shape; every other list-endpoint test already
 extracted `series_id`/`length` field-by-field and needed no change.
 
+v0.19: v0.17/v0.18's own "What's next" flagged this gap -- the only way to
+keep a series alive past its idle TTL was to GET it (or resolve it via
+`/forecast`), which forces a caller who has nothing new to ask yet to
+either throw away a response it doesn't need or duplicate the id lookup
+it's about to do anyway just to keep the clock from running out. `PATCH
+/series/{series_id}` refreshes the idle-TTL clock directly -- "still
+interested in this one" without needing (or returning) anything about the
+series beyond its length and the refreshed TTL. Shares `_resolve_series_id`'s
+exact purge-then-check-then-touch semantics (same 404 on an id that's
+already aged out, same LRU-position bump), so a caller can't tell PATCH
+and GET apart by their effect on the store's bookkeeping -- only by
+whether the response carries the full series length vs. just enough to
+confirm the refresh happened. Response reuses `SeriesListItemResponse`
+(the v0.18 shape), since "one series + how much idle time it has left" is
+exactly what both `GET /series`'s items and this endpoint's response are.
+
 Honest scope, stated here and in the README: this is still a demo-quality
 serving layer. No auth, no rate limiting, no persistence across process
 restarts -- both the fit cache and the series store are in-memory only and
@@ -126,6 +142,11 @@ GET    /series                -- list every series currently in the store
 GET    /series/{series_id}   -- check whether a `series_id` is still in the
                                  store, and its length. 404 if it's aged out
                                  either by capacity or by idle-TTL (v0.17).
+PATCH  /series/{series_id}   -- refresh a series' idle-TTL clock back to the
+                                 full budget without needing its data for
+                                 any other reason (v0.19). Same 404 as any
+                                 other series-store lookup if the id has
+                                 already aged out.
 DELETE /series/{series_id}   -- remove a series from the store.
 POST   /forecast             -- run one model on one dataset OR one
                                  user-supplied series OR a previously
@@ -164,7 +185,7 @@ app = FastAPI(
         "you've registered once and referenced by id. "
         "Demo-quality: see the repo README for honest scope notes."
     ),
-    version="0.18",
+    version="0.19",
 )
 
 # Generic defaults used for a user-supplied series, which has no dataset
@@ -586,6 +607,45 @@ def list_series() -> SeriesListResponse:
 def series_info(series_id: str) -> SeriesInfoResponse:
     series = _resolve_series_id(series_id)
     return SeriesInfoResponse(series_id=series_id, length=len(series))
+
+
+def _touch_series_ttl(series_id: str) -> int:
+    """Refresh `series_id`'s idle-TTL to the full `_SERIES_STORE_TTL_SECONDS`
+    budget and bump its LRU position, without needing the caller to want
+    the raw series for any other reason (v0.19). Shares `_resolve_series_id`'s
+    exact purge-then-check-then-touch sequence under one lock acquisition,
+    so a PATCH and a GET have identical effects on the store's bookkeeping.
+
+    Returns the series length. Raises HTTPException(404) if the id isn't
+    (or no longer) in the store -- same semantics every other series-store
+    lookup already uses.
+    """
+    with _series_lock:
+        _purge_expired_series_locked()
+        series = _series_store.get(series_id)
+        if series is not None:
+            _series_store.move_to_end(series_id)
+            _touch_series_locked(series_id)
+    if series is None:
+        raise HTTPException(status_code=404, detail=f"no series registered with id {series_id!r}")
+    return len(series)
+
+
+@app.patch("/series/{series_id}", response_model=SeriesListItemResponse)
+def refresh_series_ttl(series_id: str) -> SeriesListItemResponse:
+    """Refresh `series_id`'s idle-TTL clock back to the full budget (v0.19).
+
+    Equivalent, for TTL purposes, to `GET /series/{series_id}` -- both
+    touch the entry -- but doesn't force a caller that only wants to say
+    "still interested in this one" to fetch (and discard) a response it
+    has no other use for. 404s exactly when `GET`/`DELETE` would: an id
+    that's already aged out, by capacity or by idle-TTL, is gone either
+    way.
+    """
+    length = _touch_series_ttl(series_id)
+    return SeriesListItemResponse(
+        series_id=series_id, length=length, ttl_remaining_seconds=_SERIES_STORE_TTL_SECONDS
+    )
 
 
 @app.delete("/series/{series_id}")

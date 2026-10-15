@@ -1015,6 +1015,114 @@ how it's computed), and a severely bounded window measurably differs from
 a generous one (the window-truncation fix guard, exercised through this
 path specifically).
 
+## EnbPI: a principled, held-out-data window selection (v0.22)
+
+v0.21 added `enbpi-window-sweep`, a CLI command for the swept-then-eyeballed
+`window` value the EnbPI section above was still choosing by hand. This
+closes EnbPI's own remaining "What's next" item: `enbpi-cv-window-select`,
+the same rolling-origin cross-validation `cv-window-select` already does
+for ACI's sliding window (see that section above), adapted to EnbPI's own
+residual pool. Method, mirroring `run_cv_window_selection` exactly: the
+bootstrap ensemble is fit once; its out-of-bag training residuals (fixed,
+reused by every fold) plus an *expanding* prefix of the calibration
+residuals seed each rolling-origin fold's own online-pool backtest; each
+candidate window is scored by the mean of |coverage gap| across folds,
+never touching the real test set, which is used only afterward as an
+honest post-hoc check — exactly like every other selection method in this
+README.
+
+**Measured on both of the datasets this section has real numbers for —
+honest, not a clean win either way, the same finding the ACI version of
+this feature already reports for itself:**
+
+`airline` (n_cal=28, same tiny calibration set the ACI CV section found to
+be the hardest case for this method family):
+
+| Window | Mean &#124;fold gap&#124; (4 folds, used to select) | Real test gap (post-hoc check) |
+|---|---|---|
+| 5 | 17.1pp | -3.3pp |
+| 7 | 17.1pp | -3.3pp |
+| 10 (best in hindsight, per the eyeballed v0.21 sweep above) | 13.6pp | -3.3pp |
+| 15 | 13.6pp | -3.3pp |
+| 20 (**selected**) | 13.6pp | **-6.7pp** |
+| 30 | 17.1pp | -13.3pp |
+| 50 | 20.7pp | -23.3pp |
+| unbounded | 20.7pp | -30.0pp |
+
+```
+$ python -m forecasting.cli enbpi-cv-window-select --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --n-bootstrap 20 --plot results/airline_enbpi_cv_window_select.png
+```
+
+![airline EnbPI rolling-origin CV window selection: mean fold gap vs. real test-set outcome](results/airline_enbpi_cv_window_select.png)
+
+On `airline`, four candidates (10/15/20, tied with 5/7 at a different
+value) tie on the fold-averaged metric — the same small-calibration-set
+limitation the ACI version of this feature already documents, not a new
+problem. The tie-break (smaller mean width, then larger window) happens to
+land on window=20 here, which does *worse* on the real test set (-6.7pp)
+than window=10 — the value the v0.21 sweep's own eyeballed pick already
+used above (-3.3pp). **This is an honest loss for the automated method on
+this specific dataset**, not glossed over: a human eyeballing the sweep
+plot would have done better here than this rolling-origin CV selection
+does, exactly the kind of case `tests/test_enbpi_cv_window_selection.py`
+and this project's own "measure, don't assert" discipline exist to surface
+rather than hide.
+
+`synthetic` (n_cal=160, a case where the ACI version of this feature
+measurably helps):
+
+| Window | Mean &#124;fold gap&#124; (4 folds, used to select) | Real test gap (post-hoc check) |
+|---|---|---|
+| 5 | 8.8pp | -4.4pp |
+| 7 | 4.1pp | -1.9pp |
+| 10 | 3.7pp | +2.5pp |
+| 15 | 3.7pp | +5.0pp |
+| 20 (**selected**) | 1.4pp | **+1.2pp** |
+| 30 (best in hindsight) | 2.3pp | -0.6pp |
+| 50 | 2.7pp | -1.9pp |
+| unbounded | 2.7pp | -6.2pp |
+
+```
+$ python -m forecasting.cli enbpi-cv-window-select --dataset synthetic --candidates 5,7,10,15,20,30,50,unbounded --n-bootstrap 20 --plot results/synthetic_enbpi_cv_window_select.png
+```
+
+![synthetic EnbPI rolling-origin CV window selection: mean fold gap vs. real test-set outcome](results/synthetic_enbpi_cv_window_select.png)
+
+Here the fold-averaged metric genuinely discriminates (1.4pp to 8.8pp, no
+ties) and the selected window=20 lands at +1.2pp real gap — close to the
+oracle's +(-0.6)pp and comfortably beating every smaller candidate, a real
+(if modest) win for the automated method.
+
+**Honest takeaway, consistent with the ACI version of this same idea:**
+rolling-origin CV selection is not a strict upgrade over eyeballing the
+`enbpi-window-sweep` plot by hand — it does genuinely well when the fold
+metric actually discriminates between candidates (`synthetic`), and can do
+worse than a human's eyeballed pick when the calibration set is small
+enough that several candidates tie and the method falls through to a
+tie-break that doesn't happen to match the real test-set outcome
+(`airline`). Both outcomes are reported here, not just the favorable one —
+only `tests/test_enbpi_cv_window_selection.py`'s structural/integration
+tests are pinned as hard regression checks; the two real-data tables above
+are a measured snapshot, not an assertion that this method always wins.
+Not yet checked on `temperature` (the largest calibration set, where the
+ACI version of this feature found both methods already tie with the
+oracle) — a natural small follow-up if a future run has time for it.
+
+`tests/test_enbpi_cv_window_selection.py` (10 tests) checks the new
+`run_enbpi_cv_window_selection`/`format_enbpi_cv_window_selection`
+integration directly: every candidate reported, folds partition the
+calibration set with no gap or overlap, determinism for a fixed seed, the
+honest post-hoc check reports the exact same numbers a direct
+`run_enbpi_window_sweep_comparison` call would for the same window/seed,
+`auto_folds` reaches more folds than the fixed default, the `sliding`
+fold-scheme option is reported and reaches EnbPI's own CV path correctly,
+and both the too-small-calibration-set and invalid-argument error paths.
+The pure fold-boundary/tie-break helpers this reuses
+(`_make_rolling_folds`, `_fold_seed_start`, `_select_best_window`,
+`_auto_cv_fold_params`) are already fully tested by
+`tests/test_cv_window_selection.py` against their own inputs and are not
+re-tested here.
+
 ## Serving it as an API (v0.11, caching in v0.12, user series in v0.13, dataset handles in v0.14, listing in v0.15, idle-TTL eviction in v0.17, per-entry TTL remaining in v0.18, PATCH-to-refresh in v0.19)
 
 Everything above is driven through the CLI, one process invocation at a
@@ -1359,6 +1467,11 @@ forecasting/
                  # fold_scheme and auto_folds can be combined via the same
                  # run_cv_window_selection call (v0.9 measured this
                  # combination; no new function needed, see README) --
+                 # run_enbpi_window_sweep_comparison (v0.21: reuses one
+                 # fitted ensemble across every swept window value) +
+                 # run_enbpi_cv_window_selection (v0.22: the held-out-data
+                 # analogue of run_cv_window_selection, for EnbPI's own
+                 # residual pool) --
                  # _prepare_split_from_series (v0.13): the shared split/
                  # window/normalize/validate core, extracted from
                  # _prepare_split so the API's user-supplied-series path
@@ -1382,10 +1495,11 @@ forecasting/
                  # same TTL directly, without a throwaway GET (v0.19)
   cli.py         # `python -m forecasting.cli benchmark [...]` /
                  # `sliding-window [...]` / `enbpi [--n-bootstrap --window]` /
-                 # `window-sweep [...]` /
+                 # `enbpi-window-sweep [...]` / `enbpi-cv-window-select [...
+                 # --fold-scheme --auto-folds]` / `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]` / `serve [--host --port --reload]`
-tests/           # 203 tests, including the coverage-tracking statistical checks above
+tests/           # 213 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -1395,7 +1509,7 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 203 tests
+python -m pytest                                    # 213 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -1426,14 +1540,16 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   plus a `python -m forecasting.cli enbpi-window-sweep` command — re-running
   it for real reproduced the exact same window=10 result above
   (86.7%/-3.3pp/3.492) byte-for-byte, confirming the reusable function
-  matches the original ad hoc sweep script it replaces. A principled,
+  matches the original ad hoc sweep script it replaces. ~~A principled,
   held-out-data `window` selection for EnbPI (mirroring `auto-window`/
-  `cv-window-select`'s own held-out/CV approach for ACI, instead of a
-  swept-then-picked value) remains the natural, still-open next increment
-  in this vein, same as those two commands were themselves later
-  follow-ups to the first "sliding beats fixed-pool" finding — this run
-  deliberately scoped to the smaller, mechanical CLI-command piece rather
-  than both at once.
+  `cv-window-select`'s own held-out/CV approach for ACI)~~ **Done (v0.22):**
+  `enbpi-cv-window-select` — see the dedicated section above. Honest,
+  mixed result, same as the ACI version of this idea: a real win on
+  `synthetic` (fold metric discriminates cleanly, selects window=20,
+  +1.2pp real gap), a real loss on `airline` (small calibration set ties
+  several candidates, the tie-break lands on a worse real-test outcome
+  than the v0.21 sweep's own eyeballed pick). Not yet checked on
+  `temperature` — a natural small follow-up.
 - ~~More model families (N-BEATS-style block architecture, a small
   Transformer forecaster) to see whether the small-data problem on the
   airline dataset is LSTM-specific or general to neural approaches at this

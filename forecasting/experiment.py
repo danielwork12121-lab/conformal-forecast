@@ -572,6 +572,129 @@ def format_enbpi_comparison(comparison: EnbPIComparison) -> str:
 
 
 # ---------------------------------------------------------------------------
+# EnbPI window sweep (v0.21) -- this repo's own "What's next" item for
+# EnbPI, named in two places: `forecasting/enbpi.py`'s own docstring
+# ("pass an explicit window=... to reproduce the paper's own constant-
+# memory behavior") and `active-project.md`'s progress log ("a principled,
+# held-out-data way to pick window ... or an enbpi-window-sweep CLI
+# command mirroring the existing window-sweep one for ACI"). This section
+# is the second, simpler alternative named there -- mirrors
+# `run_window_sweep_comparison`/`format_window_sweep_comparison` exactly,
+# for EnbPI's own `window` parameter instead of ACI's.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EnbPIWindowSweepResult:
+    window: int | None  # None = unbounded growing buffer
+    enbpi: dict  # evaluate_enbpi_coverage() output for this window value
+
+
+@dataclass
+class EnbPIWindowSweepComparison:
+    dataset: str
+    alpha: float
+    n_bootstrap: int
+    static: dict  # evaluate_coverage() output for static split conformal (reference line)
+    fixed_pool: dict  # evaluate_adaptive_coverage() output for fixed-pool ACI (reference line)
+    results: list[EnbPIWindowSweepResult]  # one per swept window value, in the order given
+
+
+def run_enbpi_window_sweep_comparison(
+    dataset: str,
+    windows: list[int | None],
+    alpha: float = 0.1,
+    gamma: float = 0.05,
+    n_bootstrap: int = 20,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> EnbPIWindowSweepComparison:
+    """Sweep `window` for `EnbPIForecaster` on one dataset, holding the
+    bootstrap ensemble -- and the LOO + calibration residual pool it seeds
+    -- fixed across the sweep, exactly the same reasoning
+    `run_window_sweep_comparison` already uses for ACI's sliding window:
+    `window` only changes how `predict_sequential` *reads* the residual
+    pool (see `forecasting/enbpi.py`'s own docstring); it has no effect on
+    how the ensemble itself is trained. So the `n_bootstrap` models are
+    fit exactly once here and reused for every window value, rather than
+    re-fitting the whole ensemble per value (which would waste
+    `len(windows)` rounds of ensemble training and let train-time
+    randomness, not `window`, explain part of any difference between
+    values).
+
+    `static` and `fixed_pool` are included once, as reference lines, so a
+    caller (the CLI / README table) can show the sweep against the same
+    two baselines `run_enbpi_comparison` already reports, without
+    re-running them.
+    """
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+
+    static_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    static = SplitConformalForecaster(static_model, alpha=alpha).fit(X_train, y_train, X_cal, y_cal)
+    static_result = evaluate_coverage(static.predict(X_test), y_test)
+
+    fixed_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    fixed = AdaptiveConformalForecaster(fixed_model, alpha=alpha, gamma=gamma).fit(X_train, y_train, X_cal, y_cal)
+    fixed_pred = fixed.predict_sequential(X_test, y_test.reshape(-1))
+    fixed_result = evaluate_adaptive_coverage(fixed_pred, y_test)
+
+    def _ensemble_member(member_seed: int):
+        return DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=member_seed))
+
+    # Fit the ensemble exactly once. `window` is passed here only to satisfy
+    # the constructor; it plays no role in fit() at all (see
+    # `forecasting/enbpi.py`), so any value would do -- `None` keeps this
+    # call self-documenting as "the fit step, unaffected by window".
+    fitted = EnbPIForecaster(_ensemble_member, n_bootstrap=n_bootstrap, alpha=alpha, window=None, seed=seed).fit(
+        X_train, y_train, X_cal, y_cal
+    )
+
+    results = []
+    for window in windows:
+        forecaster = EnbPIForecaster(_ensemble_member, n_bootstrap=n_bootstrap, alpha=alpha, window=window, seed=seed)
+        # Reuse the one fit; window doesn't affect training, only how
+        # predict_sequential reads the pool (same pattern as the ACI sweep).
+        forecaster._models = fitted._models
+        forecaster._residuals = fitted._residuals
+        pred = forecaster.predict_sequential(X_test, y_test.reshape(-1))
+        results.append(EnbPIWindowSweepResult(window=window, enbpi=evaluate_enbpi_coverage(pred, y_test)))
+
+    return EnbPIWindowSweepComparison(
+        dataset=dataset,
+        alpha=alpha,
+        n_bootstrap=n_bootstrap,
+        static=static_result,
+        fixed_pool=fixed_result,
+        results=results,
+    )
+
+
+def format_enbpi_window_sweep_comparison(comparison: EnbPIWindowSweepComparison) -> str:
+    nominal_pct = int(round((1 - comparison.alpha) * 100))
+    s, f = comparison.static, comparison.fixed_pool
+    lines = [
+        f"### {comparison.dataset}: EnbPI window sweep "
+        f"(LSTM (delta), nominal {nominal_pct}%, n_bootstrap={comparison.n_bootstrap})",
+        "",
+        "| Window | Empirical coverage | Coverage gap | Mean interval width |",
+        "|---|---|---|---|",
+        f"| *static split conformal (reference)* | {s['empirical_coverage'] * 100:.1f}% | "
+        f"{s['coverage_gap'] * 100:+.1f}pp | {s['mean_interval_width']:.3f} |",
+        f"| *fixed-pool ACI (reference)* | {f['empirical_coverage'] * 100:.1f}% | "
+        f"{f['coverage_gap'] * 100:+.1f}pp | {f['mean_interval_width']:.3f} |",
+    ]
+    for r in comparison.results:
+        wlabel = "unbounded (growing buffer)" if r.window is None else str(r.window)
+        e = r.enbpi
+        lines.append(
+            f"| {wlabel} | {e['empirical_coverage'] * 100:.1f}% | "
+            f"{e['coverage_gap'] * 100:+.1f}pp | {e['mean_interval_width']:.3f} |"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Automatic window selection (v0.5) -- the README's own "What's next" item:
 # "pick the window minimizing |coverage gap| on a held-out slice of the
 # calibration data ... instead of requiring a user to eyeball a window-sweep

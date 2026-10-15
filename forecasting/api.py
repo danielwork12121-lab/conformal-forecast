@@ -222,12 +222,21 @@ def _clock() -> float:
     return time.monotonic()
 
 
-def _purge_expired_series_locked() -> None:
+def _purge_expired_series_locked(now: float | None = None) -> None:
     """Evict every series idle longer than `_SERIES_STORE_TTL_SECONDS`.
 
-    Caller must already hold `_series_lock`.
+    Caller must already hold `_series_lock`. `now` lets a caller that also
+    needs "the current time" for its own purposes right after purging
+    (e.g. `list_series`'s per-entry `ttl_remaining_seconds`) pass in one
+    already-read clock value instead of this function reading a second,
+    technically-later one -- harmless in practice (purging and `now` both
+    happen under the same lock, microseconds apart) but one clock read per
+    request is simpler to reason about than two, and it means the purge
+    decision and the reported remaining time can never disagree about what
+    "now" was. Defaults to a fresh `_clock()` read for every other caller,
+    unchanged from before.
     """
-    now = _clock()
+    now = _clock() if now is None else now
     expired = [
         sid
         for sid, last_seen in _series_last_access.items()
@@ -553,11 +562,13 @@ def list_series() -> SeriesListResponse:
     most-recently-used first, the same recency `GET /series/{id}` and a
     cache lookup already bump, so the most likely-relevant entries lead.
     Runs the idle-TTL sweep (v0.17) first, so an entry that's aged out
-    never appears in the listing.
+    never appears in the listing. Each entry's `ttl_remaining_seconds` is
+    computed against the same `now` used for that sweep, so a listing is
+    never built from two different clock reads.
     """
     with _series_lock:
-        _purge_expired_series_locked()
         now = _clock()
+        _purge_expired_series_locked(now=now)
         items = [
             SeriesListItemResponse(
                 series_id=sid,

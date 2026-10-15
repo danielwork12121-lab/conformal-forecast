@@ -962,7 +962,15 @@ guessing `window=10` first: a real sweep (`window` in `{10, 15, 20, 30, 40,
 every value — fitting doesn't depend on `window`, only the online scoring
 loop does) showed the gap degrading smoothly and substantially as the
 window grows, down to matching static conformal almost exactly once
-unbounded:
+unbounded. As of v0.21, this sweep is a tested, reusable function
+(`run_enbpi_window_sweep_comparison`) and CLI command
+(`enbpi-window-sweep`), not a throwaway script — re-running it below
+reproduced this exact result:
+
+```
+$ python -m forecasting.cli enbpi-window-sweep --dataset airline --n-bootstrap 20 \
+    --windows 10,15,20,30,40,50,60,75,90,100,unbounded --plot results/airline_enbpi_window_sweep.png
+```
 
 ![EnbPI coverage gap vs. residual-pool window on airline](results/airline_enbpi_window_sweep.png)
 
@@ -998,7 +1006,14 @@ EnbPI meaningfully closes a constructed gap, mirroring
 fixed-pool ACI by a wide, non-noise margin, and that a large/unbounded
 window measurably underperforms it on this exact dataset) as a live
 regression check, the same way `tests/test_sliding_window_experiment.py`
-already pins its own real-data finding.
+already pins its own real-data finding. `tests/test_enbpi_window_sweep.py`
+(4 tests, v0.21) checks the new reusable sweep function directly: every
+requested window actually runs, a swept result matches what calling
+`run_enbpi_comparison` directly for the same window/seed would give (the
+"one ensemble fit, reused" shortcut must never change the answer, only
+how it's computed), and a severely bounded window measurably differs from
+a generous one (the window-truncation fix guard, exercised through this
+path specifically).
 
 ## Serving it as an API (v0.11, caching in v0.12, user series in v0.13, dataset handles in v0.14, listing in v0.15, idle-TTL eviction in v0.17, per-entry TTL remaining in v0.18, PATCH-to-refresh in v0.19)
 
@@ -1370,7 +1385,7 @@ forecasting/
                  # `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]` / `serve [--host --port --reload]`
-tests/           # 199 tests, including the coverage-tracking statistical checks above
+tests/           # 203 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -1380,7 +1395,7 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 199 tests
+python -m pytest                                    # 203 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -1401,16 +1416,24 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   is frozen through the whole test window; only the conformal pool adapts.
 - ~~EnbPI (Xu & Xie, 2021), a different time-series-specific conformal
   variant based on a bootstrap ensemble rather than a single model +
-  adapting alpha~~ **Done (v0.20)** — see the dedicated section above. A
-  principled `window` selection for EnbPI (mirroring `auto-window`/
-  `cv-window-select`'s own held-out/CV approach for ACI, instead of this
-  run's swept-then-picked `window=10`) would be the natural next increment
-  in this vein, same as those two commands were themselves later follow-ups
-  to the first "sliding beats fixed-pool" finding. A dedicated
-  `enbpi-window-sweep` CLI command (mirroring `window-sweep`) is the
-  smaller, more mechanical piece of that — the sweep itself is already
-  real (see the plotted figure), just not yet wired up as a reusable
-  command the way ACI's own `window-sweep` is.
+  adapting alpha~~ **Done (v0.20)** — see the dedicated section above.
+  ~~A dedicated `enbpi-window-sweep` CLI command (mirroring `window-sweep`)
+  — the sweep itself was already real, just not yet wired up as a reusable
+  command the way ACI's own `window-sweep` is.~~ **Done (v0.21):**
+  `run_enbpi_window_sweep_comparison`/`format_enbpi_window_sweep_comparison`
+  in `forecasting/experiment.py` (reusing one fitted ensemble across every
+  window value, same reasoning as `run_window_sweep_comparison` for ACI)
+  plus a `python -m forecasting.cli enbpi-window-sweep` command — re-running
+  it for real reproduced the exact same window=10 result above
+  (86.7%/-3.3pp/3.492) byte-for-byte, confirming the reusable function
+  matches the original ad hoc sweep script it replaces. A principled,
+  held-out-data `window` selection for EnbPI (mirroring `auto-window`/
+  `cv-window-select`'s own held-out/CV approach for ACI, instead of a
+  swept-then-picked value) remains the natural, still-open next increment
+  in this vein, same as those two commands were themselves later
+  follow-ups to the first "sliding beats fixed-pool" finding — this run
+  deliberately scoped to the smaller, mechanical CLI-command piece rather
+  than both at once.
 - ~~More model families (N-BEATS-style block architecture, a small
   Transformer forecaster) to see whether the small-data problem on the
   airline dataset is LSTM-specific or general to neural approaches at this

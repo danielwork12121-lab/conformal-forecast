@@ -1093,20 +1093,51 @@ ties) and the selected window=20 lands at +1.2pp real gap — close to the
 oracle's +(-0.6)pp and comfortably beating every smaller candidate, a real
 (if modest) win for the automated method.
 
+`temperature` (n_cal=730, the largest calibration set of the three — added
+2026-10-15, the natural small follow-up the first version of this section
+flagged as not yet checked):
+
+| Window | Mean &#124;fold gap&#124; (4 folds, used to select) | Real test gap (post-hoc check) |
+|---|---|---|
+| 5 | 8.0pp | -7.1pp |
+| 7 | 4.2pp | -2.3pp |
+| 10 | 1.5pp | +1.5pp |
+| 15 | 2.0pp | +4.0pp |
+| 20 | 1.2pp | +1.4pp |
+| 30 (**selected**, also best in hindsight) | 1.2pp | **+1.0pp** |
+| 50 | 1.7pp | +1.1pp |
+| unbounded | 3.6pp | +2.9pp |
+
+```
+$ python -m forecasting.cli enbpi-cv-window-select --dataset temperature --candidates 5,7,10,15,20,30,50,unbounded --n-bootstrap 20 --plot results/temperature_enbpi_cv_window_select.png
+```
+
+![temperature EnbPI rolling-origin CV window selection: mean fold gap vs. real test-set outcome](results/temperature_enbpi_cv_window_select.png)
+
+Window 30 ties window 20 on the fold-averaged metric (both 1.2pp) but the
+tie-break (smaller mean width, then larger window) happens to land on the
+one that is *also* the real oracle best here (+1.0pp, edging out window 50
+at +1.1pp and window 20 at +1.4pp) — a clean win, unlike the tie-break
+outcome on `airline`. Three datasets now checked, three different
+outcomes: a clean win where the fold metric discriminates with no ties
+(`synthetic`), a clean win even with a tie (`temperature`, this tie-break
+happened to land well), and a real loss where a tie-break landed badly on
+a very small calibration set (`airline`) — consistent with this being a
+genuinely data-dependent method, not one that always wins or always ties
+badly.
+
 **Honest takeaway, consistent with the ACI version of this same idea:**
 rolling-origin CV selection is not a strict upgrade over eyeballing the
 `enbpi-window-sweep` plot by hand — it does genuinely well when the fold
-metric actually discriminates between candidates (`synthetic`), and can do
-worse than a human's eyeballed pick when the calibration set is small
-enough that several candidates tie and the method falls through to a
-tie-break that doesn't happen to match the real test-set outcome
-(`airline`). Both outcomes are reported here, not just the favorable one —
-only `tests/test_enbpi_cv_window_selection.py`'s structural/integration
-tests are pinned as hard regression checks; the two real-data tables above
-are a measured snapshot, not an assertion that this method always wins.
-Not yet checked on `temperature` (the largest calibration set, where the
-ACI version of this feature found both methods already tie with the
-oracle) — a natural small follow-up if a future run has time for it.
+metric actually discriminates between candidates (`synthetic`) or when a
+tie-break happens to land well (`temperature`), and can do worse than a
+human's eyeballed pick when the calibration set is small enough that
+several candidates tie and the tie-break doesn't happen to match the real
+test-set outcome (`airline`). All three outcomes are reported here, not
+just the favorable ones — only `tests/test_enbpi_cv_window_selection.py`'s
+structural/integration tests are pinned as hard regression checks; the
+three real-data tables above are a measured snapshot, not an assertion
+that this method always wins.
 
 `tests/test_enbpi_cv_window_selection.py` (10 tests) checks the new
 `run_enbpi_cv_window_selection`/`format_enbpi_cv_window_selection`
@@ -1548,8 +1579,12 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   `synthetic` (fold metric discriminates cleanly, selects window=20,
   +1.2pp real gap), a real loss on `airline` (small calibration set ties
   several candidates, the tie-break lands on a worse real-test outcome
-  than the v0.21 sweep's own eyeballed pick). Not yet checked on
-  `temperature` — a natural small follow-up.
+  than the v0.21 sweep's own eyeballed pick). **Checked on `temperature`
+  too (2026-10-15):** a tie on the fold metric this time (window=30 ties
+  window=20 at 1.2pp) but the tie-break happens to land on the real
+  oracle best (+1.0pp) — a clean win despite the tie, unlike `airline`'s
+  tie-break outcome. All three bundled datasets now checked for this
+  feature.
 - ~~More model families (N-BEATS-style block architecture, a small
   Transformer forecaster) to see whether the small-data problem on the
   airline dataset is LSTM-specific or general to neural approaches at this

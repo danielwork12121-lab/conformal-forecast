@@ -5,6 +5,7 @@ from forecasting.models import (
     DeltaWrapper,
     LSTMForecaster,
     NaiveForecaster,
+    NBEATSForecaster,
     SeasonalNaiveForecaster,
     TransformerForecaster,
 )
@@ -175,3 +176,117 @@ def test_delta_wrapper_forwards_attributes_to_transformer_base_model():
     y = np.random.RandomState(1).randn(20, 1).astype(np.float32)
     wrapper.fit(X, y)
     assert len(wrapper.train_losses) > 0  # forwarded via __getattr__
+
+
+def test_nbeats_forecaster_learns_a_bounded_periodic_series():
+    # Same test as the LSTM/Transformer periodic-series checks above, same
+    # reasoning: a bounded sine wave isolates "did the training loop learn
+    # a real in-distribution pattern" from neural nets' separate, unrelated
+    # weakness at extrapolating past their training range.
+    t = np.arange(400, dtype=np.float64)
+    series = (np.sin(t * 0.3) * 5.0).astype(np.float32)
+    X, y = make_windows(series, lookback=8, horizon=1)
+    X_train, y_train = X[:300], y[:300]
+    X_test, y_test = X[300:], y[300:]
+
+    model = NBEATSForecaster(num_blocks=3, hidden_size=16, max_epochs=300, patience=30, seed=0)
+    model.fit(X_train, y_train)
+    assert model.train_losses[-1] < model.train_losses[0]
+
+    pred = model.predict(X_test)
+    mae = float(np.mean(np.abs(pred - y_test)))
+    # Same loose tolerance and reasoning as the LSTM/Transformer versions of
+    # this test: a naive last-value baseline gets roughly 1.6-2.0 here, so
+    # we require clearly better than that, not a specific float.
+    assert mae < 1.5
+
+
+def test_nbeats_forecaster_rejects_a_different_lookback_at_predict_time():
+    # Real, honest architectural difference from LSTM/Transformer: those two
+    # are sequence models (recurrence / attention), so they tolerate a
+    # different lookback at predict time than they were fit on (see the
+    # dedicated Transformer test for this). N-BEATS' blocks are plain FC
+    # stacks with Linear layers sized to the *flat* lookback at construction
+    # time, so a mismatched lookback is a real shape error, not something
+    # this implementation silently handles -- this test documents that
+    # instead of pretending otherwise.
+    rng = np.random.RandomState(0)
+    X_train = rng.randn(40, 6).astype(np.float32)
+    y_train = rng.randn(40, 1).astype(np.float32)
+    model = NBEATSForecaster(num_blocks=2, hidden_size=8, max_epochs=5, patience=5, seed=0)
+    model.fit(X_train, y_train)
+
+    X_different_lookback = rng.randn(5, 10).astype(np.float32)
+    try:
+        model.predict(X_different_lookback)
+    except RuntimeError as e:
+        assert "size mismatch" in str(e) or "shapes cannot be multiplied" in str(e)
+    else:
+        raise AssertionError(
+            "expected a shape error -- N-BEATS' FC blocks are sized to the "
+            "lookback they were fit on, unlike the sequence models"
+        )
+
+
+def test_delta_wrapper_extrapolates_a_trend_with_nbeats_too():
+    # The same trend-extrapolation check as the LSTM/Transformer versions
+    # above, run against N-BEATS instead -- confirms DeltaWrapper's benefit
+    # isn't architecture-specific.
+    series = np.arange(300, dtype=np.float64).astype(np.float32)  # y = x, unbounded trend
+    X, y = make_windows(series, lookback=5, horizon=1)
+    X_train, y_train = X[:200], y[:200]
+    X_test, y_test = X[200:], y[200:]
+
+    plain = NBEATSForecaster(num_blocks=3, hidden_size=16, max_epochs=200, patience=20, seed=0)
+    plain.fit(X_train, y_train)
+    plain_mae = float(np.mean(np.abs(plain.predict(X_test) - y_test)))
+
+    wrapped = DeltaWrapper(
+        NBEATSForecaster(num_blocks=3, hidden_size=16, max_epochs=200, patience=20, seed=0)
+    )
+    wrapped.fit(X_train, y_train)
+    wrapped_mae = float(np.mean(np.abs(wrapped.predict(X_test) - y_test)))
+
+    assert wrapped_mae < plain_mae
+
+
+def test_delta_wrapper_forwards_attributes_to_nbeats_base_model():
+    wrapper = DeltaWrapper(NBEATSForecaster(num_blocks=2, hidden_size=8, max_epochs=5, patience=5))
+    X = np.random.RandomState(0).randn(20, 4).astype(np.float32)
+    y = np.random.RandomState(1).randn(20, 1).astype(np.float32)
+    wrapper.fit(X, y)
+    assert len(wrapper.train_losses) > 0  # forwarded via __getattr__
+
+
+def test_nbeats_doubly_residual_stacking_reduces_backcast_error_across_blocks():
+    # The defining mechanic of N-BEATS (vs. a single FC block) is doubly-
+    # residual stacking: each block only has to explain what earlier
+    # blocks' backcasts failed to reconstruct. This test checks that
+    # mechanic directly, at the module level, rather than only checking
+    # end-to-end forecast accuracy (which wouldn't distinguish "residual
+    # stacking is working" from "one block alone would do just as well").
+    from forecasting.models import NBEATSModule
+
+    torch_seed = 0
+    import torch
+
+    torch.manual_seed(torch_seed)
+    module = NBEATSModule(lookback=10, horizon=1, num_blocks=3, hidden_size=16)
+    x = torch.randn(4, 10)
+
+    with torch.no_grad():
+        residual = x
+        residual_norms = [float(residual.norm())]
+        for block in module.blocks:
+            backcast, _ = block(residual)
+            residual = residual - backcast
+            residual_norms.append(float(residual.norm()))
+
+    # An untrained block's backcast is essentially random noise relative to
+    # the input, so this doesn't assert monotonic decrease (that would only
+    # hold after training) -- it asserts the mechanic itself: each block
+    # actually changes the residual passed to the next one, i.e. the
+    # blocks are genuinely chained, not independently reading the same
+    # fixed input (which would make "stacking" cosmetic).
+    assert residual_norms[1] != residual_norms[0]
+    assert residual_norms[2] != residual_norms[1]

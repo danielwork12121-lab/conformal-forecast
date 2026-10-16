@@ -14,11 +14,15 @@ hand-wavy confidence score.
 
 ## What's in here
 
-- **Four point-forecast models**, all behind the same `fit`/`predict`
-  interface: `Naive`, `SeasonalNaive`, a from-scratch PyTorch `LSTM`, and
-  (v0.20) a from-scratch PyTorch `Transformer` encoder (`forecasting/models.py`)
-  — two architecturally distinct neural models, trained with the identical
-  recipe, so a benchmark comparison isolates architecture from training.
+- **Five point-forecast models**, all behind the same `fit`/`predict`
+  interface: `Naive`, `SeasonalNaive`, a from-scratch PyTorch `LSTM`,
+  (v0.20) a from-scratch PyTorch `Transformer` encoder, and (v0.23) a
+  from-scratch generic `N-BEATS` (Oreshkin et al. 2020) stacked-block
+  architecture with explicit backcast/forecast residual stacking
+  (`forecasting/models.py`) — three architecturally distinct neural models
+  (recurrence / self-attention / stacked-FC-with-residual-basis-expansion),
+  trained with the identical recipe, so a benchmark comparison isolates
+  architecture from training.
 - **A `DeltaWrapper`** that turns any point model into one that predicts the
   *change* from the last observation instead of the absolute level — the
   neural-net analogue of ARIMA's differencing term, needed because a small
@@ -100,6 +104,7 @@ points, strong trend + yearly seasonality, almost no noise).
 | SeasonalNaive | 40.800 | 45.555 | 9.02 | 86.7% | 1.999 |
 | LSTM (delta) | 122.645 | 134.268 | 27.76 | 63.3% | 4.873 |
 | Transformer (delta) | 36.276 | 44.416 | 8.22 | 66.7% | 1.509 |
+| N-BEATS (delta) | 45.260 | 49.689 | 10.64 | 56.7% | 1.484 |
 
 ![Airline forecast with conformal interval](results/airline_forecast.png)
 
@@ -123,6 +128,15 @@ baselines (36.3 MAE vs. SeasonalNaive's 40.8), but its interval still
 under-covers (66.7% vs. 90% nominal) — a real, measured improvement over the
 LSTM's under-coverage (63.3%), not a fix of it.
 
+**N-BEATS (v0.23), the third architecture, is the honest disappointment of
+the three here — see "More model families" below for the full read:** its
+point accuracy (45.3 MAE) lands close to `SeasonalNaive`'s and well behind
+the Transformer's, and its coverage (56.7%) is the *worst* of all five rows
+in this table, including the LSTM it was meant to compare against. Reported
+as measured, not reframed — this benchmark isn't a showcase for N-BEATS, it's
+a real answer to whether it generalizes better here (it doesn't, in this
+configuration).
+
 ### daily-min-temperatures (nominal 90% intervals)
 
 Daily minimum temperatures in Melbourne, Australia, 1981-1990 (3650 points,
@@ -134,6 +148,7 @@ strong yearly seasonality, substantial day-to-day noise).
 | SeasonalNaive | 1.953 | 2.481 | 21.23 | 93.6% | 2.163 |
 | LSTM (delta) | 1.730 | 2.199 | 20.68 | 93.0% | 1.929 |
 | Transformer (delta) | 1.721 | 2.197 | 20.42 | 92.9% | 1.941 |
+| N-BEATS (delta) | 1.758 | 2.245 | 20.80 | 92.3% | 1.970 |
 
 ![Temperature forecast with conformal interval](results/temperature_forecast.png)
 
@@ -159,6 +174,7 @@ to validate the conformal machinery itself:
 | SeasonalNaive | 1.515 | 1.847 | 1.77 | 90.0% | 0.608 |
 | LSTM (delta) | 1.978 | 2.425 | 2.32 | 63.7% | 0.471 |
 | Transformer (delta) | 1.556 | 1.905 | 1.83 | 81.2% | 0.491 |
+| N-BEATS (delta) | 2.240 | 2.639 | 2.60 | 58.1% | 0.531 |
 
 The `Naive`/`SeasonalNaive` rows land close to the 90% nominal target, which
 is what `tests/test_conformal.py::test_empirical_coverage_tracks_nominal_on_synthetic_data`
@@ -174,7 +190,7 @@ closes most (not all) of that gap here too (81.2% vs. the LSTM's 63.7%) —
 see the next section for the full three-dataset picture and what it does and
 doesn't answer.
 
-## More model families: is the under-coverage LSTM-specific, or a general small-neural-model problem? (v0.20)
+## More model families: is the under-coverage LSTM-specific, or a general small-neural-model problem? (v0.20, extended v0.23)
 
 Every benchmark table above measured exactly one neural architecture (the
 from-scratch LSTM) against two non-neural baselines. That leaves an obvious
@@ -223,17 +239,11 @@ dataset" — not a clean "it was always just the LSTM":**
   closely; there was never much of a gap to explain here in the first
   place.
 
-**What this doesn't answer, stated plainly rather than overclaimed:** this
-is one Transformer configuration (`d_model=32, nhead=4, num_layers=1`) at
-one seed, same early-stopping budget as the LSTM — not a hyperparameter
+**What this didn't answer at v0.20, stated plainly rather than overclaimed:**
+that was one Transformer configuration (`d_model=32, nhead=4, num_layers=1`)
+at one seed, same early-stopping budget as the LSTM — not a hyperparameter
 sweep, and not the N-BEATS-style block architecture the original "What's
-next" note also named as a candidate. The honest conclusion is narrower than
-"Transformers fix this": under-coverage on short, non-stationary series is
-*not* purely an artifact of recurrence (the synthetic result rules that
-out), but it also isn't purely a point-accuracy problem either (the airline
-result rules that out) — the calibration-side fix (ACI, already in this
-repo) and the model-side choice are separate levers, and this run is the
-first real evidence they don't move together.
+next" note also named as a candidate.
 
 7 new tests (179 → 186, after the API's own v0.19 bump above): the model's
 own fit/predict mechanics in isolation (rejects an incompatible
@@ -245,6 +255,76 @@ end-to-end and produces finite, sane, apples-to-apples-comparable results
 against the same test split every other model in the benchmark sees, and
 genuinely trains rather than silently reusing the LSTM's own predictions).
 Full suite verified: **186/186 passed.**
+
+### A third architecture: generic N-BEATS (v0.23) — and a real negative result
+
+The Transformer answer above was a mix, not a clean story — exactly the
+kind of result that makes the *third* candidate the original "What's next"
+note already named (an N-BEATS-style stacked block architecture) worth
+actually building rather than leaving as a hypothetical. `forecasting/models.py`
+now ships `NBEATSForecaster` — a generic (Oreshkin et al. 2020) N-BEATS
+variant: a stack of fully-connected blocks, each producing a *backcast*
+(subtracted from the input before the next block sees it — "doubly-residual
+stacking") and a *forecast* (summed across blocks), with no hand-coded
+trend/seasonality basis functions. Trained with the exact same discipline as
+the other two neural models (Adam, MSE loss, early stopping on the same
+validation split), so this is a third apples-to-apples comparison, not a
+differently-tuned one.
+
+**Measured, not assumed, on all three datasets (see the tables above for the
+full numbers):**
+
+| Dataset | LSTM coverage | Transformer coverage | N-BEATS coverage | LSTM MAE | Transformer MAE | N-BEATS MAE |
+|---|---|---|---|---|---|---|
+| airline | 63.3% | **66.7%** | 56.7% | 122.645 | **36.276** | 45.260 |
+| temperature | 93.0% | **92.9%** | 92.3% | 1.730 | 1.721 | 1.758 |
+| synthetic | 63.7% | **81.2%** | 58.1% | 1.978 | **1.556** | 2.240 |
+
+**The honest answer this time is simpler and less flattering: in this
+configuration, N-BEATS is the weakest of the three architectures, not a
+third way to close the coverage gap.** It has the *worst* coverage of all
+three neural models on two of three datasets (`airline` 56.7%, `synthetic`
+58.1% — both below even the LSTM's own under-coverage), and on `synthetic`
+it's also the worst on every point-accuracy column, including both
+non-neural baselines (2.240 MAE vs. `SeasonalNaive`'s 1.515). Only on
+`temperature` — the one dataset with enough training data (~1,950 windows)
+for any of these three architectures to train reliably — does it land
+within noise of the other two (92.3% vs. 92.9%/93.0%).
+
+A plausible reason, stated as a hypothesis rather than a proven cause: the
+*generic* N-BEATS variant has no built-in trend or seasonality structure (no
+basis functions, unlike the paper's "interpretable" variant) and its blocks
+operate on the flat lookback window with plain FC layers, giving it
+strictly fewer useful inductive biases for a short, structured series like
+`airline` (strong trend + seasonality, only ~86 training windows) than
+either the LSTM's recurrence or the Transformer's attention-over-positions.
+This isn't tested here (that would need the interpretable variant, or a
+basis-function ablation, as its own follow-up) — stated as a real open
+question, not a settled explanation.
+
+**What all three architectures together actually show:** under-coverage on
+short, non-stationary series is *not* purely an artifact of recurrence (the
+Transformer's `synthetic` result already ruled that out at v0.20), it also
+isn't purely a point-accuracy problem (the Transformer's `airline` result
+ruled that out too), and now — a third data point — it isn't the case that
+*any* alternative architecture reliably helps: N-BEATS, tried here in good
+faith as the "third candidate," is actually worse than the LSTM it was
+meant to be an improvement over. The calibration-side fix (ACI, already in
+this repo) remains the lever that's actually been shown to work reliably
+across datasets; architecture choice alone is not a substitute for it.
+
+7 new tests (213 → 220): the model's own fit/predict mechanics in isolation
+(learns a bounded periodic series, a real architectural-difference test
+documenting that — unlike the two sequence models — N-BEATS' FC blocks
+reject a different lookback at predict time than they were fit on,
+`DeltaWrapper` trend-extrapolation and attribute-forwarding compatibility,
+and a module-level check that doubly-residual stacking actually chains the
+blocks rather than having each one independently see the same fixed input),
+plus two `run_experiment` integration checks (the model factory wires in
+correctly end-to-end with finite, sane results, and all three neural
+models' predictions are genuinely distinct from one another, not one
+silently reusing another's output). Full suite verified: **220/220
+passed.**
 
 ## Adaptive Conformal Inference: does it actually fix the LSTM's under-coverage?
 
@@ -1530,7 +1610,7 @@ forecasting/
                  # --fold-scheme --auto-folds]` / `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]` / `serve [--host --port --reload]`
-tests/           # 213 tests, including the coverage-tracking statistical checks above
+tests/           # 220 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -1540,7 +1620,7 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 213 tests
+python -m pytest                                    # 220 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -1588,12 +1668,18 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
 - ~~More model families (N-BEATS-style block architecture, a small
   Transformer forecaster) to see whether the small-data problem on the
   airline dataset is LSTM-specific or general to neural approaches at this
-  scale.~~ **Partially done (v0.20):** a small Transformer forecaster is
-  now benchmarked alongside the LSTM on all three datasets — see "More
-  model families" above. Honest answer: it's a mix, not purely one or the
-  other (the Transformer closes most of the gap on `synthetic` but still
-  under-covers on `airline` despite much better point accuracy there). The
-  N-BEATS-style block architecture is still untried.
+  scale.~~ **Done (v0.20 + v0.23):** a small Transformer forecaster (v0.20)
+  and a generic N-BEATS forecaster (v0.23) are both now benchmarked
+  alongside the LSTM on all three datasets — see "More model families"
+  above. Honest answer across all three architectures: it's a mix, not a
+  clean story either way — the Transformer closes most of the under-coverage
+  gap on `synthetic` but still under-covers on `airline` despite much better
+  point accuracy there, and N-BEATS (tried in good faith as the third
+  candidate) turns out to be the *worst* of the three on coverage in two of
+  three datasets, not an improvement. A natural follow-up this run did not
+  attempt: the paper's "interpretable" N-BEATS variant (hand-coded
+  trend/seasonality basis functions instead of the generic FC blocks used
+  here) might behave differently on the strongly-seasonal `airline` series.
 - Extend the window sweep's multi-seed check to `gamma` too (this run only
   tuned `window`, holding `gamma=0.05` fixed throughout — the two
   hyperparameters likely interact).

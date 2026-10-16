@@ -14,6 +14,12 @@ TransformerForecaster is a second, architecturally distinct from-scratch
 model (self-attention instead of recurrence) added to check whether the
 LSTM's small-data weaknesses (see README) are specific to that one
 architecture or a general property of neural approaches at this scale.
+(v0.23) NBEATSForecaster is a third, differently-structured from-scratch
+model -- a stack of fully-connected "basis expansion" blocks (Oreshkin et
+al. 2020, generic variant) with explicit backcast/forecast residual
+stacking -- neither recurrent nor attention-based, completing the planned
+three-way architecture comparison (see README's "More model families"
+section).
 """
 from __future__ import annotations
 
@@ -346,6 +352,170 @@ class TransformerForecaster:
             raise RuntimeError("TransformerForecaster.predict called before fit()")
         self.model.eval()
         X_t = torch.from_numpy(X).float().unsqueeze(-1)
+        with torch.no_grad():
+            pred = self.model(X_t)
+        return pred.numpy()
+
+
+class NBEATSBlock(nn.Module):
+    """One generic N-BEATS block: a small fully-connected stack produces a
+    hidden representation, which is linearly projected into two separate
+    "theta" vectors -- one expanded into a backcast (a reconstruction of
+    this block's own input window, length `lookback`), one expanded into a
+    forecast (length `horizon`). This is the "generic" basis variant from
+    Oreshkin et al. 2020 (no hand-coded trend/seasonality basis functions,
+    just learned linear projections), which is the simplest version that
+    still captures the paper's actual core idea: doubly-residual stacking
+    (each block only has to explain what the previous blocks' backcasts
+    failed to reconstruct) and a forecast that's a *sum* across blocks
+    rather than read off a single final hidden state the way LSTMModule
+    and TransformerModule both do.
+    """
+
+    def __init__(self, lookback: int, horizon: int, hidden_size: int, num_fc_layers: int = 2):
+        super().__init__()
+        layers: list[nn.Module] = []
+        in_features = lookback
+        for _ in range(num_fc_layers):
+            layers.append(nn.Linear(in_features, hidden_size))
+            layers.append(nn.ReLU())
+            in_features = hidden_size
+        self.fc_stack = nn.Sequential(*layers)
+        self.backcast_proj = nn.Linear(hidden_size, lookback)
+        self.forecast_proj = nn.Linear(hidden_size, horizon)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # x: (batch, lookback)
+        hidden = self.fc_stack(x)
+        backcast = self.backcast_proj(hidden)
+        forecast = self.forecast_proj(hidden)
+        return backcast, forecast
+
+
+class NBEATSModule(nn.Module):
+    def __init__(
+        self,
+        lookback: int,
+        horizon: int = 1,
+        num_blocks: int = 3,
+        hidden_size: int = 32,
+        num_fc_layers: int = 2,
+    ):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [
+                NBEATSBlock(lookback, horizon, hidden_size, num_fc_layers)
+                for _ in range(num_blocks)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, lookback) -- unlike LSTMModule/TransformerModule, N-BEATS'
+        # own blocks are plain FC stacks, so the input is the flat lookback
+        # window, not a (batch, lookback, 1) sequence.
+        residual = x
+        forecast_sum = None
+        for block in self.blocks:
+            backcast, forecast = block(residual)
+            residual = residual - backcast  # doubly-residual stacking
+            forecast_sum = forecast if forecast_sum is None else forecast_sum + forecast
+        return forecast_sum
+
+
+class NBEATSForecaster:
+    """A small from-scratch generic N-BEATS regressor, trained with Adam +
+    early stopping -- the same training discipline as LSTMForecaster and
+    TransformerForecaster (same optimizer, same loss, same early-stopping
+    rule), so a three-way benchmark comparison isolates architecture
+    (recurrent vs. attention vs. stacked-FC-with-residual-basis-expansion)
+    rather than also varying how each one is trained.
+
+    Unlike the other two models, N-BEATS blocks operate on the flat
+    lookback window directly (no per-timestep embedding/sequence
+    processing) -- `fit`/`predict` reshape accordingly.
+
+    Inputs/targets are expected to already be normalized by the caller
+    (see forecasting.data.Normalizer), exactly like LSTMForecaster and
+    TransformerForecaster.
+    """
+
+    def __init__(
+        self,
+        num_blocks: int = 3,
+        hidden_size: int = 32,
+        num_fc_layers: int = 2,
+        lr: float = 1e-2,
+        max_epochs: int = 200,
+        patience: int = 15,
+        seed: int = 0,
+    ):
+        self.num_blocks = num_blocks
+        self.hidden_size = hidden_size
+        self.num_fc_layers = num_fc_layers
+        self.lr = lr
+        self.max_epochs = max_epochs
+        self.patience = patience
+        self.seed = seed
+        self.model: NBEATSModule | None = None
+        self.train_losses: list[float] = []
+        self.val_losses: list[float] = []
+
+    def fit(self, X: np.ndarray, y: np.ndarray, val_frac: float = 0.15) -> "NBEATSForecaster":
+        torch.manual_seed(self.seed)
+        n, lookback = X.shape
+        horizon = y.shape[1]
+        n_val = max(1, int(n * val_frac))
+        n_train = n - n_val
+
+        X_t = torch.from_numpy(X).float()  # (n, lookback) -- flat, not a sequence
+        y_t = torch.from_numpy(y).float()  # (n, horizon)
+
+        X_train, y_train = X_t[:n_train], y_t[:n_train]
+        X_val, y_val = X_t[n_train:], y_t[n_train:]
+
+        self.model = NBEATSModule(
+            lookback, horizon, self.num_blocks, self.hidden_size, self.num_fc_layers
+        )
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        loss_fn = nn.MSELoss()
+
+        best_val = float("inf")
+        best_state = None
+        epochs_since_improvement = 0
+
+        for _epoch in range(self.max_epochs):
+            self.model.train()
+            optimizer.zero_grad()
+            pred = self.model(X_train)
+            loss = loss_fn(pred, y_train)
+            loss.backward()
+            optimizer.step()
+            self.train_losses.append(float(loss.item()))
+
+            self.model.eval()
+            with torch.no_grad():
+                val_pred = self.model(X_val)
+                val_loss = float(loss_fn(val_pred, y_val).item())
+            self.val_losses.append(val_loss)
+
+            if val_loss < best_val - 1e-6:
+                best_val = val_loss
+                best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+                epochs_since_improvement = 0
+            else:
+                epochs_since_improvement += 1
+                if epochs_since_improvement >= self.patience:
+                    break
+
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        if self.model is None:
+            raise RuntimeError("NBEATSForecaster.predict called before fit()")
+        self.model.eval()
+        X_t = torch.from_numpy(X).float()
         with torch.no_grad():
             pred = self.model(X_t)
         return pred.numpy()

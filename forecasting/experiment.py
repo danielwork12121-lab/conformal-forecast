@@ -23,6 +23,7 @@ from forecasting.models import (
     DeltaWrapper,
     LSTMForecaster,
     NaiveForecaster,
+    NBEATSForecaster,
     SeasonalNaiveForecaster,
     TransformerForecaster,
 )
@@ -160,6 +161,9 @@ def run_experiment(
         "LSTM (delta)": lambda: DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed)),
         "Transformer (delta)": lambda: DeltaWrapper(
             TransformerForecaster(d_model=32, nhead=4, num_layers=1, seed=seed)
+        ),
+        "N-BEATS (delta)": lambda: DeltaWrapper(
+            NBEATSForecaster(num_blocks=3, hidden_size=32, num_fc_layers=2, seed=seed)
         ),
     }
 

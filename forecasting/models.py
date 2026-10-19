@@ -519,3 +519,252 @@ class NBEATSForecaster:
         with torch.no_grad():
             pred = self.model(X_t)
         return pred.numpy()
+
+
+class NBEATSTrendBlock(nn.Module):
+    """One "interpretable" N-BEATS trend block (Oreshkin et al. 2020,
+    Appendix): instead of the generic block's learned linear projection
+    straight to a (lookback,)/(horizon,)-sized backcast/forecast, the FC
+    stack's hidden representation is projected to a small `theta` vector
+    (size `degree + 1`) which is then expanded through a *fixed*,
+    non-learned low-degree polynomial basis shared by every block in the
+    trend stack. This hard-codes the inductive bias that trend is smooth
+    and low-order, rather than letting the network learn an arbitrary
+    shape -- the actual difference between "interpretable" and "generic"
+    N-BEATS that the paper's ablation is about.
+    """
+
+    def __init__(self, lookback: int, horizon: int, hidden_size: int, num_fc_layers: int = 2, degree: int = 2):
+        super().__init__()
+        layers: list[nn.Module] = []
+        in_features = lookback
+        for _ in range(num_fc_layers):
+            layers.append(nn.Linear(in_features, hidden_size))
+            layers.append(nn.ReLU())
+            in_features = hidden_size
+        self.fc_stack = nn.Sequential(*layers)
+        self.theta_size = degree + 1
+        self.theta_proj = nn.Linear(hidden_size, self.theta_size)
+
+        # Fixed (non-learned) polynomial basis: t in [0, 1) raised to powers
+        # 0..degree, evaluated separately over the backcast window and the
+        # forecast horizon. Registered as buffers so they move with
+        # .to(device)/state_dict() like the rest of the module but are
+        # never updated by the optimizer.
+        t_back = torch.arange(lookback, dtype=torch.float32) / max(lookback, 1)
+        t_fore = torch.arange(horizon, dtype=torch.float32) / max(horizon, 1)
+        backcast_basis = torch.stack([t_back**p for p in range(self.theta_size)], dim=0)  # (theta_size, lookback)
+        forecast_basis = torch.stack([t_fore**p for p in range(self.theta_size)], dim=0)  # (theta_size, horizon)
+        self.register_buffer("backcast_basis", backcast_basis)
+        self.register_buffer("forecast_basis", forecast_basis)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden = self.fc_stack(x)
+        theta = self.theta_proj(hidden)  # (batch, theta_size)
+        backcast = theta @ self.backcast_basis  # (batch, lookback)
+        forecast = theta @ self.forecast_basis  # (batch, horizon)
+        return backcast, forecast
+
+
+class NBEATSSeasonalityBlock(nn.Module):
+    """One "interpretable" N-BEATS seasonality block: same fixed-basis idea
+    as `NBEATSTrendBlock`, but the basis is a truncated Fourier series
+    (paired sin/cos harmonics) instead of a polynomial -- the hard-coded
+    inductive bias that seasonality is periodic. `num_harmonics` defaults
+    to `horizon // 2` (the paper's own default, roughly the Nyquist limit
+    for a horizon-length cycle); a tiny `horizon` (e.g. 1, as used
+    elsewhere in this project) falls back to 1 harmonic since
+    `horizon // 2` would otherwise be 0.
+    """
+
+    def __init__(
+        self,
+        lookback: int,
+        horizon: int,
+        hidden_size: int,
+        num_fc_layers: int = 2,
+        num_harmonics: int | None = None,
+    ):
+        super().__init__()
+        layers: list[nn.Module] = []
+        in_features = lookback
+        for _ in range(num_fc_layers):
+            layers.append(nn.Linear(in_features, hidden_size))
+            layers.append(nn.ReLU())
+            in_features = hidden_size
+        self.fc_stack = nn.Sequential(*layers)
+
+        if num_harmonics is None:
+            num_harmonics = max(1, horizon // 2)
+        self.num_harmonics = num_harmonics
+        self.theta_size = 2 * num_harmonics  # one sin + one cos coefficient per harmonic
+        self.theta_proj = nn.Linear(hidden_size, self.theta_size)
+
+        t_back = torch.arange(lookback, dtype=torch.float32) / max(lookback, 1)
+        t_fore = torch.arange(horizon, dtype=torch.float32) / max(horizon, 1)
+        backcast_rows, forecast_rows = [], []
+        for h in range(1, num_harmonics + 1):
+            backcast_rows.append(torch.cos(2 * math.pi * h * t_back))
+            backcast_rows.append(torch.sin(2 * math.pi * h * t_back))
+            forecast_rows.append(torch.cos(2 * math.pi * h * t_fore))
+            forecast_rows.append(torch.sin(2 * math.pi * h * t_fore))
+        backcast_basis = torch.stack(backcast_rows, dim=0)  # (theta_size, lookback)
+        forecast_basis = torch.stack(forecast_rows, dim=0)  # (theta_size, horizon)
+        self.register_buffer("backcast_basis", backcast_basis)
+        self.register_buffer("forecast_basis", forecast_basis)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden = self.fc_stack(x)
+        theta = self.theta_proj(hidden)  # (batch, theta_size)
+        backcast = theta @ self.backcast_basis  # (batch, lookback)
+        forecast = theta @ self.forecast_basis  # (batch, horizon)
+        return backcast, forecast
+
+
+class NBEATSInterpretableModule(nn.Module):
+    """The "interpretable" N-BEATS architecture: a stack of
+    `num_trend_blocks` `NBEATSTrendBlock`s followed by `num_seasonality_blocks`
+    `NBEATSSeasonalityBlock`s, chained with the same doubly-residual
+    stacking as the generic variant (`NBEATSModule`) -- each block only has
+    to explain what the earlier blocks' backcasts failed to reconstruct.
+    Trend comes first, same order as the paper's own figure, so the
+    seasonality blocks see a (hopefully already detrended) residual.
+    """
+
+    def __init__(
+        self,
+        lookback: int,
+        horizon: int = 1,
+        num_trend_blocks: int = 2,
+        num_seasonality_blocks: int = 2,
+        hidden_size: int = 32,
+        num_fc_layers: int = 2,
+        trend_degree: int = 2,
+        num_harmonics: int | None = None,
+    ):
+        super().__init__()
+        trend_blocks = [
+            NBEATSTrendBlock(lookback, horizon, hidden_size, num_fc_layers, trend_degree)
+            for _ in range(num_trend_blocks)
+        ]
+        seasonality_blocks = [
+            NBEATSSeasonalityBlock(lookback, horizon, hidden_size, num_fc_layers, num_harmonics)
+            for _ in range(num_seasonality_blocks)
+        ]
+        self.blocks = nn.ModuleList(trend_blocks + seasonality_blocks)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        forecast_sum = None
+        for block in self.blocks:
+            backcast, forecast = block(residual)
+            residual = residual - backcast
+            forecast_sum = forecast if forecast_sum is None else forecast_sum + forecast
+        return forecast_sum
+
+
+class NBEATSInterpretableForecaster:
+    """The interpretable-basis counterpart to `NBEATSForecaster`, named
+    separately (not a flag on the same class) so both can sit side by side
+    in a benchmark's `model_factories` and be told apart in results/README
+    tables without a confusing shared name. Same `fit`/`predict` interface,
+    same training discipline (Adam, MSE loss, early stopping on the same
+    validation split) as every other neural model in this module, so a
+    comparison against `NBEATSForecaster` isolates the generic-vs-
+    interpretable basis choice rather than also varying how either is
+    trained.
+    """
+
+    def __init__(
+        self,
+        num_trend_blocks: int = 2,
+        num_seasonality_blocks: int = 2,
+        hidden_size: int = 32,
+        num_fc_layers: int = 2,
+        trend_degree: int = 2,
+        num_harmonics: int | None = None,
+        lr: float = 1e-2,
+        max_epochs: int = 200,
+        patience: int = 15,
+        seed: int = 0,
+    ):
+        self.num_trend_blocks = num_trend_blocks
+        self.num_seasonality_blocks = num_seasonality_blocks
+        self.hidden_size = hidden_size
+        self.num_fc_layers = num_fc_layers
+        self.trend_degree = trend_degree
+        self.num_harmonics = num_harmonics
+        self.lr = lr
+        self.max_epochs = max_epochs
+        self.patience = patience
+        self.seed = seed
+        self.model: NBEATSInterpretableModule | None = None
+        self.train_losses: list[float] = []
+        self.val_losses: list[float] = []
+
+    def fit(self, X: np.ndarray, y: np.ndarray, val_frac: float = 0.15) -> "NBEATSInterpretableForecaster":
+        torch.manual_seed(self.seed)
+        n, lookback = X.shape
+        horizon = y.shape[1]
+        n_val = max(1, int(n * val_frac))
+        n_train = n - n_val
+
+        X_t = torch.from_numpy(X).float()
+        y_t = torch.from_numpy(y).float()
+
+        X_train, y_train = X_t[:n_train], y_t[:n_train]
+        X_val, y_val = X_t[n_train:], y_t[n_train:]
+
+        self.model = NBEATSInterpretableModule(
+            lookback,
+            horizon,
+            self.num_trend_blocks,
+            self.num_seasonality_blocks,
+            self.hidden_size,
+            self.num_fc_layers,
+            self.trend_degree,
+            self.num_harmonics,
+        )
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        loss_fn = nn.MSELoss()
+
+        best_val = float("inf")
+        best_state = None
+        epochs_since_improvement = 0
+
+        for _epoch in range(self.max_epochs):
+            self.model.train()
+            optimizer.zero_grad()
+            pred = self.model(X_train)
+            loss = loss_fn(pred, y_train)
+            loss.backward()
+            optimizer.step()
+            self.train_losses.append(float(loss.item()))
+
+            self.model.eval()
+            with torch.no_grad():
+                val_pred = self.model(X_val)
+                val_loss = float(loss_fn(val_pred, y_val).item())
+            self.val_losses.append(val_loss)
+
+            if val_loss < best_val - 1e-6:
+                best_val = val_loss
+                best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+                epochs_since_improvement = 0
+            else:
+                epochs_since_improvement += 1
+                if epochs_since_improvement >= self.patience:
+                    break
+
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        if self.model is None:
+            raise RuntimeError("NBEATSInterpretableForecaster.predict called before fit()")
+        self.model.eval()
+        X_t = torch.from_numpy(X).float()
+        with torch.no_grad():
+            pred = self.model(X_t)
+        return pred.numpy()

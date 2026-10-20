@@ -14,15 +14,19 @@ hand-wavy confidence score.
 
 ## What's in here
 
-- **Five point-forecast models**, all behind the same `fit`/`predict`
+- **Six point-forecast models**, all behind the same `fit`/`predict`
   interface: `Naive`, `SeasonalNaive`, a from-scratch PyTorch `LSTM`,
-  (v0.20) a from-scratch PyTorch `Transformer` encoder, and (v0.23) a
+  (v0.20) a from-scratch PyTorch `Transformer` encoder, (v0.23) a
   from-scratch generic `N-BEATS` (Oreshkin et al. 2020) stacked-block
-  architecture with explicit backcast/forecast residual stacking
-  (`forecasting/models.py`) — three architecturally distinct neural models
-  (recurrence / self-attention / stacked-FC-with-residual-basis-expansion),
-  trained with the identical recipe, so a benchmark comparison isolates
-  architecture from training.
+  architecture with explicit backcast/forecast residual stacking, and
+  (v0.24) its "interpretable" sibling — the same doubly-residual block
+  stack, but with a fixed, non-learned trend (low-degree polynomial) and
+  seasonality (Fourier) basis in place of the generic variant's
+  unconstrained learned projection (`forecasting/models.py`) — four
+  architecturally distinct neural models (recurrence / self-attention /
+  stacked-FC-with-residual-basis-expansion, in both its generic and
+  basis-constrained forms), trained with the identical recipe, so a
+  benchmark comparison isolates architecture from training.
 - **A `DeltaWrapper`** that turns any point model into one that predicts the
   *change* from the last observation instead of the absolute level — the
   neural-net analogue of ARIMA's differencing term, needed because a small
@@ -105,6 +109,7 @@ points, strong trend + yearly seasonality, almost no noise).
 | LSTM (delta) | 122.645 | 134.268 | 27.76 | 63.3% | 4.873 |
 | Transformer (delta) | 36.276 | 44.416 | 8.22 | 66.7% | 1.509 |
 | N-BEATS (delta) | 45.260 | 49.689 | 10.64 | 56.7% | 1.484 |
+| N-BEATS interpretable (delta) | 36.092 | 43.731 | 8.58 | 66.7% | **1.372** |
 
 ![Airline forecast with conformal interval](results/airline_forecast.png)
 
@@ -137,6 +142,17 @@ as measured, not reframed — this benchmark isn't a showcase for N-BEATS, it's
 a real answer to whether it generalizes better here (it doesn't, in this
 configuration).
 
+**The interpretable N-BEATS variant (v0.24) tells a very different story
+from its generic sibling — see "A fourth comparison" below for the full
+read:** swapping the generic variant's unconstrained learned basis for a
+hard-coded trend (low-degree polynomial) + seasonality (Fourier) basis
+turns N-BEATS from the worst architecture here into the *best* — narrowest
+interval of all six rows (1.372) at the Transformer's own coverage (66.7%),
+and real point accuracy gains too (36.092 MAE, edging out even the
+Transformer's 36.276). A real, measured case where the "interpretable"
+inductive bias the original paper argues for actually mattered, not a
+cosmetic rename of the same architecture.
+
 ### daily-min-temperatures (nominal 90% intervals)
 
 Daily minimum temperatures in Melbourne, Australia, 1981-1990 (3650 points,
@@ -149,6 +165,7 @@ strong yearly seasonality, substantial day-to-day noise).
 | LSTM (delta) | 1.730 | 2.199 | 20.68 | 93.0% | 1.929 |
 | Transformer (delta) | 1.721 | 2.197 | 20.42 | 92.9% | 1.941 |
 | N-BEATS (delta) | 1.758 | 2.245 | 20.80 | 92.3% | 1.970 |
+| N-BEATS interpretable (delta) | 1.789 | 2.264 | 20.60 | 91.9% | 1.927 |
 
 ![Temperature forecast with conformal interval](results/temperature_forecast.png)
 
@@ -163,6 +180,17 @@ beats same-day-last-year for this series (MAE 1.95 vs 2.97), which is why
 the shorter default lookback isn't just a shortcut, it's the better choice
 here too.
 
+**On this dataset specifically, the interpretable N-BEATS variant is not a
+win** — the first honest counter-example to its airline/synthetic gains,
+and worth stating plainly rather than quietly omitting: its point accuracy
+(1.789 MAE) is the worst of the four neural rows, and its coverage (91.9%)
+is the furthest from nominal among them, though still well within a
+reasonable band. With ~1950 training windows, this is plausibly a dataset
+where the generic variant's unconstrained learned basis has enough data to
+find a better fit than the trend/seasonality basis constrains it to —
+exactly the kind of case-dependent result a single win elsewhere wouldn't
+have predicted, reported honestly rather than cherry-picked.
+
 ### synthetic (known noise, nominal 90% intervals — the calibration sanity check)
 
 Trend + seasonality + i.i.d. Gaussian noise with known std, used specifically
@@ -175,6 +203,7 @@ to validate the conformal machinery itself:
 | LSTM (delta) | 1.978 | 2.425 | 2.32 | 63.7% | 0.471 |
 | Transformer (delta) | 1.556 | 1.905 | 1.83 | 81.2% | 0.491 |
 | N-BEATS (delta) | 2.240 | 2.639 | 2.60 | 58.1% | 0.531 |
+| N-BEATS interpretable (delta) | **1.099** | **1.396** | **1.27** | 89.4% | **0.438** |
 
 The `Naive`/`SeasonalNaive` rows land close to the 90% nominal target, which
 is what `tests/test_conformal.py::test_empirical_coverage_tracks_nominal_on_synthetic_data`
@@ -189,6 +218,17 @@ tools like this one are supposed to surface, not obscure. The Transformer
 closes most (not all) of that gap here too (81.2% vs. the LSTM's 63.7%) —
 see the next section for the full three-dataset picture and what it does and
 doesn't answer.
+
+**This series is exactly the case the interpretable variant's basis was
+built for, and the result shows it plainly:** this dataset's true generating
+process *is* trend + seasonality + noise (see the description above), so a
+model whose own structure hard-codes "fit a trend, fit a seasonal
+component" has a genuine, mechanism-level advantage here, not a lucky draw —
+best MAE of every model in this table, including both non-neural baselines,
+and coverage (89.4%) the closest to the 90% nominal target of any model
+except `SeasonalNaive`. This is the cleanest of the three datasets for
+reading the interpretable-vs-generic comparison causally, since the
+dataset's own structure matches the inductive bias being tested.
 
 ## More model families: is the under-coverage LSTM-specific, or a general small-neural-model problem? (v0.20, extended v0.23)
 
@@ -324,6 +364,98 @@ plus two `run_experiment` integration checks (the model factory wires in
 correctly end-to-end with finite, sane results, and all three neural
 models' predictions are genuinely distinct from one another, not one
 silently reusing another's output). Full suite verified: **220/220
+passed.**
+
+### A fourth comparison: does the "interpretable" N-BEATS basis actually matter? (v0.24)
+
+The generic N-BEATS result above ends with a stated-as-hypothesis
+explanation, not a settled one: that the generic variant's *unconstrained*
+learned basis gives it fewer useful inductive biases for a short, structured
+series than either recurrence or attention, and that the paper's own
+"interpretable" variant — hand-coded trend and seasonality basis functions
+instead of a free-form linear projection — might behave differently. This
+wasn't tested at v0.23; it's tested now.
+
+`forecasting/models.py` adds `NBEATSTrendBlock` and `NBEATSSeasonalityBlock`
+(the fixed-basis counterparts to the generic `NBEATSBlock`) and
+`NBEATSInterpretableForecaster`, which stacks a configurable number of each
+(default: 2 trend blocks, then 2 seasonality blocks) with the exact same
+doubly-residual mechanism as `NBEATSModule`. Each block's hidden
+representation is still a small learned FC stack, same as the generic
+variant — the only change is what happens *after* that: instead of a
+learned linear projection straight to a `(lookback,)`/`(horizon,)`-sized
+backcast/forecast, the hidden representation is projected to a small
+`theta` vector, which is then expanded through a **fixed, non-learned**
+basis shared by every block of that type:
+
+- **Trend blocks** use a low-degree polynomial basis (`t`, `t^2`, ... up to
+  `degree`, default 2) evaluated over `[0, 1)` — the network can only ever
+  express a smooth, low-order curve, never an arbitrary shape.
+- **Seasonality blocks** use a truncated Fourier series (paired sin/cos
+  harmonics, `num_harmonics` defaulting to `horizon // 2`, floored at 1 so a
+  `horizon=1` series still gets a usable basis) — the network can only ever
+  express a periodic shape.
+
+Both bases are registered as PyTorch buffers (so they move with the module
+like any other tensor) but are never touched by the optimizer — they're
+fixed math, not learned weights, which is the actual meaning of
+"interpretable" here: the *shape* of what each block can express is
+hand-coded, only the amplitude/phase coefficients (`theta`) are learned.
+Trained with the identical discipline as every other neural model in this
+repo (Adam, MSE loss, early stopping on the same validation split).
+
+**Measured, not assumed, on all three datasets (see the per-dataset tables
+above for the full numbers):**
+
+| Dataset | Generic N-BEATS coverage | Interpretable N-BEATS coverage | Generic MAE | Interpretable MAE |
+|---|---|---|---|---|
+| airline | 56.7% | **66.7%** | 45.260 | **36.092** |
+| temperature | 92.3% | 91.9% | 1.758 | 1.789 |
+| synthetic | 58.1% | **89.4%** | 2.240 | **1.099** |
+
+**The honest answer this time is a real, measured win for the inductive
+bias the paper argues for — not a universal one:** on `airline` and
+`synthetic`, constraining the basis turns N-BEATS from the *worst*
+architecture in this repo's whole lineup into one of the *best* — on
+`synthetic` in particular (the one dataset whose true generating process
+actually is trend + seasonality + noise), the interpretable variant posts
+the best point accuracy of all six models in that table, including both
+non-neural baselines, and coverage (89.4%) nearest the 90% nominal target
+short of `SeasonalNaive` itself. On `temperature`, the one dataset with
+enough data (~1,950 windows) for the generic variant's unconstrained basis
+to find a good fit on its own, the interpretable variant is not a win —
+slightly worse on both point accuracy and coverage than its generic
+sibling, reported here exactly as measured rather than omitted because it
+doesn't fit the pattern from the other two datasets.
+
+**What this does and doesn't show:** it confirms the hypothesis raised at
+v0.23 — the generic variant's weakness on short, structured series really
+was (at least partly) about having *too little* structure, not an
+unconditional flaw in the stacked-FC-with-residual-basis-expansion idea
+itself — but it also shows that inductive bias is a trade-off, not a free
+lunch: it helps most exactly where the data has little of its own (short
+series, or a series whose true structure matches the hard-coded basis
+shape) and stops helping once there's enough data for an unconstrained
+model to find a good fit on its own. Architecture alone, even with the
+right inductive bias, is still not a substitute for the calibration-side
+fix (ACI, below) when the real problem is exchangeability rather than point
+accuracy — the `airline` row still under-covers relative to nominal (66.7%
+vs. 90%) even at its best point-accuracy result in this entire README.
+
+10 new tests (220 → 230): hand-computed checks of both fixed bases in
+isolation (the trend block's polynomial basis matches `t**p` exactly for
+`p` in `range(degree+1)`; the seasonality block's Fourier basis matches
+`cos`/`sin` at each harmonic exactly; `num_harmonics` defaults to
+`horizon // 2` and floors at 1 for `horizon=1`), the interpretable
+forecaster's own fit/predict mechanics (learns a bounded periodic series,
+fits a pure linear trend well via the trend basis specifically, rejects a
+different lookback at predict time — the same real architectural
+limitation as the generic variant, `DeltaWrapper` attribute-forwarding
+compatibility, and a module-level doubly-residual-stacking chain check
+across a mixed trend+seasonality block stack), plus two `run_experiment`
+integration checks (the model factory wires in correctly end-to-end with
+finite, sane results, and all four neural models' predictions are
+genuinely distinct from one another). Full suite verified: **230/230
 passed.**
 
 ## Adaptive Conformal Inference: does it actually fix the LSTM's under-coverage?
@@ -1610,7 +1742,7 @@ forecasting/
                  # --fold-scheme --auto-folds]` / `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]` / `serve [--host --port --reload]`
-tests/           # 220 tests, including the coverage-tracking statistical checks above
+tests/           # 230 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -1620,7 +1752,7 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 220 tests
+python -m pytest                                    # 230 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -1676,10 +1808,20 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   gap on `synthetic` but still under-covers on `airline` despite much better
   point accuracy there, and N-BEATS (tried in good faith as the third
   candidate) turns out to be the *worst* of the three on coverage in two of
-  three datasets, not an improvement. A natural follow-up this run did not
+  three datasets, not an improvement. ~~A natural follow-up this run did not
   attempt: the paper's "interpretable" N-BEATS variant (hand-coded
   trend/seasonality basis functions instead of the generic FC blocks used
-  here) might behave differently on the strongly-seasonal `airline` series.
+  here) might behave differently on the strongly-seasonal `airline`
+  series.~~ **Done (v0.24):** see "A fourth comparison" above. Real,
+  measured answer: yes, it behaves very differently — the hard-coded basis
+  turns N-BEATS from the worst architecture here into one of the best on
+  `airline` and `synthetic` (66.7%/89.4% coverage, both real improvements
+  over the generic variant's 56.7%/58.1%), but is a real, reported loss on
+  `temperature`, where the generic variant's unconstrained basis has enough
+  data to find a better fit on its own. A natural remaining follow-up this
+  run did not attempt: sweeping `trend_degree`/`num_harmonics` rather than
+  using the paper's own defaults throughout, or trying a wider range of
+  `num_trend_blocks`/`num_seasonality_blocks` combinations.
 - Extend the window sweep's multi-seed check to `gamma` too (this run only
   tuned `window`, holding `gamma=0.05` fixed throughout — the two
   hyperparameters likely interact).

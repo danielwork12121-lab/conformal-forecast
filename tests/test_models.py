@@ -6,6 +6,7 @@ from forecasting.models import (
     LSTMForecaster,
     NaiveForecaster,
     NBEATSForecaster,
+    NBEATSInterpretableForecaster,
     SeasonalNaiveForecaster,
     TransformerForecaster,
 )
@@ -290,3 +291,160 @@ def test_nbeats_doubly_residual_stacking_reduces_backcast_error_across_blocks():
     # fixed input (which would make "stacking" cosmetic).
     assert residual_norms[1] != residual_norms[0]
     assert residual_norms[2] != residual_norms[1]
+
+
+def test_trend_block_basis_is_a_fixed_low_degree_polynomial():
+    # Hand-computed check of the fixed (non-learned) basis itself, isolated
+    # from the learned theta projection: a degree=2 trend block's backcast
+    # basis must be exactly [1, t, t^2] evaluated at lookback evenly-spaced
+    # points in [0, 1), and the forecast basis the same shape over the
+    # horizon -- this is what makes it "interpretable" (a hard-coded
+    # low-order polynomial shape), not a claim about what the network
+    # learns to put in theta.
+    from forecasting.models import NBEATSTrendBlock
+
+    block = NBEATSTrendBlock(lookback=4, horizon=2, hidden_size=8, num_fc_layers=1, degree=2)
+    assert block.theta_size == 3  # degree + 1
+
+    t_back = np.arange(4) / 4.0
+    expected_backcast_basis = np.stack([t_back**p for p in range(3)], axis=0)
+    np.testing.assert_allclose(block.backcast_basis.detach().numpy(), expected_backcast_basis, atol=1e-6)
+
+    t_fore = np.arange(2) / 2.0
+    expected_forecast_basis = np.stack([t_fore**p for p in range(3)], axis=0)
+    np.testing.assert_allclose(block.forecast_basis.detach().numpy(), expected_forecast_basis, atol=1e-6)
+
+
+def test_seasonality_block_basis_is_a_fixed_fourier_series():
+    # Same idea as the trend-block basis test, for the seasonality block's
+    # paired sin/cos harmonics -- hand-computed against the actual Fourier
+    # formula, not just "it runs."
+    from forecasting.models import NBEATSSeasonalityBlock
+
+    block = NBEATSSeasonalityBlock(lookback=8, horizon=4, hidden_size=8, num_fc_layers=1, num_harmonics=2)
+    assert block.theta_size == 4  # 2 harmonics * (cos, sin)
+
+    t_fore = np.arange(4) / 4.0
+    expected_forecast_basis = np.stack(
+        [
+            np.cos(2 * np.pi * 1 * t_fore),
+            np.sin(2 * np.pi * 1 * t_fore),
+            np.cos(2 * np.pi * 2 * t_fore),
+            np.sin(2 * np.pi * 2 * t_fore),
+        ],
+        axis=0,
+    )
+    np.testing.assert_allclose(block.forecast_basis.detach().numpy(), expected_forecast_basis, atol=1e-6)
+
+
+def test_seasonality_block_num_harmonics_defaults_to_half_horizon_and_floors_at_one():
+    from forecasting.models import NBEATSSeasonalityBlock
+
+    assert NBEATSSeasonalityBlock(lookback=10, horizon=12, hidden_size=8).num_harmonics == 6
+    # horizon=1 elsewhere in this project (horizon // 2 == 0) must not produce
+    # a zero-width (unusable) basis.
+    assert NBEATSSeasonalityBlock(lookback=10, horizon=1, hidden_size=8).num_harmonics == 1
+
+
+def test_nbeats_interpretable_forecaster_learns_a_bounded_periodic_series():
+    # Same periodic-series check as NBEATSForecaster's own version -- the
+    # interpretable variant's seasonality blocks should be at least as able
+    # to fit a clean sine wave as the generic variant's learned basis.
+    t = np.arange(400, dtype=np.float64)
+    series = (np.sin(t * 0.3) * 5.0).astype(np.float32)
+    X, y = make_windows(series, lookback=8, horizon=1)
+    X_train, y_train = X[:300], y[:300]
+    X_test, y_test = X[300:], y[300:]
+
+    model = NBEATSInterpretableForecaster(
+        num_trend_blocks=2, num_seasonality_blocks=2, hidden_size=16, max_epochs=300, patience=30, seed=0
+    )
+    model.fit(X_train, y_train)
+    assert model.train_losses[-1] < model.train_losses[0]
+
+    pred = model.predict(X_test)
+    mae = float(np.mean(np.abs(pred - y_test)))
+    # Same loose tolerance as every other model's version of this test --
+    # a naive last-value baseline gets roughly 1.6-2.0 here.
+    assert mae < 1.5
+
+
+def test_nbeats_interpretable_forecaster_fits_a_pure_linear_trend_well():
+    # A case the trend basis is specifically built for: a pure linear trend
+    # should be very easy for a degree>=1 polynomial basis to represent,
+    # directly through theta -- not something that requires many epochs or
+    # a lucky learned shape the way the generic block's unconstrained
+    # linear projection would need to discover on its own.
+    series = np.arange(200, dtype=np.float64).astype(np.float32)  # y = x
+    X, y = make_windows(series, lookback=5, horizon=1)
+    X_train, y_train = X[:150], y[:150]
+    X_test, y_test = X[150:], y[150:]
+
+    model = NBEATSInterpretableForecaster(
+        num_trend_blocks=2, num_seasonality_blocks=1, hidden_size=16, trend_degree=1, max_epochs=300, patience=30, seed=0
+    )
+    model.fit(X_train, y_train)
+    pred = model.predict(X_test)
+    mae = float(np.mean(np.abs(pred - y_test)))
+    assert mae < 1.5
+
+
+def test_nbeats_interpretable_forecaster_rejects_a_different_lookback_at_predict_time():
+    # Same real, honest architectural limitation as the generic variant
+    # (both operate on the flat lookback window via FC layers sized at
+    # construction time) -- documented the same way, not papered over.
+    rng = np.random.RandomState(0)
+    X_train = rng.randn(40, 6).astype(np.float32)
+    y_train = rng.randn(40, 1).astype(np.float32)
+    model = NBEATSInterpretableForecaster(
+        num_trend_blocks=1, num_seasonality_blocks=1, hidden_size=8, max_epochs=5, patience=5, seed=0
+    )
+    model.fit(X_train, y_train)
+
+    X_different_lookback = rng.randn(5, 10).astype(np.float32)
+    try:
+        model.predict(X_different_lookback)
+    except RuntimeError as e:
+        assert "size mismatch" in str(e) or "shapes cannot be multiplied" in str(e)
+    else:
+        raise AssertionError(
+            "expected a shape error -- the interpretable variant's FC blocks are "
+            "sized to the lookback they were fit on, same as the generic variant"
+        )
+
+
+def test_delta_wrapper_forwards_attributes_to_nbeats_interpretable_base_model():
+    wrapper = DeltaWrapper(
+        NBEATSInterpretableForecaster(num_trend_blocks=1, num_seasonality_blocks=1, hidden_size=8, max_epochs=5, patience=5)
+    )
+    X = np.random.RandomState(0).randn(20, 4).astype(np.float32)
+    y = np.random.RandomState(1).randn(20, 1).astype(np.float32)
+    wrapper.fit(X, y)
+    assert len(wrapper.train_losses) > 0  # forwarded via __getattr__
+
+
+def test_nbeats_interpretable_doubly_residual_stacking_chains_blocks():
+    # Same mechanic check as the generic variant's own version of this test:
+    # trend and seasonality blocks alike must actually change the residual
+    # each sees, confirming the stack (not just one block) is doing the work.
+    from forecasting.models import NBEATSInterpretableModule
+
+    import torch
+
+    torch.manual_seed(0)
+    module = NBEATSInterpretableModule(
+        lookback=10, horizon=1, num_trend_blocks=2, num_seasonality_blocks=2, hidden_size=16
+    )
+    assert len(module.blocks) == 4
+    x = torch.randn(4, 10)
+
+    with torch.no_grad():
+        residual = x
+        residual_norms = [float(residual.norm())]
+        for block in module.blocks:
+            backcast, _ = block(residual)
+            residual = residual - backcast
+            residual_norms.append(float(residual.norm()))
+
+    for i in range(1, len(residual_norms)):
+        assert residual_norms[i] != residual_norms[i - 1]

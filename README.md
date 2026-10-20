@@ -535,6 +535,85 @@ really gets its own independent fit, not one fit relabeled); and the
 formatted table includes every swept degree, the generic reference line,
 and the shipped-default marker. Full suite verified: **234/234 passed.**
 
+### Does the shipped seasonality basis size matter? The `num_harmonics` half of the same question (v0.26)
+
+v0.25's own sweep above left one explicit thing open: "The `num_harmonics`
+half of v0.24's original 'What's next' item is also still open." This
+closes it — `run_num_harmonics_sweep_comparison` (`forecasting/experiment.py`)
+and a new `python -m forecasting.cli num-harmonics-sweep` command sweep
+`num_harmonics` (the seasonality block's own basis-size hyperparameter)
+across `[1, 2, 3, 4, 5]` on each dataset, holding `trend_degree` at its
+shipped default (2) throughout — same "one real question per increment"
+discipline as the `trend_degree` sweep itself, and the same reasoning for
+why each point needs its own full, independent fit: `num_harmonics`
+changes `NBEATSSeasonalityBlock`'s own `theta_size` and its registered
+Fourier `backcast_basis`/`forecast_basis` buffers, an architecture change,
+not a read-time setting.
+
+The shipped default here is **`num_harmonics=1`**, not a round number
+picked for the sweep: `NBEATSSeasonalityBlock`'s own fallback rule is
+`max(1, horizon // 2)`, and this project's horizon is 1 everywhere
+(one-step-ahead forecasting throughout), so `1 // 2 == 0` floors to `1`.
+The sweep code computes this from the actual horizon rather than
+hard-coding it, so it stays correct if that ever changes.
+
+**Measured, not assumed, directly against each dataset's real held-out
+test set** (the shipped default, `num_harmonics=1`, marked):
+
+![airline N-BEATS num_harmonics sweep](results/airline_num_harmonics_sweep.png)
+![synthetic N-BEATS num_harmonics sweep](results/synthetic_num_harmonics_sweep.png)
+![temperature N-BEATS num_harmonics sweep](results/temperature_num_harmonics_sweep.png)
+
+| Dataset | harmonics=1 (shipped) | harmonics=2 | harmonics=3 | harmonics=4 | harmonics=5 |
+|---|---|---|---|---|---|
+| airline (coverage / MAE) | 66.7% / 36.092 | **76.7%** / **22.942** | 66.7% / 48.927 | 70.0% / 31.354 | 73.3% / 43.421 |
+| synthetic (coverage / MAE) | **89.4%** / 1.099 | 88.1% / **1.017** | 85.0% / 1.104 | 70.0% / 1.937 | 84.4% / 1.148 |
+| temperature (coverage / MAE) | 91.9% / 1.789 | 92.6% / **1.753** | **92.7%** / 1.760 | 92.2% / 1.782 | 91.1% / 1.784 |
+
+**The same genuinely dataset-dependent story as the `trend_degree` sweep,
+for a different hyperparameter of the same model:**
+
+- On `airline`, the shipped default (`num_harmonics=1`) is again one of
+  the *worse* points — `num_harmonics=2` closes the coverage gap from
+  -23.3pp to -13.3pp (the best coverage this architecture has posted on
+  `airline` anywhere in this README) while also cutting MAE by more than
+  a third (36.092 → 22.942). A richer seasonality basis genuinely helps
+  here, the same direction the `trend_degree` sweep found for this
+  dataset, though via the seasonality block rather than the trend block.
+- On `synthetic`, the shipped default is close to the best point again —
+  `num_harmonics=1` has the best coverage (89.4%) and `num_harmonics=2`
+  the best MAE (1.017, barely ahead of 1's 1.099) — both near the top of
+  the sweep; `num_harmonics=4` is a clear outlier in the other direction
+  (70.0% coverage, 1.937 MAE), the same overfitting pattern high
+  `trend_degree` values showed on this dataset.
+- On `temperature`, every value again lands within about 1pp of every
+  other and MAE barely moves (1.753–1.789) — consistent with the
+  `trend_degree` sweep's own finding that whatever costs this variant
+  accuracy on `temperature` isn't fixed by retuning either basis
+  hyperparameter in isolation.
+
+**What this does and doesn't mean:** same diagnostic-sweep framing as the
+`trend_degree` section above — this answers "how sensitive is this result
+to `num_harmonics`," not "what should the default be," and the shipped
+default is unchanged. With both halves of v0.24's original "What's next"
+item now measured, the honest combined picture is: on `airline`, *either*
+a higher `trend_degree` *or* a higher `num_harmonics` improves on the
+shipped combination (2, 1) individually, but this project has not swept
+the two hyperparameters jointly (a 5×5 grid, 25 independent fits per
+dataset) to check whether their individual gains stack, cancel, or
+interact — a real, explicitly open follow-up, not attempted here.
+
+4 new tests (234 → 238): the sweep runs every requested value and reports
+a sane `generic` N-BEATS reference line; `num_harmonics=1` inside the
+sweep produces numerically identical coverage/width/MAE to
+`run_experiment`'s own "N-BEATS interpretable (delta)" row for the same
+seed (the same direct same-model check the `trend_degree` sweep's tests
+already apply); `num_harmonics=1` and `num_harmonics=5` produce genuinely
+different MAE on the same data/seed (the same independent-fit regression
+guard); and the formatted table includes every swept value, the generic
+reference line, and the shipped-default marker — computed from the
+actual horizon, not hard-coded. Full suite verified: **238/238 passed.**
+
 ## Adaptive Conformal Inference: does it actually fix the LSTM's under-coverage?
 
 The three LSTM rows above all share a cause: the model's own error grows
@@ -1796,6 +1875,10 @@ forecasting/
                  # NBEATSInterpretableForecaster's trend_degree, a full
                  # independent fit per value since it changes the model's
                  # own architecture, not just how a fit is read) --
+                 # run_num_harmonics_sweep_comparison (v0.26: the same idea
+                 # for num_harmonics, the seasonality block's own basis-size
+                 # hyperparameter, holding trend_degree at its shipped
+                 # default throughout) --
                  # _prepare_split_from_series (v0.13): the shared split/
                  # window/normalize/validate core, extracted from
                  # _prepare_split so the API's user-supplied-series path
@@ -1823,8 +1906,9 @@ forecasting/
                  # --fold-scheme --auto-folds]` / `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]` / `nbeats-basis-sweep [--trend-degrees]`
-                 # (v0.25) / `serve [--host --port --reload]`
-tests/           # 234 tests, including the coverage-tracking statistical checks above
+                 # (v0.25) / `num-harmonics-sweep [--num-harmonics-values]`
+                 # (v0.26) / `serve [--host --port --reload]`
+tests/           # 238 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -1834,7 +1918,7 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 230 tests
+python -m pytest                                    # 238 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -1908,11 +1992,22 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   of the *worse* points on `airline`'s own sweep (degree=5 cuts the
   coverage gap roughly in half) but is clearly the *best* point on
   `synthetic`'s sweep, and `temperature` barely moves with degree at all —
-  not a clean story, reported as measured. The `num_harmonics` half, and
-  trying a wider range of `num_trend_blocks`/`num_seasonality_blocks`
-  combinations, remain open. A more principled next step than reading an
-  answer off the test set directly would be a held-out-data selection
-  method for `trend_degree` (mirroring `cv-window-select` for ACI's
+  not a clean story, reported as measured. ~~The `num_harmonics` half~~
+  **Done (v0.26):** see "Does the shipped seasonality basis size matter?"
+  above. The same genuinely dataset-dependent pattern, this time for
+  `num_harmonics`: the shipped default (`num_harmonics=1`) is again one of
+  the *worse* points on `airline` (`num_harmonics=2` cuts the coverage gap
+  from -23.3pp to -13.3pp and improves MAE by over a third), close to the
+  best point on `synthetic` (89.4% coverage, nearly tied on MAE with
+  `num_harmonics=2`), and `temperature` again barely moves. With both
+  halves now measured, whether a higher `trend_degree` and a higher
+  `num_harmonics` *together* stack, cancel, or interact on `airline` (a
+  joint 5×5 grid, not swept independently by either run) is a real,
+  explicitly open follow-up. Trying a wider range of
+  `num_trend_blocks`/`num_seasonality_blocks` combinations also remains
+  open. A more principled next step than reading an answer off the test
+  set directly would be a held-out-data selection method for
+  `trend_degree`/`num_harmonics` (mirroring `cv-window-select` for ACI's
   `window`) — not attempted here.
 - Extend the window sweep's multi-seed check to `gamma` too (this run only
   tuned `window`, holding `gamma=0.05` fixed throughout — the two

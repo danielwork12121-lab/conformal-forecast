@@ -458,6 +458,83 @@ finite, sane results, and all four neural models' predictions are
 genuinely distinct from one another). Full suite verified: **230/230
 passed.**
 
+### Does the shipped trend-basis degree matter? A real sweep, not a guess (v0.25)
+
+v0.24's own "What's next" named a follow-up it didn't attempt: "sweeping
+`trend_degree`/`num_harmonics` rather than using the paper's own defaults
+throughout." This answers the `trend_degree` half of that question —
+holding `num_seasonality_blocks`' `num_harmonics` at its default
+throughout, same "one real question per increment" discipline as every
+other sweep in this project.
+
+`run_nbeats_basis_sweep_comparison` (`forecasting/experiment.py`) and a new
+`python -m forecasting.cli nbeats-basis-sweep` command sweep
+`trend_degree` across `[1, 2, 3, 4, 5]` on each dataset, training a fully
+independent model per value (unlike the EnbPI/ACI window sweeps elsewhere
+in this README, `trend_degree` changes the trend block's own basis and
+`theta_proj` output size — it's an architecture change, not a
+read-time setting, so there's no single fit to reuse here; each point is
+its own full, independent fit, same Adam/MSE/early-stopping discipline as
+every other neural model).
+
+**Measured, not assumed, directly against each dataset's real held-out
+test set** (the shipped default, `trend_degree=2`, marked):
+
+![airline N-BEATS basis sweep](results/airline_nbeats_basis_sweep.png)
+![synthetic N-BEATS basis sweep](results/synthetic_nbeats_basis_sweep.png)
+![temperature N-BEATS basis sweep](results/temperature_nbeats_basis_sweep.png)
+
+| Dataset | degree=1 | degree=2 (shipped) | degree=3 | degree=4 | degree=5 |
+|---|---|---|---|---|---|
+| airline (coverage / MAE) | 70.0% / 21.666 | 66.7% / 36.092 | 76.7% / 25.555 | 76.7% / 27.122 | **83.3%** / 23.930 |
+| synthetic (coverage / MAE) | 73.8% / 1.921 | **89.4%** / **1.099** | 81.9% / 1.276 | 63.1% / 2.709 | 65.0% / 1.987 |
+| temperature (coverage / MAE) | 92.5% / 1.757 | 91.9% / 1.789 | 92.5% / **1.748** | 92.2% / 1.764 | 91.6% / 1.785 |
+
+**The honest answer is genuinely dataset-dependent, and in one case the
+shipped default is not the best point on its own sweep:**
+
+- On `airline`, the shipped default (degree=2) is actually one of the
+  *worse* points in this sweep — degree=5 closes the coverage gap from
+  -23.3pp to -6.7pp, the best result this architecture has posted on
+  `airline` anywhere in this README, while also improving MAE. A
+  low-degree polynomial really does look too restrictive for `airline`'s
+  real trend shape, consistent with the hypothesis v0.24 raised.
+- On `synthetic`, the opposite: degree=2 is clearly the best point in the
+  entire sweep, both on coverage (nearest nominal, -0.6pp) and MAE (best of
+  any value tried). Degrees 4 and 5 actively hurt — more flexibility here
+  overfits a series whose real trend genuinely is low-order, rather than
+  helping.
+- On `temperature`, every degree lands within about 1pp of every other —
+  this dataset's real loss at v0.24 is not explained by `trend_degree`
+  specifically; whatever is costing the interpretable variant ~0.03 MAE
+  here relative to the generic variant isn't fixed by retuning this one
+  hyperparameter.
+
+**What this does and doesn't mean:** this is a diagnostic sweep directly
+against each dataset's real test set, in the same spirit as
+`window-sweep`/`enbpi-window-sweep` elsewhere in this README — it answers
+"how sensitive is this result to `trend_degree`," not "what should the
+default be." Picking a different default *because* it won on this same
+test set would be exactly the kind of test-set-driven tuning this
+project's own window-selection sections (CV-based selection, not sweep
+results) exist to avoid; the shipped default (`trend_degree=2`) is
+unchanged. A natural, more principled follow-up would be a held-out-data
+selection method for `trend_degree` (mirroring `cv-window-select`'s
+approach for ACI's `window`) rather than reading an answer off the test
+set directly — not attempted here. The `num_harmonics` half of v0.24's
+original "What's next" item is also still open.
+
+4 new tests (230 → 234): the sweep runs every requested degree and reports
+a sane `generic` N-BEATS reference line; `trend_degree=2` inside the
+sweep produces numerically identical coverage/width/MAE to
+`run_experiment`'s own "N-BEATS interpretable (delta)" row for the same
+seed (a direct check that the sweep's degree=2 point is the same model,
+not a separately-configured one); degree=1 and degree=5 produce genuinely
+different MAE on the same data/seed (a regression guard that each point
+really gets its own independent fit, not one fit relabeled); and the
+formatted table includes every swept degree, the generic reference line,
+and the shipped-default marker. Full suite verified: **234/234 passed.**
+
 ## Adaptive Conformal Inference: does it actually fix the LSTM's under-coverage?
 
 The three LSTM rows above all share a cause: the model's own error grows
@@ -1715,6 +1792,10 @@ forecasting/
                  # run_enbpi_cv_window_selection (v0.22: the held-out-data
                  # analogue of run_cv_window_selection, for EnbPI's own
                  # residual pool) --
+                 # run_nbeats_basis_sweep_comparison (v0.25: sweeps
+                 # NBEATSInterpretableForecaster's trend_degree, a full
+                 # independent fit per value since it changes the model's
+                 # own architecture, not just how a fit is read) --
                  # _prepare_split_from_series (v0.13): the shared split/
                  # window/normalize/validate core, extracted from
                  # _prepare_split so the API's user-supplied-series path
@@ -1741,8 +1822,9 @@ forecasting/
                  # `enbpi-window-sweep [...]` / `enbpi-cv-window-select [...
                  # --fold-scheme --auto-folds]` / `window-sweep [...]` /
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
-                 # --auto-folds]` / `serve [--host --port --reload]`
-tests/           # 230 tests, including the coverage-tracking statistical checks above
+                 # --auto-folds]` / `nbeats-basis-sweep [--trend-degrees]`
+                 # (v0.25) / `serve [--host --port --reload]`
+tests/           # 234 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -1818,10 +1900,20 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   `airline` and `synthetic` (66.7%/89.4% coverage, both real improvements
   over the generic variant's 56.7%/58.1%), but is a real, reported loss on
   `temperature`, where the generic variant's unconstrained basis has enough
-  data to find a better fit on its own. A natural remaining follow-up this
-  run did not attempt: sweeping `trend_degree`/`num_harmonics` rather than
-  using the paper's own defaults throughout, or trying a wider range of
-  `num_trend_blocks`/`num_seasonality_blocks` combinations.
+  data to find a better fit on its own. ~~A natural remaining follow-up:
+  sweeping `trend_degree`/`num_harmonics` rather than using the paper's
+  own defaults throughout~~ **Done, the `trend_degree` half (v0.25):** see
+  "Does the shipped trend-basis degree matter?" above. Real, genuinely
+  dataset-dependent answer: the shipped default (degree=2) is actually one
+  of the *worse* points on `airline`'s own sweep (degree=5 cuts the
+  coverage gap roughly in half) but is clearly the *best* point on
+  `synthetic`'s sweep, and `temperature` barely moves with degree at all —
+  not a clean story, reported as measured. The `num_harmonics` half, and
+  trying a wider range of `num_trend_blocks`/`num_seasonality_blocks`
+  combinations, remain open. A more principled next step than reading an
+  answer off the test set directly would be a held-out-data selection
+  method for `trend_degree` (mirroring `cv-window-select` for ACI's
+  `window`) — not attempted here.
 - Extend the window sweep's multi-seed check to `gamma` too (this run only
   tuned `window`, holding `gamma=0.05` fixed throughout — the two
   hyperparameters likely interact).

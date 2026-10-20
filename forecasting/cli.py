@@ -95,6 +95,14 @@ check, the real test-set gap for every candidate is reported too:
 
     python -m forecasting.cli enbpi-cv-window-select --dataset airline --candidates 5,10,15,20,30,50,unbounded --plot results/airline_enbpi_cv_window_select.png
 
+Sweep the interpretable N-BEATS variant's `num_harmonics` (its seasonality
+basis's own hyperparameter), holding `trend_degree` at its shipped default
+(2) throughout -- the direct follow-up to the `trend_degree` sweep (v0.25)
+`run_nbeats_basis_sweep_comparison`'s own docstring named but did not
+attempt (see `forecasting/experiment.py`'s `run_num_harmonics_sweep_comparison`):
+
+    python -m forecasting.cli num-harmonics-sweep --dataset airline --num-harmonics-values 1,2,3,4,5 --plot results/airline_num_harmonics_sweep.png
+
 Serve the calibrated forecasts over a minimal REST API (see
 `forecasting/api.py` and the README's "Serving it as an API" section --
 demo-quality, not production: the LSTM refits per request):
@@ -113,6 +121,7 @@ from forecasting.experiment import (
     format_enbpi_cv_window_selection,
     format_enbpi_window_sweep_comparison,
     format_nbeats_basis_sweep_comparison,
+    format_num_harmonics_sweep_comparison,
     format_results_table,
     format_sliding_window_comparison,
     format_window_sweep_comparison,
@@ -124,6 +133,7 @@ from forecasting.experiment import (
     run_enbpi_window_sweep_comparison,
     run_experiment,
     run_nbeats_basis_sweep_comparison,
+    run_num_harmonics_sweep_comparison,
     run_sliding_window_comparison,
     run_window_sweep_comparison,
 )
@@ -360,6 +370,45 @@ def _plot_nbeats_basis_sweep(dataset: str, comparison, path: str) -> None:
     plt.close(fig)
 
 
+def _plot_num_harmonics_sweep(dataset: str, comparison, path: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    harmonics = [r.num_harmonics for r in comparison.results]
+    gaps = [r.interpretable["coverage_gap"] * 100 for r in comparison.results]
+    x = range(len(harmonics))
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(x, gaps, color="#1f77b4", linewidth=1.5, marker="o", label="interpretable N-BEATS")
+    ax.axhline(
+        comparison.generic["coverage_gap"] * 100,
+        color="#888888",
+        linewidth=1.0,
+        linestyle=":",
+        label="generic N-BEATS (reference)",
+    )
+    ax.axhline(0.0, color="#222222", linewidth=0.8)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels([str(h) for h in harmonics])
+    if comparison.shipped_default in harmonics:
+        ax.axvline(
+            harmonics.index(comparison.shipped_default),
+            color="#9467bd",
+            linewidth=0.8,
+            linestyle="--",
+            label=f"shipped default (num_harmonics={comparison.shipped_default})",
+        )
+    ax.set_xlabel("num_harmonics")
+    ax.set_ylabel("coverage gap (pp, closer to 0 is better)")
+    ax.set_title(f"{dataset}: interpretable N-BEATS coverage gap by num_harmonics")
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
 def _plot_auto_window_selection(dataset: str, result, path: str) -> None:
     import matplotlib
 
@@ -578,6 +627,21 @@ def main() -> None:
     nbeats_sweep.add_argument("--plot", type=str, default=None, help="save a plot of coverage gap vs. trend_degree")
     nbeats_sweep.add_argument("--seed", type=int, default=0)
 
+    harmonics_sweep = sub.add_parser(
+        "num-harmonics-sweep",
+        help="sweep the interpretable N-BEATS seasonality basis's num_harmonics and compare coverage/MAE across values",
+    )
+    harmonics_sweep.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    harmonics_sweep.add_argument("--alpha", type=float, default=0.1)
+    harmonics_sweep.add_argument(
+        "--num-harmonics-values",
+        type=str,
+        default="1,2,3,4,5",
+        help="comma-separated list of num_harmonics values to try (trend_degree stays at its shipped default, 2, throughout)",
+    )
+    harmonics_sweep.add_argument("--plot", type=str, default=None, help="save a plot of coverage gap vs. num_harmonics")
+    harmonics_sweep.add_argument("--seed", type=int, default=0)
+
     auto = sub.add_parser(
         "auto-window",
         help="automatically select the sliding-pool ACI's window size from a held-out calibration slice",
@@ -752,6 +816,16 @@ def main() -> None:
         print()
         if args.plot:
             _plot_nbeats_basis_sweep(args.dataset, comparison, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "num-harmonics-sweep":
+        num_harmonics_values = [int(h) for h in args.num_harmonics_values.split(",")]
+        comparison = run_num_harmonics_sweep_comparison(
+            args.dataset, num_harmonics_values=num_harmonics_values, alpha=args.alpha, seed=args.seed
+        )
+        print(format_num_harmonics_sweep_comparison(comparison))
+        print()
+        if args.plot:
+            _plot_num_harmonics_sweep(args.dataset, comparison, args.plot)
             print(f"Saved plot to {args.plot}")
     elif args.command == "auto-window":
         candidates = [None if w.strip().lower() == "unbounded" else int(w) for w in args.candidates.split(",")]

@@ -445,6 +445,121 @@ def format_window_sweep_comparison(comparison: WindowSweepComparison) -> str:
     return "\n".join(lines)
 
 
+@dataclass
+class WindowGammaSweepCell:
+    """One (window, gamma) grid cell, aggregated across several seeds."""
+
+    window: int | None
+    gamma: float
+    mean_abs_gap: float  # mean, across seeds, of |coverage_gap| -- the same aggregation
+    # `run_cv_window_selection` uses for ACI's own held-out-data window selection, so a
+    # "best cell" read off this grid is directly comparable to that method's criterion.
+    mean_gap: float  # mean of *signed* coverage_gap across seeds -- always read alongside
+    # mean_abs_gap, never instead of it: a small mean_gap can hide two seeds that swing to
+    # opposite over-/under-coverage and cancel out, which mean_abs_gap would catch.
+    mean_interval_width: float  # mean across seeds
+    per_seed_gap: list[float]  # one signed coverage_gap per seed, in seed order -- lets a
+    # caller check whether a cell's mean reflects consistent behavior or two outliers
+    # cancelling (see mean_gap's own note above).
+
+
+@dataclass
+class WindowGammaSweepComparison:
+    dataset: str
+    alpha: float
+    seeds: list[int]
+    windows: list[int | None]
+    gammas: list[float]
+    cells: list[WindowGammaSweepCell]  # len(windows) * len(gammas), window-major order
+
+
+def run_window_gamma_sweep_comparison(
+    dataset: str,
+    windows: list[int | None],
+    gammas: list[float],
+    alpha: float = 0.1,
+    seeds: list[int] | None = None,
+    lookback: int | None = None,
+    period: int | None = None,
+) -> WindowGammaSweepComparison:
+    """Jointly sweep `window` AND `gamma` for `SlidingWindowAdaptiveConformalForecaster`,
+    aggregated across several seeds -- the real follow-up `run_window_sweep_comparison`'s
+    own README "What's next" named: that function (and its 6-seed README re-check) only
+    ever tuned `window`, holding `gamma=0.05` fixed throughout, so whether the best window
+    depends on `gamma` (or vice versa) was never actually measured, only assumed.
+
+    Training-cost discipline, same reasoning as `run_window_sweep_comparison`'s own
+    docstring: neither `window` nor `gamma` affects model fitting at all. `window` only
+    changes how the sliding pool is *read* at predict time (see that function's docstring
+    for the full argument), and `gamma` only changes how `alpha_t` is updated inside
+    `predict_sequential` -- it never touches `self.model` or `self._residuals` either. So
+    exactly one LSTM is trained per seed here, and the full `len(windows) * len(gammas)`
+    grid is evaluated on top of that single fit for each seed: `len(seeds)` trainings
+    total, not `len(seeds) * len(windows) * len(gammas)`.
+    """
+    if not seeds:
+        seeds = [0]
+
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+
+    # One fit per seed; gamma=gammas[0] here only satisfies the constructor, it has no
+    # effect on fit() itself (see docstring) and is overridden per grid cell below.
+    fits = []
+    for seed in seeds:
+        seed_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+        fitted = SlidingWindowAdaptiveConformalForecaster(seed_model, alpha=alpha, gamma=gammas[0], window=None).fit(
+            X_train, y_train, X_cal, y_cal
+        )
+        fits.append(fitted)
+
+    cells = []
+    for window in windows:
+        for gamma in gammas:
+            per_seed_gap = []
+            per_seed_width = []
+            for fitted in fits:
+                forecaster = SlidingWindowAdaptiveConformalForecaster(
+                    fitted.model, alpha=alpha, gamma=gamma, window=window
+                )
+                forecaster._residuals = fitted._residuals  # reuse the one fit for this seed
+                pred = forecaster.predict_sequential(X_test, y_test.reshape(-1))
+                result = evaluate_adaptive_coverage(pred, y_test)
+                per_seed_gap.append(result["coverage_gap"])
+                per_seed_width.append(result["mean_interval_width"])
+            cells.append(
+                WindowGammaSweepCell(
+                    window=window,
+                    gamma=gamma,
+                    mean_abs_gap=float(np.mean(np.abs(per_seed_gap))),
+                    mean_gap=float(np.mean(per_seed_gap)),
+                    mean_interval_width=float(np.mean(per_seed_width)),
+                    per_seed_gap=[float(g) for g in per_seed_gap],
+                )
+            )
+
+    return WindowGammaSweepComparison(
+        dataset=dataset, alpha=alpha, seeds=list(seeds), windows=list(windows), gammas=list(gammas), cells=cells
+    )
+
+
+def format_window_gamma_sweep_comparison(comparison: WindowGammaSweepComparison) -> str:
+    nominal_pct = int(round((1 - comparison.alpha) * 100))
+    lines = [
+        f"### {comparison.dataset}: sliding-pool ACI window x gamma joint sweep "
+        f"(LSTM (delta), nominal {nominal_pct}%, {len(comparison.seeds)} seeds: {comparison.seeds})",
+        "",
+        "| window | gamma | mean \\|gap\\| | mean gap (signed) | mean interval width |",
+        "|---|---|---|---|---|",
+    ]
+    for cell in comparison.cells:
+        wlabel = "unbounded" if cell.window is None else str(cell.window)
+        lines.append(
+            f"| {wlabel} | {cell.gamma} | {cell.mean_abs_gap * 100:.1f}pp | "
+            f"{cell.mean_gap * 100:+.1f}pp | {cell.mean_interval_width:.3f} |"
+        )
+    return "\n".join(lines)
+
+
 def format_sliding_window_comparison(comparison: SlidingWindowComparison) -> str:
     nominal_pct = int(round((1 - comparison.alpha) * 100))
     window_desc = "unbounded (growing buffer)" if comparison.window is None else f"{comparison.window} (sliding)"

@@ -110,6 +110,14 @@ attempt (see `forecasting/experiment.py`'s `run_num_harmonics_sweep_comparison`)
 
     python -m forecasting.cli num-harmonics-sweep --dataset airline --num-harmonics-values 1,2,3,4,5 --plot results/airline_num_harmonics_sweep.png
 
+Jointly sweep the interpretable N-BEATS variant's `trend_degree` AND
+`num_harmonics` (v0.28) -- the real follow-up both single-hyperparameter
+basis sweeps' own README "What's next" named but neither attempted:
+whether the two interact, rather than only ever being measured one at a
+time (see `forecasting/experiment.py`'s `run_nbeats_joint_basis_sweep_comparison`):
+
+    python -m forecasting.cli nbeats-joint-basis-sweep --dataset airline --trend-degrees 1,2,3,4,5 --num-harmonics-values 1,2,3,4,5 --plot results/airline_nbeats_joint_basis_sweep.png
+
 Serve the calibrated forecasts over a minimal REST API (see
 `forecasting/api.py` and the README's "Serving it as an API" section --
 demo-quality, not production: the LSTM refits per request):
@@ -128,6 +136,7 @@ from forecasting.experiment import (
     format_enbpi_cv_window_selection,
     format_enbpi_window_sweep_comparison,
     format_nbeats_basis_sweep_comparison,
+    format_nbeats_joint_basis_sweep_comparison,
     format_num_harmonics_sweep_comparison,
     format_results_table,
     format_sliding_window_comparison,
@@ -141,6 +150,7 @@ from forecasting.experiment import (
     run_enbpi_window_sweep_comparison,
     run_experiment,
     run_nbeats_basis_sweep_comparison,
+    run_nbeats_joint_basis_sweep_comparison,
     run_num_harmonics_sweep_comparison,
     run_sliding_window_comparison,
     run_window_gamma_sweep_comparison,
@@ -452,6 +462,39 @@ def _plot_num_harmonics_sweep(dataset: str, comparison, path: str) -> None:
     plt.close(fig)
 
 
+def _plot_nbeats_joint_basis_sweep(dataset: str, comparison, path: str) -> None:
+    import numpy as np
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    degrees = comparison.trend_degrees
+    harmonics = comparison.num_harmonics_values
+    grid = np.zeros((len(degrees), len(harmonics)))
+    cell_by_pos = {(c.trend_degree, c.num_harmonics): c for c in comparison.cells}
+    for i, d in enumerate(degrees):
+        for j, h in enumerate(harmonics):
+            grid[i, j] = abs(cell_by_pos[(d, h)].coverage_gap) * 100
+
+    fig, ax = plt.subplots(figsize=(1.6 * len(harmonics) + 2, 1.1 * len(degrees) + 2))
+    im = ax.imshow(grid, cmap="viridis_r", aspect="auto")
+    ax.set_xticks(range(len(harmonics)))
+    ax.set_xticklabels([str(h) for h in harmonics])
+    ax.set_yticks(range(len(degrees)))
+    ax.set_yticklabels([str(d) for d in degrees])
+    ax.set_xlabel("num_harmonics")
+    ax.set_ylabel("trend_degree")
+    ax.set_title(f"{dataset}: trend_degree x num_harmonics joint sweep, |coverage gap| (pp)\nseed={comparison.seed}")
+    for i in range(len(degrees)):
+        for j in range(len(harmonics)):
+            ax.text(j, i, f"{grid[i, j]:.1f}", ha="center", va="center", color="white", fontsize=8)
+    fig.colorbar(im, ax=ax, label="|coverage gap| (pp)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
 def _plot_auto_window_selection(dataset: str, result, path: str) -> None:
     import matplotlib
 
@@ -712,6 +755,30 @@ def main() -> None:
     harmonics_sweep.add_argument("--plot", type=str, default=None, help="save a plot of coverage gap vs. num_harmonics")
     harmonics_sweep.add_argument("--seed", type=int, default=0)
 
+    joint_basis_sweep = sub.add_parser(
+        "nbeats-joint-basis-sweep",
+        help="jointly sweep the interpretable N-BEATS variant's trend_degree AND num_harmonics "
+        "(the real follow-up neither single-hyperparameter basis sweep attempted: whether they interact)",
+    )
+    joint_basis_sweep.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    joint_basis_sweep.add_argument("--alpha", type=float, default=0.1)
+    joint_basis_sweep.add_argument(
+        "--trend-degrees",
+        type=str,
+        default="1,2,3,4,5",
+        help="comma-separated list of trend_degree values to try",
+    )
+    joint_basis_sweep.add_argument(
+        "--num-harmonics-values",
+        type=str,
+        default="1,2,3,4,5",
+        help="comma-separated list of num_harmonics values to try",
+    )
+    joint_basis_sweep.add_argument(
+        "--plot", type=str, default=None, help="save a trend_degree x num_harmonics heatmap of coverage gap"
+    )
+    joint_basis_sweep.add_argument("--seed", type=int, default=0)
+
     auto = sub.add_parser(
         "auto-window",
         help="automatically select the sliding-pool ACI's window size from a held-out calibration slice",
@@ -908,6 +975,21 @@ def main() -> None:
         print()
         if args.plot:
             _plot_num_harmonics_sweep(args.dataset, comparison, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "nbeats-joint-basis-sweep":
+        trend_degrees = [int(d) for d in args.trend_degrees.split(",")]
+        num_harmonics_values = [int(h) for h in args.num_harmonics_values.split(",")]
+        comparison = run_nbeats_joint_basis_sweep_comparison(
+            args.dataset,
+            trend_degrees=trend_degrees,
+            num_harmonics_values=num_harmonics_values,
+            alpha=args.alpha,
+            seed=args.seed,
+        )
+        print(format_nbeats_joint_basis_sweep_comparison(comparison))
+        print()
+        if args.plot:
+            _plot_nbeats_joint_basis_sweep(args.dataset, comparison, args.plot)
             print(f"Saved plot to {args.plot}")
     elif args.command == "auto-window":
         candidates = [None if w.strip().lower() == "unbounded" else int(w) for w in args.candidates.split(",")]

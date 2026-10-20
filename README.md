@@ -614,6 +614,107 @@ guard); and the formatted table includes every swept value, the generic
 reference line, and the shipped-default marker — computed from the
 actual horizon, not hard-coded. Full suite verified: **238/238 passed.**
 
+## Do `trend_degree` and `num_harmonics` interact? The joint sweep neither half above attempted (v0.28)
+
+Both sweeps above left the same explicit question open: "this project has
+not swept the two hyperparameters jointly (a 5×5 grid, 25 independent fits
+per dataset) to check whether their individual gains stack, cancel, or
+interact." This closes it — `run_nbeats_joint_basis_sweep_comparison`/
+`format_nbeats_joint_basis_sweep_comparison` in `forecasting/experiment.py`
+and a new `python -m forecasting.cli nbeats-joint-basis-sweep` command sweep
+every combination of `trend_degree in [1,2,3,4,5]` and
+`num_harmonics in [1,2,3,4,5]` on each dataset — the full 25-cell grid, not
+either margin alone.
+
+Same training-cost discipline as both single-hyperparameter sweeps, this
+time for both axes at once: `trend_degree` changes `NBEATSTrendBlock`'s own
+`theta_size`, and `num_harmonics` changes `NBEATSSeasonalityBlock`'s own
+`theta_size` and its registered Fourier basis buffers — both are real
+architecture changes, not read-time settings, so unlike the ACI
+window/gamma joint sweep (v0.27), there is no single fit to reuse across
+the grid. Every one of the 25 cells per dataset gets its own full,
+independent fit, single seed (`seed=0`, the same single-seed convention
+both individual basis sweeps already use for architecture-changing
+sweeps — a multi-seed version of this specific grid is not attempted here,
+the same honestly-scoped limitation as every other sweep in this section).
+As a sanity check before trusting any new number, the grid's own
+`(trend_degree=2, num_harmonics=1)` cell was confirmed to reproduce both
+single-hyperparameter sweeps' already-published numbers exactly on every
+dataset (same model, same seed, not a separately-configured one).
+
+**Full grid, coverage gap (pp) for every (trend_degree, num_harmonics) cell:**
+
+![airline trend_degree x num_harmonics joint sweep heatmap](results/airline_nbeats_joint_basis_sweep.png)
+![synthetic trend_degree x num_harmonics joint sweep heatmap](results/synthetic_nbeats_joint_basis_sweep.png)
+![temperature trend_degree x num_harmonics joint sweep heatmap](results/temperature_nbeats_joint_basis_sweep.png)
+
+| Dataset | Shipped default (2, 1) | Best cell in this grid | Generic N-BEATS (reference) |
+|---|---|---|---|
+| airline | -23.3pp / MAE 36.092 | **(1, 3): +3.3pp / MAE 17.298** | -33.3pp / MAE 45.260 |
+| synthetic | **(2, 1): -0.6pp / MAE 1.099** *(shipped default is the grid's own best cell)* | -0.6pp / MAE 1.099 | n/a (generic reference not dominant here) |
+| temperature | +1.9pp / MAE 1.789 | (2, 5): +1.1pp / MAE 1.784 | n/a |
+
+**The honest answer is "it genuinely depends on the dataset, in three
+different ways" — not one clean story:**
+
+- **`airline` — a real interaction, not reachable from either margin
+  alone.** The joint-best cell, `(trend_degree=1, num_harmonics=3)`, posts
+  +3.3pp coverage gap (essentially nominal) and MAE 17.298 — clearly better
+  than the best point *either single sweep ever found on its own margin*:
+  sweeping `trend_degree` alone (holding `num_harmonics` at the shipped
+  default) tops out at `trend_degree=5`'s -6.7pp/23.930 MAE, and sweeping
+  `num_harmonics` alone (holding `trend_degree` at 2) tops out at
+  `num_harmonics=2`'s -13.3pp/22.942 MAE. Neither single-hyperparameter
+  sweep could have found `(1, 3)`, since it requires *lowering*
+  `trend_degree` below its shipped value while raising `num_harmonics` —
+  the opposite direction from what the `trend_degree` sweep alone suggested
+  (that sweep found *higher* degrees helped, holding harmonics fixed). This
+  is the real, measured answer to the question this feature was built to
+  ask: on `airline`, the two hyperparameters' individual gains do not
+  simply stack — the actual joint optimum lives somewhere neither margin's
+  own sweep would lead you to.
+- **`synthetic` — no interaction to find; the shipped default already sits
+  at (or within noise of) this grid's own joint optimum.** `(2, 1)`, the
+  shipped combination, posts -0.6pp — the best |gap| anywhere in the full
+  25-cell grid. More importantly, this grid also shows a real risk the two
+  single-hyperparameter sweeps couldn't: raising `trend_degree` *without*
+  also raising `num_harmonics` is actively harmful here —
+  `trend_degree=3/4/5` at `num_harmonics=1` post -8.1pp/-26.9pp/-25.0pp,
+  each worse than the default, even though the standalone `trend_degree`
+  sweep (which also held `num_harmonics` at 1 throughout) never found a
+  degree value that bad on this dataset at the values it tried. Overfitting
+  from a richer trend basis compounds with an under-specified seasonality
+  basis rather than cancelling it out.
+- **`temperature` — no meaningful interaction, same as every single-margin
+  finding already reported for this dataset.** The entire 25-cell grid
+  spans a narrow 1.1pp–3.3pp range, no wider than either individual sweep's
+  own near-flat result, and the nominal-best cell, `(2, 5)` at +1.1pp, is
+  barely different from the shipped default's +1.9pp. Whatever limits this
+  architecture's accuracy on `temperature` is not fixed by either
+  hyperparameter alone or jointly.
+
+**Practical takeaway:** this is the first basis-hyperparameter result in
+this README where the honest answer isn't just "dataset-dependent" in
+degree but in *kind* — `airline` shows a genuine interaction unreachable
+from either single sweep, `synthetic` shows the shipped default is already
+close to jointly optimal (with a real penalty for tuning one hyperparameter
+without the other), and `temperature` shows no interaction at all. None of
+the three single-hyperparameter sweeps in this README could have
+distinguished these three cases; only the joint grid can.
+
+5 new tests (243 → 248): the sweep runs every requested cell and reports
+real, bounded numbers for each; one grid cell (`trend_degree=2`,
+`num_harmonics=1`, the shipped combination) is confirmed to numerically
+match *both* single-hyperparameter sweeps' own already-published numbers
+exactly for the same seed, not just assumed from sharing a constructor;
+varying either hyperparameter alone while holding the other fixed is
+confirmed to change MAE (the same independent-fit regression guard both
+single-hyperparameter sweeps already apply, checked here on both axes);
+`shipped_default_harmonics` is confirmed horizon-derived rather than
+hard-coded; and the formatted table includes every cell, the generic
+reference line, the shipped-default marker, and the best-cell marker. Full
+suite verified: **248/248 passed.**
+
 ## Adaptive Conformal Inference: does it actually fix the LSTM's under-coverage?
 
 The three LSTM rows above all share a cause: the model's own error grows
@@ -2084,16 +2185,25 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   the *worse* points on `airline` (`num_harmonics=2` cuts the coverage gap
   from -23.3pp to -13.3pp and improves MAE by over a third), close to the
   best point on `synthetic` (89.4% coverage, nearly tied on MAE with
-  `num_harmonics=2`), and `temperature` again barely moves. With both
+  `num_harmonics=2`), and `temperature` again barely moves. ~~With both
   halves now measured, whether a higher `trend_degree` and a higher
-  `num_harmonics` *together* stack, cancel, or interact on `airline` (a
-  joint 5×5 grid, not swept independently by either run) is a real,
-  explicitly open follow-up. Trying a wider range of
-  `num_trend_blocks`/`num_seasonality_blocks` combinations also remains
-  open. A more principled next step than reading an answer off the test
-  set directly would be a held-out-data selection method for
+  `num_harmonics` *together* stack, cancel, or interact~~ **Done (v0.28):**
+  see "Do `trend_degree` and `num_harmonics` interact?" above. Real answer,
+  genuinely different in kind per dataset: `airline` shows an actual
+  interaction unreachable from either single sweep (the joint optimum,
+  `(trend_degree=1, num_harmonics=3)`, requires *lowering* `trend_degree`
+  while raising `num_harmonics` — the opposite direction the standalone
+  `trend_degree` sweep pointed); `synthetic` shows the shipped default is
+  already at this grid's own joint optimum, with a real penalty for
+  raising `trend_degree` without also raising `num_harmonics`; and
+  `temperature` shows no interaction at all. Trying a wider range of
+  `num_trend_blocks`/`num_seasonality_blocks` combinations remains open. A
+  more principled next step than reading an answer off the test set
+  directly would be a held-out-data selection method for
   `trend_degree`/`num_harmonics` (mirroring `cv-window-select` for ACI's
-  `window`) — not attempted here.
+  `window`) — not attempted here, and now a real candidate for either
+  this grid's full joint space or just `airline`'s own joint optimum found
+  here.
 - ~~Extend the window sweep's multi-seed check to `gamma` too (this run only
   tuned `window`, holding `gamma=0.05` fixed throughout — the two
   hyperparameters likely interact).~~ **Done (v0.27):** see "Does gamma

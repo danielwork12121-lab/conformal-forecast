@@ -1855,3 +1855,139 @@ def format_num_harmonics_sweep_comparison(comparison: NumHarmonicsSweepCompariso
             f"{i['coverage_gap'] * 100:+.1f}pp | {i['mean_interval_width']:.3f} | {i['mae']:.3f} |"
         )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# N-BEATS interpretable basis joint sweep (v0.28) -- the real follow-up both
+# single-hyperparameter basis sweeps' own README "What's next" named but
+# neither attempted: "whether a higher trend_degree and a higher
+# num_harmonics together stack, cancel, or interact ... is a real,
+# explicitly open follow-up." v0.25 swept trend_degree alone (num_harmonics
+# held at its shipped default); v0.26 swept num_harmonics alone (trend_degree
+# held at 2). Neither checked whether the two interact -- this does.
+#
+# Like both of those sweeps (and unlike the EnbPI/ACI window/gamma sweeps),
+# BOTH hyperparameters here change the model's own architecture
+# (NBEATSTrendBlock's theta_size; NBEATSSeasonalityBlock's theta_size and its
+# registered Fourier basis buffers), so there is no single shared fit to
+# reuse across the grid -- every (trend_degree, num_harmonics) cell gets its
+# own full, independent fit, same training discipline (Adam, MSE loss, early
+# stopping on the same validation split) as every other neural model here.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class NBEATSJointBasisSweepCell:
+    """One (trend_degree, num_harmonics) grid cell -- a single fit/seed,
+    same single-seed convention `run_nbeats_basis_sweep_comparison` and
+    `run_num_harmonics_sweep_comparison` already use for architecture-
+    changing sweeps (unlike the multi-seed ACI window/gamma sweep, where
+    reusing one fit per seed made several seeds cheap)."""
+
+    trend_degree: int
+    num_harmonics: int
+    coverage_gap: float
+    mean_interval_width: float
+    mae: float
+
+
+@dataclass
+class NBEATSJointBasisSweepComparison:
+    dataset: str
+    alpha: float
+    seed: int
+    trend_degrees: list[int]
+    num_harmonics_values: list[int]
+    shipped_default_harmonics: int  # same horizon-derived rule run_num_harmonics_sweep_comparison uses
+    generic: dict  # evaluate_coverage() + mae for NBEATSForecaster (generic variant, reference line)
+    cells: list[NBEATSJointBasisSweepCell]  # len(trend_degrees) * len(num_harmonics_values), trend_degree-major order
+
+
+def run_nbeats_joint_basis_sweep_comparison(
+    dataset: str,
+    trend_degrees: list[int],
+    num_harmonics_values: list[int],
+    alpha: float = 0.1,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> NBEATSJointBasisSweepComparison:
+    """Jointly sweep `trend_degree` AND `num_harmonics` for
+    `NBEATSInterpretableForecaster`, one full independent fit per grid cell
+    (see module note above for why no fit can be reused here, unlike the ACI
+    window/gamma joint sweep). `generic` (`NBEATSForecaster`) is included
+    once as a reference line, same discipline as both single-hyperparameter
+    sweeps.
+    """
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+
+    horizon = y_train.shape[1] if y_train.ndim > 1 else 1
+    shipped_default_harmonics = max(1, horizon // 2)
+
+    generic_model = DeltaWrapper(NBEATSForecaster(num_blocks=3, hidden_size=32, num_fc_layers=2, seed=seed))
+    generic = SplitConformalForecaster(generic_model, alpha=alpha).fit(X_train, y_train, X_cal, y_cal)
+    generic_result = _evaluate_with_mae(generic, X_test, y_test, normalizer)
+
+    cells = []
+    for degree in trend_degrees:
+        for harmonics in num_harmonics_values:
+            model = DeltaWrapper(
+                NBEATSInterpretableForecaster(
+                    num_trend_blocks=2,
+                    num_seasonality_blocks=2,
+                    hidden_size=32,
+                    num_fc_layers=2,
+                    trend_degree=degree,
+                    num_harmonics=harmonics,
+                    seed=seed,
+                )
+            )
+            conformal = SplitConformalForecaster(model, alpha=alpha).fit(X_train, y_train, X_cal, y_cal)
+            cov = _evaluate_with_mae(conformal, X_test, y_test, normalizer)
+            cells.append(
+                NBEATSJointBasisSweepCell(
+                    trend_degree=degree,
+                    num_harmonics=harmonics,
+                    coverage_gap=cov["coverage_gap"],
+                    mean_interval_width=cov["mean_interval_width"],
+                    mae=cov["mae"],
+                )
+            )
+
+    return NBEATSJointBasisSweepComparison(
+        dataset=dataset,
+        alpha=alpha,
+        seed=seed,
+        trend_degrees=list(trend_degrees),
+        num_harmonics_values=list(num_harmonics_values),
+        shipped_default_harmonics=shipped_default_harmonics,
+        generic=generic_result,
+        cells=cells,
+    )
+
+
+def format_nbeats_joint_basis_sweep_comparison(comparison: NBEATSJointBasisSweepComparison) -> str:
+    nominal_pct = int(round((1 - comparison.alpha) * 100))
+    g = comparison.generic
+    best = min(comparison.cells, key=lambda c: abs(c.coverage_gap))
+    lines = [
+        f"### {comparison.dataset}: N-BEATS interpretable trend_degree x num_harmonics joint sweep "
+        f"(nominal {nominal_pct}%, seed={comparison.seed})",
+        "",
+        f"*Reference, generic N-BEATS:* {g['coverage_gap'] * 100:+.1f}pp gap, MAE {g['mae']:.3f}.",
+        "",
+        "| trend_degree | num_harmonics | Coverage gap | Mean interval width | MAE |",
+        "|---|---|---|---|---|",
+    ]
+    for cell in comparison.cells:
+        markers = []
+        if cell.trend_degree == 2 and cell.num_harmonics == comparison.shipped_default_harmonics:
+            markers.append("shipped default")
+        if cell is best:
+            markers.append("best |gap| in this grid")
+        marker = f" **<- {', '.join(markers)}**" if markers else ""
+        lines.append(
+            f"| {cell.trend_degree} | {cell.num_harmonics}{marker} | {cell.coverage_gap * 100:+.1f}pp | "
+            f"{cell.mean_interval_width:.3f} | {cell.mae:.3f} |"
+        )
+    return "\n".join(lines)

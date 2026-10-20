@@ -84,3 +84,32 @@ def test_run_experiment_all_three_neural_models_are_independently_seeded():
     assert not (lstm_pred == transformer_pred).all()
     assert not (lstm_pred == nbeats_pred).all()
     assert not (transformer_pred == nbeats_pred).all()
+
+
+def test_run_experiment_includes_the_interpretable_nbeats_model_with_sane_results():
+    results = run_experiment("synthetic", alpha=0.1, seed=0)
+    by_name = {r.name: r for r in results}
+
+    assert "N-BEATS interpretable (delta)" in by_name
+    result = by_name["N-BEATS interpretable (delta)"]
+
+    assert math.isfinite(result.mae)
+    assert math.isfinite(result.rmse)
+    assert math.isfinite(result.mape)
+    assert 0.0 <= result.coverage["empirical_coverage"] <= 1.0
+    assert result.coverage["mean_interval_width"] > 0.0
+    assert result.coverage["n_test"] == by_name["Naive"].coverage["n_test"]
+
+
+def test_run_experiment_all_four_neural_models_are_independently_seeded():
+    # LSTM, Transformer, generic N-BEATS, and interpretable N-BEATS all
+    # share `seed` end-to-end, but are four structurally distinct
+    # architectures/bases -- their predictions on the same data should not
+    # come out identical, which would indicate one of them isn't actually
+    # training or is silently falling back to another model's code path.
+    results = run_experiment("synthetic", alpha=0.1, seed=0)
+    by_name = {r.name: r for r in results}
+    nbeats_pred = by_name["N-BEATS (delta)"].point_pred
+    interpretable_pred = by_name["N-BEATS interpretable (delta)"].point_pred
+    assert nbeats_pred.shape == interpretable_pred.shape
+    assert not (nbeats_pred == interpretable_pred).all()

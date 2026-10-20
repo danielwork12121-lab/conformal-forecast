@@ -1991,3 +1991,136 @@ def format_nbeats_joint_basis_sweep_comparison(comparison: NBEATSJointBasisSweep
             f"{cell.mean_interval_width:.3f} | {cell.mae:.3f} |"
         )
     return "\n".join(lines)
+
+
+@dataclass
+class NBEATSBlockCountSweepCell:
+    """One (num_trend_blocks, num_seasonality_blocks) grid cell -- a single
+    fit/seed, same single-seed convention the basis-shape sweeps use for
+    architecture-changing hyperparameters (block *count* changes the
+    module's own layer stack just as much as basis *shape* does -- see
+    `NBEATSInterpretableModule`'s own `__init__`, which builds exactly
+    `num_trend_blocks + num_seasonality_blocks` blocks -- so there is no
+    shared fit to reuse across this grid either)."""
+
+    num_trend_blocks: int
+    num_seasonality_blocks: int
+    coverage_gap: float
+    mean_interval_width: float
+    mae: float
+
+
+@dataclass
+class NBEATSBlockCountSweepComparison:
+    dataset: str
+    alpha: float
+    seed: int
+    trend_degree: int  # held fixed throughout at the shipped default, 2
+    num_harmonics: int  # held fixed throughout at the shipped, horizon-derived default
+    num_trend_blocks_values: list[int]
+    num_seasonality_blocks_values: list[int]
+    generic: dict  # evaluate_coverage() + mae for NBEATSForecaster (generic variant, reference line)
+    cells: list[NBEATSBlockCountSweepCell]  # len(num_trend_blocks_values) * len(num_seasonality_blocks_values)
+
+
+def run_nbeats_block_count_sweep_comparison(
+    dataset: str,
+    num_trend_blocks_values: list[int],
+    num_seasonality_blocks_values: list[int],
+    alpha: float = 0.1,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> NBEATSBlockCountSweepComparison:
+    """Jointly sweep `num_trend_blocks` AND `num_seasonality_blocks` for
+    `NBEATSInterpretableForecaster`, holding `trend_degree`/`num_harmonics`
+    at their shipped defaults throughout (the question this answers is
+    purely about stack *depth*, not basis *shape* -- that's what
+    v0.28's joint sweep already covered). This is the real follow-up
+    v0.28's own README section left open: v0.24 through v0.28 only ever
+    varied each basis's own per-block shape parameter, never how many of
+    each block type are stacked -- `num_trend_blocks`/`num_seasonality_blocks`
+    have stayed at their constructor defaults (2, 2) in every prior N-BEATS
+    sweep in this repo.
+
+    One full independent fit per grid cell, same single-seed discipline as
+    every other architecture-changing N-BEATS sweep in this file (unlike
+    the ACI window/gamma joint sweep, which reuses one fit per seed across
+    its whole grid because neither of ACI's hyperparameters touches the
+    model's own architecture).
+    """
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+
+    horizon = y_train.shape[1] if y_train.ndim > 1 else 1
+    shipped_default_harmonics = max(1, horizon // 2)
+    shipped_default_trend_degree = 2
+
+    generic_model = DeltaWrapper(NBEATSForecaster(num_blocks=3, hidden_size=32, num_fc_layers=2, seed=seed))
+    generic = SplitConformalForecaster(generic_model, alpha=alpha).fit(X_train, y_train, X_cal, y_cal)
+    generic_result = _evaluate_with_mae(generic, X_test, y_test, normalizer)
+
+    cells = []
+    for n_trend in num_trend_blocks_values:
+        for n_season in num_seasonality_blocks_values:
+            model = DeltaWrapper(
+                NBEATSInterpretableForecaster(
+                    num_trend_blocks=n_trend,
+                    num_seasonality_blocks=n_season,
+                    hidden_size=32,
+                    num_fc_layers=2,
+                    trend_degree=shipped_default_trend_degree,
+                    num_harmonics=shipped_default_harmonics,
+                    seed=seed,
+                )
+            )
+            conformal = SplitConformalForecaster(model, alpha=alpha).fit(X_train, y_train, X_cal, y_cal)
+            cov = _evaluate_with_mae(conformal, X_test, y_test, normalizer)
+            cells.append(
+                NBEATSBlockCountSweepCell(
+                    num_trend_blocks=n_trend,
+                    num_seasonality_blocks=n_season,
+                    coverage_gap=cov["coverage_gap"],
+                    mean_interval_width=cov["mean_interval_width"],
+                    mae=cov["mae"],
+                )
+            )
+
+    return NBEATSBlockCountSweepComparison(
+        dataset=dataset,
+        alpha=alpha,
+        seed=seed,
+        trend_degree=shipped_default_trend_degree,
+        num_harmonics=shipped_default_harmonics,
+        num_trend_blocks_values=list(num_trend_blocks_values),
+        num_seasonality_blocks_values=list(num_seasonality_blocks_values),
+        generic=generic_result,
+        cells=cells,
+    )
+
+
+def format_nbeats_block_count_sweep_comparison(comparison: NBEATSBlockCountSweepComparison) -> str:
+    nominal_pct = int(round((1 - comparison.alpha) * 100))
+    g = comparison.generic
+    best = min(comparison.cells, key=lambda c: abs(c.coverage_gap))
+    lines = [
+        f"### {comparison.dataset}: N-BEATS interpretable num_trend_blocks x num_seasonality_blocks joint sweep "
+        f"(nominal {nominal_pct}%, trend_degree={comparison.trend_degree} (shipped default), "
+        f"num_harmonics={comparison.num_harmonics} (shipped default), seed={comparison.seed})",
+        "",
+        f"*Reference, generic N-BEATS (num_blocks=3):* {g['coverage_gap'] * 100:+.1f}pp gap, MAE {g['mae']:.3f}.",
+        "",
+        "| num_trend_blocks | num_seasonality_blocks | Coverage gap | Mean interval width | MAE |",
+        "|---|---|---|---|---|",
+    ]
+    for cell in comparison.cells:
+        markers = []
+        if cell.num_trend_blocks == 2 and cell.num_seasonality_blocks == 2:
+            markers.append("shipped default")
+        if cell is best:
+            markers.append("best |gap| in this grid")
+        marker = f" **<- {', '.join(markers)}**" if markers else ""
+        lines.append(
+            f"| {cell.num_trend_blocks} | {cell.num_seasonality_blocks}{marker} | {cell.coverage_gap * 100:+.1f}pp | "
+            f"{cell.mean_interval_width:.3f} | {cell.mae:.3f} |"
+        )
+    return "\n".join(lines)

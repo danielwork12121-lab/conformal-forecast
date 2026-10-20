@@ -1512,3 +1512,127 @@ def format_cv_window_selection(result: CVWindowSelectionResult) -> str:
         f"{result.selected_test_result['mean_interval_width']:.3f}."
     ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# N-BEATS interpretable basis sweep (v0.25) -- the follow-up v0.24's own
+# README "What's next" named but did not attempt: "sweeping
+# trend_degree/num_harmonics rather than using the paper's own defaults
+# throughout." This sweeps `trend_degree` specifically, since it is the
+# more direct candidate explanation for v0.24's own case-dependent result
+# (a real win on airline/synthetic, a real loss on temperature): a
+# low-degree (default degree=2) polynomial trend basis may simply be the
+# wrong order for one of these series' real trend shape.
+#
+# Unlike the EnbPI/ACI window sweeps above, `trend_degree` changes the
+# model *architecture* itself (it changes `NBEATSTrendBlock.theta_size`,
+# hence `theta_proj`'s output dimension) rather than just how an
+# already-fitted model's residual pool or buffer is read at predict time.
+# So there is no single shared fit to reuse here -- each candidate degree
+# gets its own full, independent fit, same training discipline (Adam, MSE
+# loss, early stopping on the same validation split) as every other
+# neural model in this project.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class NBEATSBasisSweepResult:
+    trend_degree: int
+    interpretable: dict  # evaluate_coverage() output, plus a "mae" key, for this trend_degree value
+
+
+@dataclass
+class NBEATSBasisSweepComparison:
+    dataset: str
+    alpha: float
+    generic: dict  # evaluate_coverage() + mae for NBEATSForecaster (generic variant, reference line)
+    results: list[NBEATSBasisSweepResult]  # one per swept trend_degree value, in the order given -- include
+    # trend_degree=2 in the swept list itself (rather than a second, separate reference) to show the shipped
+    # default as just one point on the same sweep, not a specially-trained baseline.
+
+
+def _evaluate_with_mae(conformal: SplitConformalForecaster, X_test: np.ndarray, y_test: np.ndarray, normalizer: Normalizer) -> dict:
+    """Shared helper for this sweep: `evaluate_coverage` (scale-invariant,
+    computed on normalized data, same as every other evaluate_coverage call
+    in this module) plus a denormalized `mae`, so the sweep's table can show
+    point accuracy alongside coverage -- unlike the EnbPI/ACI window
+    sweeps, `trend_degree` changes point predictions too, not just how a
+    residual pool is read, so reporting coverage alone here would hide half
+    of what actually changed.
+    """
+    pred = conformal.predict(X_test)
+    cov = evaluate_coverage(pred, y_test)
+    point_denorm = normalizer.inverse_transform(pred.point)
+    y_test_denorm = normalizer.inverse_transform(y_test)
+    cov["mae"] = mae(y_test_denorm, point_denorm)
+    return cov
+
+
+def run_nbeats_basis_sweep_comparison(
+    dataset: str,
+    trend_degrees: list[int],
+    alpha: float = 0.1,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> NBEATSBasisSweepComparison:
+    """Sweep `trend_degree` for `NBEATSInterpretableForecaster` on one
+    dataset, holding `num_seasonality_blocks`'s own `num_harmonics` at its
+    default throughout (a `num_harmonics` sweep is a natural, separate
+    follow-up this function does not attempt, same "don't scope more than
+    one real question per increment" discipline as every other sweep in
+    this file).
+
+    `generic` (`NBEATSForecaster`, the generic variant already benchmarked
+    in v0.23) is included once as a reference line, computed with the
+    exact same training discipline and seed as every swept candidate, so a
+    caller can show the sweep against it without re-running it. Pass a
+    `trend_degrees` list that includes `2` to see the shipped default as
+    one point on the same sweep (marked in `format_nbeats_basis_sweep_comparison`),
+    rather than training it separately as a second, differently-labeled
+    baseline.
+    """
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+
+    generic_model = DeltaWrapper(NBEATSForecaster(num_blocks=3, hidden_size=32, num_fc_layers=2, seed=seed))
+    generic = SplitConformalForecaster(generic_model, alpha=alpha).fit(X_train, y_train, X_cal, y_cal)
+    generic_result = _evaluate_with_mae(generic, X_test, y_test, normalizer)
+
+    results = []
+    for degree in trend_degrees:
+        model = DeltaWrapper(
+            NBEATSInterpretableForecaster(
+                num_trend_blocks=2,
+                num_seasonality_blocks=2,
+                hidden_size=32,
+                num_fc_layers=2,
+                trend_degree=degree,
+                seed=seed,
+            )
+        )
+        conformal = SplitConformalForecaster(model, alpha=alpha).fit(X_train, y_train, X_cal, y_cal)
+        cov = _evaluate_with_mae(conformal, X_test, y_test, normalizer)
+        results.append(NBEATSBasisSweepResult(trend_degree=degree, interpretable=cov))
+
+    return NBEATSBasisSweepComparison(dataset=dataset, alpha=alpha, generic=generic_result, results=results)
+
+
+def format_nbeats_basis_sweep_comparison(comparison: NBEATSBasisSweepComparison) -> str:
+    nominal_pct = int(round((1 - comparison.alpha) * 100))
+    g = comparison.generic
+    lines = [
+        f"### {comparison.dataset}: N-BEATS interpretable trend_degree sweep (nominal {nominal_pct}%)",
+        "",
+        "| trend_degree | Empirical coverage | Coverage gap | Mean interval width | MAE |",
+        "|---|---|---|---|---|",
+        f"| *generic N-BEATS (reference)* | {g['empirical_coverage'] * 100:.1f}% | "
+        f"{g['coverage_gap'] * 100:+.1f}pp | {g['mean_interval_width']:.3f} | {g['mae']:.3f} |",
+    ]
+    for r in comparison.results:
+        i = r.interpretable
+        marker = " **<- shipped default**" if r.trend_degree == 2 else ""
+        lines.append(
+            f"| {r.trend_degree}{marker} | {i['empirical_coverage'] * 100:.1f}% | "
+            f"{i['coverage_gap'] * 100:+.1f}pp | {i['mean_interval_width']:.3f} | {i['mae']:.3f} |"
+        )
+    return "\n".join(lines)

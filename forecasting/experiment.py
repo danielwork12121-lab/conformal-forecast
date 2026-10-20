@@ -1636,3 +1636,107 @@ def format_nbeats_basis_sweep_comparison(comparison: NBEATSBasisSweepComparison)
             f"{i['coverage_gap'] * 100:+.1f}pp | {i['mean_interval_width']:.3f} | {i['mae']:.3f} |"
         )
     return "\n".join(lines)
+
+
+@dataclass
+class NumHarmonicsSweepResult:
+    num_harmonics: int
+    interpretable: dict  # evaluate_coverage() output, plus a "mae" key, for this num_harmonics value
+
+
+@dataclass
+class NumHarmonicsSweepComparison:
+    dataset: str
+    alpha: float
+    generic: dict  # evaluate_coverage() + mae for NBEATSForecaster (generic variant, reference line)
+    shipped_default: int  # the num_harmonics value NBEATSSeasonalityBlock actually falls back to
+    # at this project's horizon=1 (max(1, horizon // 2) == 1) -- computed once, not hard-coded,
+    # so this stays correct if a future run ever changes the project's horizon.
+    results: list[NumHarmonicsSweepResult]  # one per swept num_harmonics value, in the order given --
+    # include `shipped_default`'s own value in the swept list itself (rather than a second,
+    # separately-trained baseline), same discipline as `run_nbeats_basis_sweep_comparison`.
+
+
+def run_num_harmonics_sweep_comparison(
+    dataset: str,
+    num_harmonics_values: list[int],
+    alpha: float = 0.1,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> NumHarmonicsSweepComparison:
+    """Sweep `num_harmonics` for `NBEATSInterpretableForecaster`'s seasonality
+    basis on one dataset, holding `trend_degree` at its shipped default (2)
+    throughout -- the direct `run_nbeats_basis_sweep_comparison` follow-up
+    that function's own docstring named but deliberately did not attempt
+    ("a `num_harmonics` sweep is a natural, separate follow-up ... same
+    'don't scope more than one real question per increment' discipline").
+
+    `num_harmonics` changes `NBEATSSeasonalityBlock`'s own architecture
+    (`theta_size = 2 * num_harmonics`, and the registered Fourier
+    `backcast_basis`/`forecast_basis` buffers), not just how an
+    already-fitted model's pool is read -- so, exactly like the
+    `trend_degree` sweep, each swept value gets its own full, independent
+    fit rather than reusing one fit across the sweep.
+
+    `shipped_default` is computed from `NBEATSSeasonalityBlock`'s own
+    fallback rule (`max(1, horizon // 2)`) at this project's actual
+    horizon (1 everywhere `_prepare_split` is used), rather than hard-coding
+    `1` here -- if a future run ever changes the project's horizon, this
+    stays correct without a forgotten manual update elsewhere in the
+    sweep/plot/format code.
+
+    `generic` (`NBEATSForecaster`) is included once as a reference line,
+    computed with the exact same training discipline and seed as every
+    swept candidate, mirroring `run_nbeats_basis_sweep_comparison`.
+    """
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+
+    horizon = y_train.shape[1] if y_train.ndim > 1 else 1
+    shipped_default = max(1, horizon // 2)
+
+    generic_model = DeltaWrapper(NBEATSForecaster(num_blocks=3, hidden_size=32, num_fc_layers=2, seed=seed))
+    generic = SplitConformalForecaster(generic_model, alpha=alpha).fit(X_train, y_train, X_cal, y_cal)
+    generic_result = _evaluate_with_mae(generic, X_test, y_test, normalizer)
+
+    results = []
+    for harmonics in num_harmonics_values:
+        model = DeltaWrapper(
+            NBEATSInterpretableForecaster(
+                num_trend_blocks=2,
+                num_seasonality_blocks=2,
+                hidden_size=32,
+                num_fc_layers=2,
+                trend_degree=2,
+                num_harmonics=harmonics,
+                seed=seed,
+            )
+        )
+        conformal = SplitConformalForecaster(model, alpha=alpha).fit(X_train, y_train, X_cal, y_cal)
+        cov = _evaluate_with_mae(conformal, X_test, y_test, normalizer)
+        results.append(NumHarmonicsSweepResult(num_harmonics=harmonics, interpretable=cov))
+
+    return NumHarmonicsSweepComparison(
+        dataset=dataset, alpha=alpha, generic=generic_result, shipped_default=shipped_default, results=results
+    )
+
+
+def format_num_harmonics_sweep_comparison(comparison: NumHarmonicsSweepComparison) -> str:
+    nominal_pct = int(round((1 - comparison.alpha) * 100))
+    g = comparison.generic
+    lines = [
+        f"### {comparison.dataset}: N-BEATS interpretable num_harmonics sweep (nominal {nominal_pct}%)",
+        "",
+        "| num_harmonics | Empirical coverage | Coverage gap | Mean interval width | MAE |",
+        "|---|---|---|---|---|",
+        f"| *generic N-BEATS (reference)* | {g['empirical_coverage'] * 100:.1f}% | "
+        f"{g['coverage_gap'] * 100:+.1f}pp | {g['mean_interval_width']:.3f} | {g['mae']:.3f} |",
+    ]
+    for r in comparison.results:
+        i = r.interpretable
+        marker = " **<- shipped default**" if r.num_harmonics == comparison.shipped_default else ""
+        lines.append(
+            f"| {r.num_harmonics}{marker} | {i['empirical_coverage'] * 100:.1f}% | "
+            f"{i['coverage_gap'] * 100:+.1f}pp | {i['mean_interval_width']:.3f} | {i['mae']:.3f} |"
+        )
+    return "\n".join(lines)

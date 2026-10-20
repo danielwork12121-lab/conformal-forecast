@@ -118,6 +118,16 @@ time (see `forecasting/experiment.py`'s `run_nbeats_joint_basis_sweep_comparison
 
     python -m forecasting.cli nbeats-joint-basis-sweep --dataset airline --trend-degrees 1,2,3,4,5 --num-harmonics-values 1,2,3,4,5 --plot results/airline_nbeats_joint_basis_sweep.png
 
+Jointly sweep the interpretable N-BEATS variant's stack *depth*,
+`num_trend_blocks` AND `num_seasonality_blocks` (v0.29) -- every prior
+N-BEATS sweep in this repo (v0.24 through v0.28) varied a basis's own
+per-block *shape* (`trend_degree`, `num_harmonics`) but left block *count*
+at the constructor default (2, 2) throughout; this is the real follow-up
+question neither basis-shape sweep could answer (see
+`forecasting/experiment.py`'s `run_nbeats_block_count_sweep_comparison`):
+
+    python -m forecasting.cli nbeats-block-count-sweep --dataset airline --num-trend-blocks-values 1,2,3,4,5 --num-seasonality-blocks-values 1,2,3,4,5 --plot results/airline_nbeats_block_count_sweep.png
+
 Serve the calibrated forecasts over a minimal REST API (see
 `forecasting/api.py` and the README's "Serving it as an API" section --
 demo-quality, not production: the LSTM refits per request):
@@ -136,6 +146,7 @@ from forecasting.experiment import (
     format_enbpi_cv_window_selection,
     format_enbpi_window_sweep_comparison,
     format_nbeats_basis_sweep_comparison,
+    format_nbeats_block_count_sweep_comparison,
     format_nbeats_joint_basis_sweep_comparison,
     format_num_harmonics_sweep_comparison,
     format_results_table,
@@ -150,6 +161,7 @@ from forecasting.experiment import (
     run_enbpi_window_sweep_comparison,
     run_experiment,
     run_nbeats_basis_sweep_comparison,
+    run_nbeats_block_count_sweep_comparison,
     run_nbeats_joint_basis_sweep_comparison,
     run_num_harmonics_sweep_comparison,
     run_sliding_window_comparison,
@@ -495,6 +507,43 @@ def _plot_nbeats_joint_basis_sweep(dataset: str, comparison, path: str) -> None:
     plt.close(fig)
 
 
+def _plot_nbeats_block_count_sweep(dataset: str, comparison, path: str) -> None:
+    import numpy as np
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n_trend_values = comparison.num_trend_blocks_values
+    n_season_values = comparison.num_seasonality_blocks_values
+    grid = np.zeros((len(n_trend_values), len(n_season_values)))
+    cell_by_pos = {(c.num_trend_blocks, c.num_seasonality_blocks): c for c in comparison.cells}
+    for i, nt in enumerate(n_trend_values):
+        for j, ns in enumerate(n_season_values):
+            grid[i, j] = abs(cell_by_pos[(nt, ns)].coverage_gap) * 100
+
+    fig, ax = plt.subplots(figsize=(1.6 * len(n_season_values) + 2, 1.1 * len(n_trend_values) + 2))
+    im = ax.imshow(grid, cmap="viridis_r", aspect="auto")
+    ax.set_xticks(range(len(n_season_values)))
+    ax.set_xticklabels([str(n) for n in n_season_values])
+    ax.set_yticks(range(len(n_trend_values)))
+    ax.set_yticklabels([str(n) for n in n_trend_values])
+    ax.set_xlabel("num_seasonality_blocks")
+    ax.set_ylabel("num_trend_blocks")
+    ax.set_title(
+        f"{dataset}: num_trend_blocks x num_seasonality_blocks joint sweep, |coverage gap| (pp)\n"
+        f"trend_degree={comparison.trend_degree}, num_harmonics={comparison.num_harmonics} "
+        f"(both shipped defaults), seed={comparison.seed}"
+    )
+    for i in range(len(n_trend_values)):
+        for j in range(len(n_season_values)):
+            ax.text(j, i, f"{grid[i, j]:.1f}", ha="center", va="center", color="white", fontsize=8)
+    fig.colorbar(im, ax=ax, label="|coverage gap| (pp)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
 def _plot_auto_window_selection(dataset: str, result, path: str) -> None:
     import matplotlib
 
@@ -779,6 +828,32 @@ def main() -> None:
     )
     joint_basis_sweep.add_argument("--seed", type=int, default=0)
 
+    block_count_sweep = sub.add_parser(
+        "nbeats-block-count-sweep",
+        help="jointly sweep the interpretable N-BEATS variant's stack depth, num_trend_blocks AND "
+        "num_seasonality_blocks (trend_degree/num_harmonics stay at their shipped defaults throughout) "
+        "-- the real follow-up neither basis-shape sweep (trend_degree, num_harmonics, or their v0.28 "
+        "joint sweep) attempted: does block count matter, not just basis shape",
+    )
+    block_count_sweep.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    block_count_sweep.add_argument("--alpha", type=float, default=0.1)
+    block_count_sweep.add_argument(
+        "--num-trend-blocks-values",
+        type=str,
+        default="1,2,3,4,5",
+        help="comma-separated list of num_trend_blocks values to try",
+    )
+    block_count_sweep.add_argument(
+        "--num-seasonality-blocks-values",
+        type=str,
+        default="1,2,3,4,5",
+        help="comma-separated list of num_seasonality_blocks values to try",
+    )
+    block_count_sweep.add_argument(
+        "--plot", type=str, default=None, help="save a num_trend_blocks x num_seasonality_blocks heatmap of coverage gap"
+    )
+    block_count_sweep.add_argument("--seed", type=int, default=0)
+
     auto = sub.add_parser(
         "auto-window",
         help="automatically select the sliding-pool ACI's window size from a held-out calibration slice",
@@ -990,6 +1065,21 @@ def main() -> None:
         print()
         if args.plot:
             _plot_nbeats_joint_basis_sweep(args.dataset, comparison, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "nbeats-block-count-sweep":
+        num_trend_blocks_values = [int(n) for n in args.num_trend_blocks_values.split(",")]
+        num_seasonality_blocks_values = [int(n) for n in args.num_seasonality_blocks_values.split(",")]
+        comparison = run_nbeats_block_count_sweep_comparison(
+            args.dataset,
+            num_trend_blocks_values=num_trend_blocks_values,
+            num_seasonality_blocks_values=num_seasonality_blocks_values,
+            alpha=args.alpha,
+            seed=args.seed,
+        )
+        print(format_nbeats_block_count_sweep_comparison(comparison))
+        print()
+        if args.plot:
+            _plot_nbeats_block_count_sweep(args.dataset, comparison, args.plot)
             print(f"Saved plot to {args.plot}")
     elif args.command == "auto-window":
         candidates = [None if w.strip().lower() == "unbounded" else int(w) for w in args.candidates.split(",")]

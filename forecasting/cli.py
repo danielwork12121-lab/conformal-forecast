@@ -112,6 +112,7 @@ from forecasting.experiment import (
     format_enbpi_comparison,
     format_enbpi_cv_window_selection,
     format_enbpi_window_sweep_comparison,
+    format_nbeats_basis_sweep_comparison,
     format_results_table,
     format_sliding_window_comparison,
     format_window_sweep_comparison,
@@ -122,6 +123,7 @@ from forecasting.experiment import (
     run_enbpi_cv_window_selection,
     run_enbpi_window_sweep_comparison,
     run_experiment,
+    run_nbeats_basis_sweep_comparison,
     run_sliding_window_comparison,
     run_window_sweep_comparison,
 )
@@ -319,6 +321,39 @@ def _plot_window_sweep(dataset: str, comparison, path: str) -> None:
     ax.set_xlabel("window (max residual-pool size)")
     ax.set_ylabel("coverage gap (pp, closer to 0 is better)")
     ax.set_title(f"{dataset}: sliding-pool ACI coverage gap by window size")
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def _plot_nbeats_basis_sweep(dataset: str, comparison, path: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    degrees = [r.trend_degree for r in comparison.results]
+    gaps = [r.interpretable["coverage_gap"] * 100 for r in comparison.results]
+    x = range(len(degrees))
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(x, gaps, color="#d62728", linewidth=1.5, marker="o", label="interpretable N-BEATS")
+    ax.axhline(
+        comparison.generic["coverage_gap"] * 100,
+        color="#888888",
+        linewidth=1.0,
+        linestyle=":",
+        label="generic N-BEATS (reference)",
+    )
+    ax.axhline(0.0, color="#222222", linewidth=0.8)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels([str(d) for d in degrees])
+    if 2 in degrees:
+        ax.axvline(degrees.index(2), color="#9467bd", linewidth=0.8, linestyle="--", label="shipped default (degree=2)")
+    ax.set_xlabel("trend_degree")
+    ax.set_ylabel("coverage gap (pp, closer to 0 is better)")
+    ax.set_title(f"{dataset}: interpretable N-BEATS coverage gap by trend_degree")
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=140)
@@ -528,6 +563,21 @@ def main() -> None:
     sweep.add_argument("--plot", type=str, default=None, help="save a plot of coverage gap vs. window size")
     sweep.add_argument("--seed", type=int, default=0)
 
+    nbeats_sweep = sub.add_parser(
+        "nbeats-basis-sweep",
+        help="sweep the interpretable N-BEATS trend basis's polynomial degree and compare coverage/MAE across values",
+    )
+    nbeats_sweep.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    nbeats_sweep.add_argument("--alpha", type=float, default=0.1)
+    nbeats_sweep.add_argument(
+        "--trend-degrees",
+        type=str,
+        default="1,2,3,4,5",
+        help="comma-separated list of trend_degree values to try (num_harmonics stays at its default throughout)",
+    )
+    nbeats_sweep.add_argument("--plot", type=str, default=None, help="save a plot of coverage gap vs. trend_degree")
+    nbeats_sweep.add_argument("--seed", type=int, default=0)
+
     auto = sub.add_parser(
         "auto-window",
         help="automatically select the sliding-pool ACI's window size from a held-out calibration slice",
@@ -692,6 +742,16 @@ def main() -> None:
         print()
         if args.plot:
             _plot_window_sweep(args.dataset, comparison, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "nbeats-basis-sweep":
+        trend_degrees = [int(d) for d in args.trend_degrees.split(",")]
+        comparison = run_nbeats_basis_sweep_comparison(
+            args.dataset, trend_degrees=trend_degrees, alpha=args.alpha, seed=args.seed
+        )
+        print(format_nbeats_basis_sweep_comparison(comparison))
+        print()
+        if args.plot:
+            _plot_nbeats_basis_sweep(args.dataset, comparison, args.plot)
             print(f"Saved plot to {args.plot}")
     elif args.command == "auto-window":
         candidates = [None if w.strip().lower() == "unbounded" else int(w) for w in args.candidates.split(",")]

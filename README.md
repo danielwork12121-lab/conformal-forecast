@@ -816,6 +816,91 @@ window-sweep` is the tool for finding it on a new series, and the honest
 scope of this finding (two datasets, one gamma, one alpha) is stated here
 rather than oversold.
 
+## Does `gamma` interact with `window`? A joint sweep, not an assumption (v0.27)
+
+The window sweep above answers "what's the best `window`?" at exactly one
+`gamma` (0.05, the default) — the section's own closing line named "one
+gamma" as part of the honest scope it wasn't claiming to cover. This run
+built `run_window_gamma_sweep_comparison`/`format_window_gamma_sweep_comparison`
+in `forecasting/experiment.py` and a `window-gamma-sweep` CLI command to
+actually answer it: jointly sweep `window` **and** `gamma`, aggregated over
+the same 6 seeds (0–5) this repo already uses for its other multi-seed
+checks, and see whether the best `window` found above still wins once
+`gamma` is allowed to vary too.
+
+Training-cost discipline, same reasoning as the single-`window` sweep: since
+neither `window` nor `gamma` affects how the LSTM is *fit* (only how the
+residual pool is read, and how `alpha_t` is updated, at predict time), this
+is one LSTM fit per seed (6 fits total per dataset), not one fit per grid
+cell — the 5x5 grid of 25 (window, gamma) combinations per seed is pure
+inference on top of that single fit, confirmed as a real regression test
+(`tests/test_window_gamma_sweep.py::test_one_fit_per_seed_not_per_grid_cell`)
+rather than just claimed in the docstring. As a sanity check before trusting
+any of the new numbers below, the `gamma=0.05` column of this joint sweep
+was confirmed to reproduce the single-`window` sweep's own already-published
+6-seed numbers exactly — `airline` window=10 at 6.1pp mean |gap| (vs.
+unbounded's 10.6pp) and `synthetic`'s bounded-window range of 0.1–0.9pp (vs.
+unbounded's 1.7pp) both match byte-for-byte.
+
+**Full grid, mean |coverage gap| (pp) across 6 seeds, for every (window, gamma) cell:**
+
+![airline window x gamma joint sweep heatmap](results/airline_window_gamma_sweep.png)
+![synthetic window x gamma joint sweep heatmap](results/synthetic_window_gamma_sweep.png)
+![temperature window x gamma joint sweep heatmap](results/temperature_window_gamma_sweep.png)
+
+**The honest answer is "it depends on the dataset, the same pattern as every
+other ablation in this README" — not a clean yes or no:**
+
+- **`airline`:** the window ranking barely moves across `gamma`. A small
+  window (10 or 15) is the best or tied-best choice at every `gamma` value
+  tried, 0.01 through 0.2 — the single-`window` sweep's own `window=10` pick
+  is never more than 0.2pp away from whichever small window is technically
+  best at a given `gamma`. The real, if modest, interaction: at `gamma=0.01`
+  and `0.02`, `window=15` edges out `window=10` by half a point (5.6pp vs.
+  6.1pp); at `gamma=0.05`/`0.1` they're tied; at `gamma=0.2` they're tied
+  again but both notably worse (7.8pp). So `gamma` shifts *which* small
+  window wins by a hair, but never which *size class* of window wins — the
+  original single-gamma finding holds up well here.
+- **`synthetic`:** this is where the two genuinely interact. At
+  `gamma=0.01`/`0.02`/`0.05`, `window=50` is the best or tied-best cell
+  (0.1–0.4pp); at `gamma=0.1`, `window=30` edges ahead instead (0.3pp vs.
+  `window=50`'s 0.4pp); at `gamma=0.2`, the ranking flattens into a
+  three-way near-tie among `window=15`/`30` (1.3pp) with `window=50`
+  actually *worse* (2.6pp) than it was the best choice at every other
+  `gamma`. Picking `window` from a sweep that only varied `gamma=0.05`
+  (as the original sweep did) would have missed that `window=50`'s
+  advantage erodes and partially reverses once `gamma` gets large — a real
+  answer to the question this feature was built to ask, not a null result.
+- **`temperature`:** coverage is near-nominal everywhere (as it was in the
+  single-`window` sweep — "nothing here to tune"), so every cell's
+  mean |gap| stays under 1.1pp regardless of window or gamma except at the
+  largest `gamma=0.2`, where every window gets measurably worse (1.5–2.3pp)
+  and `window=20` becomes the best choice instead of the unbounded buffer or
+  the largest windows that tied for best at smaller `gamma`. The dataset
+  with "nothing to tune" at the original `gamma=0.05` still shows a small
+  real effect once `gamma` is pushed to an unusually aggressive value.
+- **Across all three datasets, `gamma=0.2` is a consistent inflection
+  point:** performance degrades at `gamma=0.2` relative to `gamma=0.05`
+  almost everywhere, regardless of `window` (`airline`: every window's
+  |gap| rises at `gamma=0.2`; `synthetic`: `unbounded`'s |gap| roughly
+  triples; `temperature`: every window's |gap| at least doubles). A plausible
+  explanation, stated as a hypothesis: `gamma=0.2` makes `alpha_t` swing too
+  aggressively step-to-step for these series and horizons, overshooting the
+  target coverage rather than tracking it — the magnitude of `gamma`'s own
+  effect, independent of `window`, looks at least as large as `window`'s own
+  effect on these three datasets, which the original single-`window` sweep
+  (run at one fixed `gamma`) had no way to show.
+
+**Practical takeaway:** the original window-tuning finding ("a bounded
+window smaller than the calibration set helps on `airline`/`synthetic`")
+survives this joint check — it isn't an artifact of the one `gamma` value it
+happened to be measured at. But the *exact* best window is not
+`gamma`-invariant on `synthetic`, and an unusually large `gamma` (0.2, well
+above every value this repo has shipped as a default) hurts more than
+switching `window` helps on any of the three datasets — a real, measured
+answer to "do these two hyperparameters interact," not an assumption either
+way.
+
 ## Automatic window selection: does it actually work?
 
 "Window tuning" above found real, dataset-dependent optima but left finding
@@ -2009,9 +2094,15 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   set directly would be a held-out-data selection method for
   `trend_degree`/`num_harmonics` (mirroring `cv-window-select` for ACI's
   `window`) — not attempted here.
-- Extend the window sweep's multi-seed check to `gamma` too (this run only
+- ~~Extend the window sweep's multi-seed check to `gamma` too (this run only
   tuned `window`, holding `gamma=0.05` fixed throughout — the two
-  hyperparameters likely interact).
+  hyperparameters likely interact).~~ **Done (v0.27):** see "Does gamma
+  interact with window?" above. Real, dataset-dependent answer: the
+  original window-tuning finding survives (it wasn't an artifact of the one
+  gamma value it was measured at), but the exact best window shifts with
+  gamma on `synthetic`, and an unusually large gamma (0.2) hurts more than
+  switching window helps on every dataset tried — a genuine interaction,
+  not a null result.
 - Both open questions from the "Automatic fold count" section are now
   answered: whether `auto_folds` holds up with more seeds before flipping
   the default (re-checked at 20 seeds — it doesn't hold up as a strict

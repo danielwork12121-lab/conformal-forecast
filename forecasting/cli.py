@@ -29,6 +29,13 @@ Sweep the sliding-pool ACI's `window` size and see how coverage gap responds
 
     python -m forecasting.cli window-sweep --dataset airline --windows 10,15,20,30,50,unbounded --plot results/airline_window_sweep.png
 
+Jointly sweep `window` AND `gamma`, aggregated across several seeds, to check
+whether the best window actually depends on gamma (the single-`window`-sweep
+above holds gamma fixed at its default throughout, so this is the first time
+the two are varied together):
+
+    python -m forecasting.cli window-gamma-sweep --dataset airline --windows 10,15,20,30,50,unbounded --gammas 0.01,0.02,0.05,0.1,0.2 --seeds 0,1,2,3,4,5 --plot results/airline_window_gamma_sweep.png
+
 Automatically pick a `window` instead of eyeballing a window-sweep plot: the
 calibration set is itself split into a selection-calibration slice and a
 held-out slice, each candidate window is scored by |coverage gap| on that
@@ -124,6 +131,7 @@ from forecasting.experiment import (
     format_num_harmonics_sweep_comparison,
     format_results_table,
     format_sliding_window_comparison,
+    format_window_gamma_sweep_comparison,
     format_window_sweep_comparison,
     run_adaptive_comparison,
     run_auto_window_selection,
@@ -135,6 +143,7 @@ from forecasting.experiment import (
     run_nbeats_basis_sweep_comparison,
     run_num_harmonics_sweep_comparison,
     run_sliding_window_comparison,
+    run_window_gamma_sweep_comparison,
     run_window_sweep_comparison,
 )
 
@@ -332,6 +341,40 @@ def _plot_window_sweep(dataset: str, comparison, path: str) -> None:
     ax.set_ylabel("coverage gap (pp, closer to 0 is better)")
     ax.set_title(f"{dataset}: sliding-pool ACI coverage gap by window size")
     ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def _plot_window_gamma_sweep(dataset: str, comparison, path: str) -> None:
+    import numpy as np
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    windows = comparison.windows
+    gammas = comparison.gammas
+    wlabels = ["unbounded" if w is None else str(w) for w in windows]
+    grid = np.zeros((len(windows), len(gammas)))
+    cell_by_pos = {(c.window, c.gamma): c for c in comparison.cells}
+    for i, w in enumerate(windows):
+        for j, g in enumerate(gammas):
+            grid[i, j] = cell_by_pos[(w, g)].mean_abs_gap * 100
+
+    fig, ax = plt.subplots(figsize=(1.6 * len(gammas) + 2, 1.1 * len(windows) + 2))
+    im = ax.imshow(grid, cmap="viridis_r", aspect="auto")
+    ax.set_xticks(range(len(gammas)))
+    ax.set_xticklabels([str(g) for g in gammas])
+    ax.set_yticks(range(len(windows)))
+    ax.set_yticklabels(wlabels)
+    ax.set_xlabel("gamma (ACI step size)")
+    ax.set_ylabel("window (max residual-pool size)")
+    ax.set_title(f"{dataset}: window x gamma joint sweep, mean |coverage gap| (pp)\n{len(comparison.seeds)} seeds")
+    for i in range(len(windows)):
+        for j in range(len(gammas)):
+            ax.text(j, i, f"{grid[i, j]:.1f}", ha="center", va="center", color="white", fontsize=8)
+    fig.colorbar(im, ax=ax, label="mean |coverage gap| (pp)")
     fig.tight_layout()
     fig.savefig(path, dpi=140)
     plt.close(fig)
@@ -612,6 +655,33 @@ def main() -> None:
     sweep.add_argument("--plot", type=str, default=None, help="save a plot of coverage gap vs. window size")
     sweep.add_argument("--seed", type=int, default=0)
 
+    gamma_sweep = sub.add_parser(
+        "window-gamma-sweep",
+        help="jointly sweep the sliding-pool ACI's window AND gamma, aggregated across several seeds "
+        "(window-sweep's own 'What's next' follow-up: window and gamma were never swept together before)",
+    )
+    gamma_sweep.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    gamma_sweep.add_argument("--alpha", type=float, default=0.1)
+    gamma_sweep.add_argument(
+        "--windows",
+        type=str,
+        default="10,15,20,30,50,unbounded",
+        help="comma-separated list of window sizes to try; include 'unbounded' for the growing buffer",
+    )
+    gamma_sweep.add_argument(
+        "--gammas",
+        type=str,
+        default="0.01,0.02,0.05,0.1,0.2",
+        help="comma-separated list of ACI step sizes to try",
+    )
+    gamma_sweep.add_argument(
+        "--seeds",
+        type=str,
+        default="0,1,2,3,4,5",
+        help="comma-separated list of seeds to aggregate across (matches this repo's own 6-seed README convention)",
+    )
+    gamma_sweep.add_argument("--plot", type=str, default=None, help="save a window x gamma heatmap of mean |gap|")
+
     nbeats_sweep = sub.add_parser(
         "nbeats-basis-sweep",
         help="sweep the interpretable N-BEATS trend basis's polynomial degree and compare coverage/MAE across values",
@@ -806,6 +876,18 @@ def main() -> None:
         print()
         if args.plot:
             _plot_window_sweep(args.dataset, comparison, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "window-gamma-sweep":
+        windows = [None if w.strip().lower() == "unbounded" else int(w) for w in args.windows.split(",")]
+        gammas = [float(g) for g in args.gammas.split(",")]
+        seeds = [int(s) for s in args.seeds.split(",")]
+        comparison = run_window_gamma_sweep_comparison(
+            args.dataset, windows=windows, gammas=gammas, alpha=args.alpha, seeds=seeds
+        )
+        print(format_window_gamma_sweep_comparison(comparison))
+        print()
+        if args.plot:
+            _plot_window_gamma_sweep(args.dataset, comparison, args.plot)
             print(f"Saved plot to {args.plot}")
     elif args.command == "nbeats-basis-sweep":
         trend_degrees = [int(d) for d in args.trend_degrees.split(",")]

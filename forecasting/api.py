@@ -125,6 +125,27 @@ longer retrains on every request for a combo that's already been seen
 repeat caller no longer has to resend a whole series it already sent once
 (v0.14, this version's fix).
 
+v0.33: the README's own long-open "What's next" gap -- a series that grows
+over time has, until now, had no way to be scored without either resending
+the whole thing as a new `series`/`/forecast` call (paying both the
+resend and a brand-new fit, even though almost all of the history is
+unchanged) or living with a stale fit forever. `POST
+/series/{series_id}/score` answers the "score newly-arrived points"
+half of that gap (not the "warm-start the fit on more data" half -- see
+the endpoint's own docstring for exactly where the line is drawn):
+a caller sends only the new, actually-observed points, this reuses
+whatever fit is already cached for that `(series_id, model, seed,
+lookback, period)` combination (fitting it once, on the first call, same
+as `/forecast` would), and scores the new points against that one frozen
+fit and its one conformal quantile -- no refit, however many more times
+new points arrive. The registered series in `_series_store` is never
+mutated by this endpoint, so `series_id` keeps meaning exactly what it
+always has (one fixed, immutable sequence's content hash); the response's
+`cache_hit` field states plainly, for every call, whether a fit already
+existed or this call is the one that created it, so the "no refit on
+repeat calls" claim is something a caller (or a test) can check directly
+rather than take on faith.
+
 Endpoints
 ---------
 GET    /health              -- liveness check.
@@ -159,6 +180,12 @@ POST   /forecast             -- run one model on one dataset OR one
 GET    /cache/stats         -- current fit-cache size, max size, and keys.
 DELETE /cache                -- clear the fit cache (forces the next
                                  matching request to refit).
+POST   /series/{series_id}/score -- score newly-observed points against
+                                 an already-registered series' fit, reusing
+                                 it (fitting once, on the first call) and
+                                 never refitting it on any later call
+                                 (v0.33). Does not mutate the registered
+                                 series.
 """
 from __future__ import annotations
 
@@ -185,7 +212,7 @@ app = FastAPI(
         "you've registered once and referenced by id. "
         "Demo-quality: see the repo README for honest scope notes."
     ),
-    version="0.19",
+    version="0.33",
 )
 
 # Generic defaults used for a user-supplied series, which has no dataset
@@ -553,6 +580,50 @@ class SeriesListResponse(BaseModel):
     max_size: int = Field(description="the store's capacity; the oldest entry is evicted past this")
 
 
+class ScoreNewPointsRequest(BaseModel):
+    new_points: list[float] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "newly observed actual values, in chronological order, immediately "
+            "following the series already registered under this series_id. Scored "
+            "against whatever fit is already cached for this (series_id, model, "
+            "seed, lookback, period) combination -- fit once, on the first call for "
+            "that combination (exactly like /forecast), reused on every later call "
+            "(v0.33). Never registered or persisted anywhere -- this call's effect "
+            "is entirely in its own response."
+        ),
+    )
+    model: ModelName = Field("naive", description="point-forecast model to calibrate")
+    alpha: float = Field(0.1, gt=0.0, lt=1.0, description="miscoverage rate, e.g. 0.1 -> 90% intervals")
+    seed: int = Field(0, description="LSTM init/training seed (ignored for naive/seasonal_naive)")
+    lookback: int | None = Field(
+        None, gt=0, description="override the default lookback window (12 for a series, same as /forecast)"
+    )
+    period: int | None = Field(
+        None, gt=0, description="override the default seasonal period (12 for a series, same as /forecast)"
+    )
+
+
+class ScoreNewPointsResponse(BaseModel):
+    series_id: str
+    model: ModelName
+    alpha: float
+    seed: int
+    cache_hit: bool = Field(
+        description=(
+            "true if this call reused a fit already cached for this (series_id, "
+            "model, seed, lookback, period) combination; false only the first time "
+            "that combination is scored (or forecast via /forecast) -- that call is "
+            "what creates the entry every later call then reuses. A caller (or a "
+            "test) can check the 'never refits on repeat calls' claim directly "
+            "against this field rather than take it on faith."
+        )
+    )
+    points: list[ForecastPoint]
+    summary: ForecastSummary
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -758,6 +829,147 @@ def forecast(req: ForecastRequest) -> ForecastResponse:
         seed=req.seed,
         n_input_points=bundle["n_input_points"],
         series_id=bundle["series_id"],
+        points=points,
+        summary=summary,
+    )
+
+
+@app.post("/series/{series_id}/score", response_model=ScoreNewPointsResponse)
+def score_new_points(series_id: str, req: ScoreNewPointsRequest) -> ScoreNewPointsResponse:
+    """Score newly-observed points against an already-registered series'
+    calibrated fit -- without refitting (v0.33).
+
+    This is the README's own long-open "What's next" gap, answered: a
+    series that grows over time doesn't need to be re-POSTed whole (the
+    caller sends only `new_points`, never the full history again), and
+    scoring those new points doesn't pay a refit either, as long as a fit
+    for this exact `(series_id, model, seed, lookback, period)` combination
+    is already cached. The *first* call for a combination still fits it
+    (exactly like `/forecast` would -- this reuses `_get_or_fit` itself, not
+    a reimplementation of it); every later call, for however many more
+    points have arrived since, reuses that one fit and its one conformal
+    quantile. `cache_hit` in the response states which happened, so this
+    claim is directly checkable rather than asserted.
+
+    Deliberately NOT what this does: retrain the point model on the new
+    data. An actual online-learning model (v0.32's
+    `RetrainingSlidingWindowAdaptiveConformalForecaster` in
+    `forecasting/adaptive.py`) periodically refits a fresh model on
+    everything revealed so far, which is a heavier, structurally different
+    mechanism with its own dedicated CLI path -- this endpoint is the
+    cheap, honestly-scoped "I already have a calibrated model; score what
+    just came in" case, not a substitute for that one.
+
+    The registered series in `_series_store` is never mutated by this
+    call -- `new_points` lives only in this request/response pair, so
+    `series_id` keeps meaning exactly what it always has (the content hash
+    of one fixed, immutable sequence). A caller that wants its growing
+    history durably registered too can still call `POST /series` again
+    with the extended sequence whenever it wants a fresh `series_id` for
+    it; this endpoint is for the common case of scoring new points against
+    a fit the caller already has, without re-sending or re-registering
+    the whole series just to do that.
+
+    Same honest units caveat as every `/forecast` response (Known issue
+    #10 in this repo's own tracking): `summary.mean_interval_width` and
+    `summary.q_hat` are in the model's normalized (z-score) units, not the
+    series' original units, matching `/forecast`'s existing behavior
+    rather than introducing a second, different convention. `summary.mae`
+    is correctly denormalized, same as `/forecast`.
+
+    404s if `series_id` isn't (or is no longer) in the series store --
+    same semantics every other series-store lookup already uses. 422s if
+    the resolved `lookback` exceeds the registered series' own length (not
+    enough real history to form even the first new point's window) --
+    same status `/forecast` already uses for a too-short series.
+    """
+    base_series = _resolve_series_id(series_id)
+    lookback = req.lookback or _CUSTOM_SERIES_DEFAULT_LOOKBACK
+    period = req.period or _CUSTOM_SERIES_DEFAULT_PERIOD
+
+    if lookback > len(base_series):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"lookback={lookback} exceeds the registered series' own length "
+                f"({len(base_series)}) -- not enough real history to form even "
+                "one window for the first new point."
+            ),
+        )
+
+    forecast_req = ForecastRequest(
+        series_id=series_id,
+        model=req.model,
+        alpha=req.alpha,
+        seed=req.seed,
+        lookback=req.lookback,
+        period=req.period,
+    )
+    key = _cache_key(forecast_req, series_id)
+    with _cache_lock:
+        cache_hit = key in _model_cache
+    bundle = _get_or_fit(forecast_req)
+    model = bundle["model"]
+    normalizer = bundle["normalizer"]
+    X_cal, y_cal = bundle["X_cal"], bundle["y_cal"]
+
+    n_base = len(base_series)
+    n_new = len(req.new_points)
+    combined = np.asarray(list(base_series) + list(req.new_points), dtype=np.float64)
+    X_new = np.empty((n_new, lookback), dtype=np.float32)
+    y_new = np.empty((n_new, 1), dtype=np.float32)
+    for i in range(n_new):
+        target_idx = n_base + i
+        X_new[i] = combined[target_idx - lookback : target_idx]
+        y_new[i] = combined[target_idx]
+    X_new_norm = normalizer.transform(X_new)
+    y_new_norm = normalizer.transform(y_new)
+
+    # Same q_hat-from-scratch-each-call pattern as /forecast (never cached
+    # itself, since it's a cheap O(n_cal log n_cal) sort and alpha can
+    # legitimately differ call to call) -- `model` and `X_cal`/`y_cal` are
+    # the reused, never-refit fit; only this quantile is recomputed.
+    conformal = SplitConformalForecaster(model, alpha=req.alpha)
+    cal_pred = model.predict(X_cal)
+    residuals = np.abs(y_cal - cal_pred).reshape(-1)
+    conformal.q_hat = SplitConformalForecaster._quantile_with_finite_sample_correction(residuals, req.alpha)
+    pred = conformal.predict(X_new_norm)
+
+    point = normalizer.inverse_transform(pred.point).reshape(-1)
+    lower = normalizer.inverse_transform(pred.lower).reshape(-1)
+    upper = normalizer.inverse_transform(pred.upper).reshape(-1)
+    actual = np.asarray(req.new_points, dtype=np.float64)
+
+    cov = evaluate_coverage(pred, y_new_norm)
+    mae_value = _mae(actual, point)
+
+    points = [
+        ForecastPoint(
+            index=i,
+            actual=float(actual[i]),
+            point_forecast=float(point[i]),
+            lower=float(lower[i]),
+            upper=float(upper[i]),
+            covered=bool(lower[i] <= actual[i] <= upper[i]),
+        )
+        for i in range(n_new)
+    ]
+    summary = ForecastSummary(
+        mae=mae_value,
+        nominal_coverage=cov["nominal_coverage"],
+        empirical_coverage=cov["empirical_coverage"],
+        coverage_gap=cov["coverage_gap"],
+        mean_interval_width=cov["mean_interval_width"],
+        q_hat=cov["q_hat"],
+        n_test=cov["n_test"],
+    )
+
+    return ScoreNewPointsResponse(
+        series_id=series_id,
+        model=req.model,
+        alpha=req.alpha,
+        seed=req.seed,
+        cache_hit=cache_hit,
         points=points,
         summary=summary,
     )

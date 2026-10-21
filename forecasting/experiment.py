@@ -2124,3 +2124,289 @@ def format_nbeats_block_count_sweep_comparison(comparison: NBEATSBlockCountSweep
             f"{cell.mean_interval_width:.3f} | {cell.mae:.3f} |"
         )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# N-BEATS interpretable basis CV selection (v0.30) -- the real follow-up
+# v0.29's own README "What's next" named but did not attempt: every
+# trend_degree/num_harmonics sweep so far (v0.25, v0.26, v0.28's joint grid)
+# picks a "best" cell by reading the REAL TEST SET directly, which is
+# useful for honestly reporting what the hyperparameters' effect looks
+# like, but isn't a deployable selection method (a real user doesn't have
+# the test set). This mirrors `run_cv_window_selection`'s rolling-origin
+# cross-validation (used there to select ACI's `window`) to instead select
+# `(trend_degree, num_harmonics)` using only the calibration set, then
+# honestly reports whether the CV-selected cell matches the real test
+# set's own best cell -- for each of the three bundled datasets, which
+# v0.28's joint sweep already gives known ground truth to check against.
+#
+# Unlike `run_cv_window_selection` (where the LSTM is fit once, since
+# window has no effect on model fitting), `trend_degree`/`num_harmonics`
+# change `NBEATSInterpretableForecaster`'s own architecture (see the v0.25/
+# v0.28 module notes above) -- so each grid cell still needs its own full,
+# independent fit, same as every other basis-shape sweep. What CV adds
+# here is cheap, though: once a cell is fit, its predictions on the whole
+# calibration set are reused across every fold (only which residuals seed
+# each fold's quantile, and which calibration points each fold scores
+# against, change) -- so this costs one fit per cell, not one fit per
+# (cell, fold) pair.
+# ---------------------------------------------------------------------------
+
+
+def _select_best_cell(
+    keys: list[tuple[int, int]],
+    gap_by_key: dict,
+    width_by_key: dict | None = None,
+) -> tuple[int, int]:
+    """Pure selection rule for a `(trend_degree, num_harmonics)` grid,
+    mirroring `_select_best_window`'s own three-part tie-break but adapted
+    to a 2D hyperparameter with no natural "larger is safer" ordering:
+
+    1. argmin |coverage gap| -- the thing that actually matters.
+    2. Smaller mean interval width, when given -- same efficiency
+       tie-break `_select_best_window` uses.
+    3. Smaller `trend_degree + num_harmonics` ("model complexity") as a
+       last-resort, fully deterministic tie-break -- unlike a single
+       `window` value, there's no "unbounded" direction to prefer here, so
+       this picks the simplest (lowest total basis order) combination
+       among exact ties, a defensible Occam's-razor default rather than an
+       arbitrary one.
+    """
+    if not keys:
+        raise ValueError("Need at least one candidate cell to select from")
+
+    def sort_key(k):
+        width = width_by_key[k] if width_by_key is not None else 0.0
+        return (round(abs(gap_by_key[k]), 10), width, k[0] + k[1])
+
+    return min(keys, key=sort_key)
+
+
+@dataclass
+class NBEATSBasisCVCandidate:
+    trend_degree: int
+    num_harmonics: int
+    mean_abs_fold_gap: float  # mean of |coverage gap| across folds -- used to select
+    mean_fold_gap: float  # mean of SIGNED coverage gap across folds -- display only
+    mean_fold_width: float
+    test_coverage_gap: float  # real test-set gap, honest post-hoc check only
+
+
+@dataclass
+class NBEATSBasisCVSelectionResult:
+    dataset: str
+    alpha: float
+    seed: int
+    fold_scheme: str
+    auto_folds: bool
+    n_folds: int
+    min_initial_frac: float
+    min_fold_frac: float
+    fold_bounds: list[tuple[int, int]]
+    trend_degrees: list[int]
+    num_harmonics_values: list[int]
+    shipped_default_harmonics: int
+    candidates: list[NBEATSBasisCVCandidate]  # trend_degree-major order, same as the joint sweep
+    selected: tuple[int, int]  # (trend_degree, num_harmonics) chosen from the fold columns only
+    best_test: tuple[int, int]  # oracle: smallest |test gap| in hindsight -- comparison only
+    generic: dict  # evaluate_coverage() + mae for NBEATSForecaster (generic variant, reference line)
+    selected_test_result: NBEATSJointBasisSweepCell  # real test-set cell for the selected combination
+
+
+def run_nbeats_basis_cv_selection(
+    dataset: str,
+    trend_degrees: list[int],
+    num_harmonics_values: list[int],
+    alpha: float = 0.1,
+    n_folds: int = 4,
+    min_initial_frac: float = 0.2,
+    min_fold_frac: float = 0.1,
+    fold_scheme: str = "expanding",
+    auto_folds: bool = False,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> NBEATSBasisCVSelectionResult:
+    """Select `(trend_degree, num_harmonics)` for `NBEATSInterpretableForecaster`
+    using rolling-origin cross-validation over the calibration set, instead
+    of v0.28's joint sweep reading its "best |gap|" cell directly off the
+    real test set.
+
+    Method, per `(trend_degree, num_harmonics)` candidate: fit the model
+    once on X_train (as every basis-shape sweep already does), compute its
+    residuals on the whole calibration set, then partition the calibration
+    set into rolling folds via `_make_rolling_folds` (identical fold
+    machinery `run_cv_window_selection` already uses and already tests).
+    For each fold, the quantile (`q_hat`, the same finite-sample-corrected
+    formula `SplitConformalForecaster` itself uses) is computed from that
+    fold's seed residuals only (`_fold_seed_start`, same 'expanding'/
+    'sliding' choice as the ACI case), and scored by |coverage gap| on that
+    fold's own held-out validation chunk. The per-candidate score is the
+    MEAN of |gap| across folds (not signed mean, same reasoning as
+    `run_cv_window_selection`: a candidate that swings over- then
+    under-covered across folds shouldn't look artificially well-calibrated
+    on average). `_select_best_cell` then picks the smallest-mean-|gap|
+    candidate.
+
+    This never touches X_test/y_test to make the selection. X_test is used
+    only afterward, via the already-tested `run_nbeats_joint_basis_sweep_comparison`,
+    to honestly report whether the CV-selected cell's choice generalized --
+    same post-hoc-only discipline as `run_cv_window_selection` and
+    `run_auto_window_selection`.
+
+    Raises ValueError if the calibration set is too small to form even one
+    fold of `min_fold_frac * n_cal` points after reserving
+    `min_initial_frac * n_cal` points for the first fold's seed.
+    """
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+    n_cal = len(X_cal)
+
+    if fold_scheme not in ("expanding", "sliding"):
+        raise ValueError("fold_scheme must be 'expanding' or 'sliding'")
+
+    if auto_folds:
+        n_folds, min_initial_frac, min_fold_frac = _auto_cv_fold_params(n_cal)
+    else:
+        if n_folds < 1:
+            raise ValueError("n_folds must be a positive integer")
+        if not (0.0 < min_initial_frac < 1.0) or not (0.0 < min_fold_frac < 1.0):
+            raise ValueError("min_initial_frac and min_fold_frac must be in (0, 1)")
+
+    min_initial = max(5, round(n_cal * min_initial_frac))
+    min_fold_size = max(3, round(n_cal * min_fold_frac))
+    fold_bounds = _make_rolling_folds(n_cal, n_folds, min_initial, min_fold_size)
+    if fold_bounds is None:
+        raise ValueError(
+            f"Calibration set too small for rolling-origin CV: n_cal={n_cal}, "
+            f"min_initial={min_initial}, min_fold_size={min_fold_size} (from min_initial_frac="
+            f"{min_initial_frac}, min_fold_frac={min_fold_frac}) -- try a smaller n_folds / "
+            "min_initial_frac / min_fold_frac, or a dataset/lookback with a larger calibration set"
+        )
+
+    horizon = y_train.shape[1] if y_train.ndim > 1 else 1
+    shipped_default_harmonics = max(1, horizon // 2)
+
+    mean_abs_gap_by_cell: dict = {}
+    mean_gap_by_cell: dict = {}
+    mean_width_by_cell: dict = {}
+    for degree in trend_degrees:
+        for harmonics in num_harmonics_values:
+            model = DeltaWrapper(
+                NBEATSInterpretableForecaster(
+                    num_trend_blocks=2,
+                    num_seasonality_blocks=2,
+                    hidden_size=32,
+                    num_fc_layers=2,
+                    trend_degree=degree,
+                    num_harmonics=harmonics,
+                    seed=seed,
+                )
+            )
+            model.fit(X_train, y_train)
+            cal_pred = model.predict(X_cal).reshape(-1)
+            cal_y = y_cal.reshape(-1)
+            cal_residuals = np.abs(cal_y - cal_pred)
+
+            abs_gaps, signed_gaps, widths = [], [], []
+            for train_end, test_end in fold_bounds:
+                seed_start = _fold_seed_start(train_end, min_initial, fold_scheme)
+                fold_seed_residuals = cal_residuals[seed_start:train_end]
+                q_hat = SplitConformalForecaster._quantile_with_finite_sample_correction(fold_seed_residuals, alpha)
+                y_fold = cal_y[train_end:test_end]
+                pred_fold = cal_pred[train_end:test_end]
+                lower, upper = pred_fold - q_hat, pred_fold + q_hat
+                covered = (y_fold >= lower) & (y_fold <= upper)
+                empirical = float(np.mean(covered))
+                gap = empirical - (1 - alpha)
+                abs_gaps.append(abs(gap))
+                signed_gaps.append(gap)
+                widths.append(float(np.mean(upper - lower)))
+
+            key = (degree, harmonics)
+            mean_abs_gap_by_cell[key] = float(np.mean(abs_gaps))
+            mean_gap_by_cell[key] = float(np.mean(signed_gaps))
+            mean_width_by_cell[key] = float(np.mean(widths))
+
+    cell_keys = [(d, h) for d in trend_degrees for h in num_harmonics_values]
+    selected = _select_best_cell(cell_keys, mean_abs_gap_by_cell, mean_width_by_cell)
+
+    # Honest post-hoc check, using the already-tested v0.28 joint-sweep
+    # machinery -- same pattern as run_cv_window_selection reusing
+    # run_window_sweep_comparison for the real test-set numbers.
+    joint = run_nbeats_joint_basis_sweep_comparison(
+        dataset, trend_degrees, num_harmonics_values, alpha=alpha, lookback=lookback, period=period, seed=seed
+    )
+    test_gap_by_cell = {(c.trend_degree, c.num_harmonics): c.coverage_gap for c in joint.cells}
+    test_width_by_cell = {(c.trend_degree, c.num_harmonics): c.mean_interval_width for c in joint.cells}
+    test_result_by_cell = {(c.trend_degree, c.num_harmonics): c for c in joint.cells}
+
+    candidates = [
+        NBEATSBasisCVCandidate(
+            trend_degree=d,
+            num_harmonics=h,
+            mean_abs_fold_gap=mean_abs_gap_by_cell[(d, h)],
+            mean_fold_gap=mean_gap_by_cell[(d, h)],
+            mean_fold_width=mean_width_by_cell[(d, h)],
+            test_coverage_gap=test_gap_by_cell[(d, h)],
+        )
+        for d, h in cell_keys
+    ]
+    best_test = _select_best_cell(cell_keys, test_gap_by_cell, test_width_by_cell)
+
+    return NBEATSBasisCVSelectionResult(
+        dataset=dataset,
+        alpha=alpha,
+        seed=seed,
+        fold_scheme=fold_scheme,
+        auto_folds=auto_folds,
+        n_folds=len(fold_bounds),
+        min_initial_frac=min_initial_frac,
+        min_fold_frac=min_fold_frac,
+        fold_bounds=fold_bounds,
+        trend_degrees=list(trend_degrees),
+        num_harmonics_values=list(num_harmonics_values),
+        shipped_default_harmonics=shipped_default_harmonics,
+        candidates=candidates,
+        selected=selected,
+        best_test=best_test,
+        generic=joint.generic,
+        selected_test_result=test_result_by_cell[selected],
+    )
+
+
+def format_nbeats_basis_cv_selection(result: NBEATSBasisCVSelectionResult) -> str:
+    nominal_pct = int(round((1 - result.alpha) * 100))
+    g = result.generic
+    fold_desc = ", ".join(f"[{a}:{b})" for a, b in result.fold_bounds)
+    folds_label = f"n_folds={result.n_folds} (auto)" if result.auto_folds else f"n_folds={result.n_folds}"
+    lines = [
+        f"### {result.dataset}: N-BEATS interpretable trend_degree x num_harmonics CV selection "
+        f"(nominal {nominal_pct}%, fold_scheme={result.fold_scheme}, {folds_label}, folds={fold_desc}, "
+        f"seed={result.seed})",
+        "",
+        f"*Reference, generic N-BEATS:* {g['coverage_gap'] * 100:+.1f}pp gap, MAE {g['mae']:.3f}.",
+        "",
+        "| trend_degree | num_harmonics | Mean &#124;fold gap&#124; (used to select) | Mean fold gap (signed) | Real test gap (post-hoc check) |",
+        "|---|---|---|---|---|",
+    ]
+    for c in result.candidates:
+        markers = []
+        if (c.trend_degree, c.num_harmonics) == result.selected:
+            markers.append("selected")
+        if (c.trend_degree, c.num_harmonics) == result.best_test:
+            markers.append("best in hindsight")
+        marker = f" **<- {', '.join(markers)}**" if markers else ""
+        lines.append(
+            f"| {c.trend_degree} | {c.num_harmonics}{marker} | {c.mean_abs_fold_gap * 100:.1f}pp | "
+            f"{c.mean_fold_gap * 100:+.1f}pp | {c.test_coverage_gap * 100:+.1f}pp |"
+        )
+    lines += [
+        "",
+        f"**Selected: trend_degree={result.selected[0]}, num_harmonics={result.selected[1]}** "
+        f"(chosen from the {result.n_folds} fold columns only) -> real test-set gap "
+        f"{result.selected_test_result.coverage_gap * 100:+.1f}pp, mean interval width "
+        f"{result.selected_test_result.mean_interval_width:.3f}, MAE {result.selected_test_result.mae:.3f}. "
+        f"Best in hindsight (real test set): trend_degree={result.best_test[0]}, "
+        f"num_harmonics={result.best_test[1]}.",
+    ]
+    return "\n".join(lines)

@@ -12,6 +12,7 @@ import numpy as np
 
 from forecasting.adaptive import (
     AdaptiveConformalForecaster,
+    RetrainingSlidingWindowAdaptiveConformalForecaster,
     SlidingWindowAdaptiveConformalForecaster,
     evaluate_adaptive_coverage,
 )
@@ -576,6 +577,127 @@ def format_sliding_window_comparison(comparison: SlidingWindowComparison) -> str
         f"{f['coverage_gap'] * 100:+.1f}pp | {f['mean_interval_width']:.3f} |",
         f"| Sliding/growing-pool ACI | {w['empirical_coverage'] * 100:.1f}% | "
         f"{w['coverage_gap'] * 100:+.1f}pp | {w['mean_interval_width']:.3f} |",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Online retraining (v0.32) -- the README's one remaining long-open
+# "What's next" item: every ACI/EnbPI variant above adapts the *conformal
+# calibration* to a point model that stays frozen at its initial fit for
+# the whole test window. This section asks the complementary question:
+# does letting the model *itself* keep learning from newly-revealed test
+# data, not just the conformal layer wrapped around it, actually help --
+# measured on real data, not assumed, same as every other feature here.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OnlineRetrainingComparison:
+    dataset: str
+    alpha: float
+    gamma: float
+    window: int | None  # None = unbounded growing buffer (shared by both ACI variants below)
+    retrain_every: int  # actual step interval used (resolved from n_retrains_target if not given explicitly)
+    n_test: int
+    static: dict  # evaluate_coverage() output for static split conformal (frozen model, no ACI)
+    frozen_sliding: dict  # evaluate_adaptive_coverage() output: sliding-pool ACI, model frozen (v0.27's variant)
+    retraining: dict  # evaluate_adaptive_coverage() output: sliding-pool ACI, model periodically retrained
+    n_retrains: int  # how many times the model was actually refit over the test window
+    pool_size: np.ndarray  # (n_test,) -- the retraining variant's own pool size at each step
+    retrained_at_steps: np.ndarray  # (n_retrains,) -- which test-set step indices triggered a refit
+
+
+def run_online_retraining_comparison(
+    dataset: str,
+    alpha: float = 0.1,
+    gamma: float = 0.05,
+    window: int | None = None,
+    retrain_every: int | None = None,
+    n_retrains_target: int = 8,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> OnlineRetrainingComparison:
+    """Three-way, same-split comparison: static split conformal (frozen
+    model), sliding-pool ACI with the model frozen (the `run_sliding_window_
+    comparison` variant), and sliding-pool ACI with the model *periodically
+    retrained* on everything revealed so far.
+
+    `retrain_every`, if not given explicitly, is resolved from
+    `n_retrains_target` as `max(1, n_test // n_retrains_target)` -- a
+    dataset-size-independent way to bound the number of from-scratch LSTM
+    refits (each one as expensive as the model's very first fit) to
+    roughly `n_retrains_target` regardless of whether `n_test` is airline's
+    ~29 points or temperature's ~650, so this stays affordable in a
+    CPU-constrained sandbox without the resolved cadence needing to be
+    hand-picked per dataset. This is a real, disclosed scope choice
+    (coarse-grained online learning, not continuous retraining) -- see
+    `RetrainingSlidingWindowAdaptiveConformalForecaster`'s own docstring.
+    """
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+    n_test = len(X_test)
+    resolved_retrain_every = retrain_every if retrain_every is not None else max(1, n_test // n_retrains_target)
+
+    static_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    static = SplitConformalForecaster(static_model, alpha=alpha).fit(X_train, y_train, X_cal, y_cal)
+    static_result = evaluate_coverage(static.predict(X_test), y_test)
+
+    # Two independently-initialized model instances/factories, fit
+    # identically (same hyperparameters, same seed), so the only thing
+    # that can explain a difference between them is whether the model
+    # itself kept retraining -- not a different architecture, learning
+    # rate, or random initialization.
+    frozen_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    frozen = SlidingWindowAdaptiveConformalForecaster(frozen_model, alpha=alpha, gamma=gamma, window=window).fit(
+        X_train, y_train, X_cal, y_cal
+    )
+    frozen_pred = frozen.predict_sequential(X_test, y_test.reshape(-1))
+    frozen_result = evaluate_adaptive_coverage(frozen_pred, y_test)
+
+    def _model_factory():
+        return DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+
+    retraining = RetrainingSlidingWindowAdaptiveConformalForecaster(
+        _model_factory, alpha=alpha, gamma=gamma, window=window, retrain_every=resolved_retrain_every
+    ).fit(X_train, y_train, X_cal, y_cal)
+    retraining_pred = retraining.predict_sequential(X_test, y_test.reshape(-1))
+    retraining_result = evaluate_adaptive_coverage(retraining_pred, y_test)
+
+    return OnlineRetrainingComparison(
+        dataset=dataset,
+        alpha=alpha,
+        gamma=gamma,
+        window=window,
+        retrain_every=resolved_retrain_every,
+        n_test=n_test,
+        static=static_result,
+        frozen_sliding=frozen_result,
+        retraining=retraining_result,
+        n_retrains=retraining_pred.n_retrains,
+        pool_size=retraining_pred.pool_size,
+        retrained_at_steps=retraining_pred.retrained_at_steps,
+    )
+
+
+def format_online_retraining_comparison(comparison: OnlineRetrainingComparison) -> str:
+    nominal_pct = int(round((1 - comparison.alpha) * 100))
+    window_desc = "unbounded (growing buffer)" if comparison.window is None else f"{comparison.window} (sliding)"
+    s, f, r = comparison.static, comparison.frozen_sliding, comparison.retraining
+    lines = [
+        f"### {comparison.dataset}: does retraining the model online beat a frozen model, "
+        f"both under sliding-pool ACI? (LSTM (delta), nominal {nominal_pct}%, gamma={comparison.gamma}, "
+        f"window={window_desc}, retrain_every={comparison.retrain_every} steps, "
+        f"{comparison.n_retrains} retrains over {comparison.n_test} test steps)",
+        "",
+        "| Method | Empirical coverage | Coverage gap | Mean interval width |",
+        "|---|---|---|---|",
+        f"| Static split conformal (frozen model, no ACI) | {s['empirical_coverage'] * 100:.1f}% | "
+        f"{s['coverage_gap'] * 100:+.1f}pp | {s['mean_interval_width']:.3f} |",
+        f"| Sliding-pool ACI, model frozen | {f['empirical_coverage'] * 100:.1f}% | "
+        f"{f['coverage_gap'] * 100:+.1f}pp | {f['mean_interval_width']:.3f} |",
+        f"| Sliding-pool ACI, model retrained online | {r['empirical_coverage'] * 100:.1f}% | "
+        f"{r['coverage_gap'] * 100:+.1f}pp | {r['mean_interval_width']:.3f} |",
     ]
     return "\n".join(lines)
 

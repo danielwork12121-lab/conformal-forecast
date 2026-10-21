@@ -715,6 +715,110 @@ hard-coded; and the formatted table includes every cell, the generic
 reference line, the shipped-default marker, and the best-cell marker. Full
 suite verified: **248/248 passed.**
 
+## Does stack *depth* matter, not just basis *shape*? A `num_trend_blocks` x `num_seasonality_blocks` sweep (v0.29)
+
+Every N-BEATS interpretable-basis result above (v0.24 through v0.28) swept
+a basis's own per-block *shape* — `trend_degree`, `num_harmonics`, and
+their joint interaction — but left stack *depth*,
+`num_trend_blocks`/`num_seasonality_blocks`, fixed at the constructor
+default (2, 2) throughout. v0.28's own "What's next" named this directly:
+"trying a wider range of `num_trend_blocks`/`num_seasonality_blocks`
+combinations remains open." This closes it —
+`run_nbeats_block_count_sweep_comparison`/
+`format_nbeats_block_count_sweep_comparison` in `forecasting/experiment.py`
+and a new `python -m forecasting.cli nbeats-block-count-sweep` command
+sweep every combination of `num_trend_blocks in [1,2,3,4,5]` and
+`num_seasonality_blocks in [1,2,3,4,5]` on each dataset, holding
+`trend_degree`/`num_harmonics` at their shipped defaults throughout — the
+25-cell grid for *depth*, mirroring v0.28's own grid for *shape*.
+
+Same training-cost discipline as every other architecture-changing N-BEATS
+sweep: `NBEATSInterpretableModule.__init__` builds exactly
+`num_trend_blocks + num_seasonality_blocks` blocks, chained by the same
+doubly-residual stacking as every other block count — a real architecture
+change, not a read-time setting, so each of the 25 cells per dataset gets
+its own full, independent fit, single seed (`seed=0`), same convention as
+every other architecture-changing sweep in this file. As a sanity check
+before trusting any new number, the grid's own `(num_trend_blocks=2,
+num_seasonality_blocks=2)` cell — the constructor default this project has
+used in every prior N-BEATS sweep — was confirmed to numerically reproduce
+v0.28's own already-published `(trend_degree=2, num_harmonics=1)` cell
+exactly on `airline` (both build the identical model for the same seed),
+not just assumed from sharing a constructor.
+
+**Full grid, coverage gap (pp) for every (num_trend_blocks,
+num_seasonality_blocks) cell:**
+
+![airline num_trend_blocks x num_seasonality_blocks joint sweep heatmap](results/airline_nbeats_block_count_sweep.png)
+![synthetic num_trend_blocks x num_seasonality_blocks joint sweep heatmap](results/synthetic_nbeats_block_count_sweep.png)
+![temperature num_trend_blocks x num_seasonality_blocks joint sweep heatmap](results/temperature_nbeats_block_count_sweep.png)
+
+| Dataset | Shipped default (2, 2) | Best cell in this grid | Generic N-BEATS (reference) |
+|---|---|---|---|
+| airline | -23.3pp / MAE 36.092 | (3, 1): -10.0pp / MAE 21.152 | -33.3pp / MAE 45.260 |
+| synthetic | **(2, 2): -0.6pp / MAE 1.099** *(shipped default is the grid's own best cell)* | -0.6pp / MAE 1.099 | -31.9pp / MAE 2.240 |
+| temperature | +1.9pp / MAE 1.789 | (5, 2): +0.7pp / MAE 1.749 | +2.3pp / MAE 1.758 |
+
+**The honest answer: depth is a much noisier knob than shape, with no
+clean story on any dataset — a real, reportable result in its own right,
+not a null one dressed up as one:**
+
+- **`airline` — no monotonic or otherwise interpretable pattern by depth at
+  all.** Coverage gap ranges from -10.0pp (`num_trend_blocks=3,
+  num_seasonality_blocks=1`, the grid's best cell) to -36.7pp
+  (`num_trend_blocks=1, num_seasonality_blocks=4`), but adjacent cells
+  swing by as much as 20 points in either direction with no visible trend
+  by row, column, or diagonal — e.g. `num_trend_blocks=2` alone ranges from
+  -16.7pp to -23.3pp as `num_seasonality_blocks` goes 1→5, in no consistent
+  direction. This is qualitatively different from every basis-*shape*
+  result in this README (which found real, reportable directional trends,
+  even when dataset-dependent) — on this small a calibration set, adding
+  structurally-identical redundant blocks to an already-flexible
+  doubly-residual stack looks dominated by single-seed training noise
+  rather than a real, exploitable depth effect. The shipped default (2, 2)
+  is not the best cell here (`(3, 1)` beats it by 13.3pp), but no other
+  cell is a reliable, low-risk substitute either — the honest conclusion is
+  that this grid does not identify a better depth choice worth shipping as
+  a new default.
+- **`synthetic` — the shipped default is, again, this grid's own joint
+  optimum.** `(2, 2)` posts -0.6pp, the best |gap| anywhere in the full
+  25-cell grid, same as it was v0.28's own best *shape* cell. Every other
+  cell is worse, by as little as 3.0pp (`num_trend_blocks=2,
+  num_seasonality_blocks=1`: -5.6pp) and as much as 25.0pp
+  (`num_trend_blocks=1, num_seasonality_blocks=1`: -25.6pp) — depth away
+  from the shipped default costs real coverage here, even though which
+  exact other cell is "second-best" doesn't follow an obvious rule either.
+- **`temperature` — no meaningful movement, same flat pattern as every
+  other N-BEATS basis sweep on this dataset.** The entire 25-cell grid
+  spans a narrow +0.7pp to +3.6pp range — tighter even than the
+  shape-sweep's own narrow range — and the nominal-best cell, `(5, 2)` at
+  +0.7pp, is barely different from the shipped default's +1.9pp. Whatever
+  limits this architecture's accuracy on `temperature` is not fixed by
+  block count any more than it was by basis shape.
+
+**Practical takeaway:** unlike v0.25/v0.26/v0.28's basis-*shape* sweeps,
+which all found real, directionally-interpretable (if dataset-dependent)
+effects, this depth sweep's main finding is that `num_trend_blocks`/
+`num_seasonality_blocks` is a much noisier lever on `airline` specifically
+— no depth choice reliably beats the shipped default by a trustworthy
+margin there — while `synthetic` and `temperature` both reconfirm the
+shipped default (2, 2) is already a safe, near-optimal choice on depth, the
+same conclusion v0.28 reached on shape. Reported as measured rather than
+searching for a cleaner story that isn't there.
+
+5 new tests (248 → 253): the sweep runs every requested cell and reports
+real, bounded numbers for each; the shipped-default combination `(2, 2)`
+is confirmed to numerically match v0.28's own already-published
+`(trend_degree=2, num_harmonics=1)` cell exactly for the same seed (both
+build the identical model), not just assumed from sharing a constructor;
+varying either hyperparameter alone while holding the other fixed is
+confirmed to change MAE (the same independent-fit regression guard every
+other architecture-changing sweep applies); `trend_degree`/`num_harmonics`
+are confirmed to actually be the shipped, horizon-derived defaults rather
+than hard-coded wrong; and the formatted table includes every cell, the
+generic reference line, the shipped-default marker, and the best-cell
+marker. Full suite verified: **253/253 passed.**
+
 ## Adaptive Conformal Inference: does it actually fix the LSTM's under-coverage?
 
 The three LSTM rows above all share a cause: the model's own error grows
@@ -2094,7 +2198,7 @@ forecasting/
                  # --auto-folds]` / `nbeats-basis-sweep [--trend-degrees]`
                  # (v0.25) / `num-harmonics-sweep [--num-harmonics-values]`
                  # (v0.26) / `serve [--host --port --reload]`
-tests/           # 238 tests, including the coverage-tracking statistical checks above
+tests/           # 253 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -2104,7 +2208,7 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 238 tests
+python -m pytest                                    # 253 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -2196,14 +2300,20 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   `trend_degree` sweep pointed); `synthetic` shows the shipped default is
   already at this grid's own joint optimum, with a real penalty for
   raising `trend_degree` without also raising `num_harmonics`; and
-  `temperature` shows no interaction at all. Trying a wider range of
-  `num_trend_blocks`/`num_seasonality_blocks` combinations remains open. A
-  more principled next step than reading an answer off the test set
-  directly would be a held-out-data selection method for
-  `trend_degree`/`num_harmonics` (mirroring `cv-window-select` for ACI's
-  `window`) — not attempted here, and now a real candidate for either
-  this grid's full joint space or just `airline`'s own joint optimum found
-  here.
+  `temperature` shows no interaction at all. ~~Trying a wider range of
+  `num_trend_blocks`/`num_seasonality_blocks` combinations remains open.~~
+  **Done (v0.29):** see "Does stack depth matter, not just basis shape?"
+  above. Real, genuinely different answer from the shape sweeps: depth is
+  a much noisier lever than shape on `airline` (no interpretable pattern,
+  coverage gap swings 20+ points between adjacent cells with no visible
+  trend), while `synthetic` and `temperature` both reconfirm the shipped
+  default `(2, 2)` is already safe and near-optimal on depth too, the same
+  conclusion already reached on shape. A more principled next step than
+  reading an answer off the test set directly would be a held-out-data
+  selection method for `trend_degree`/`num_harmonics` (mirroring
+  `cv-window-select` for ACI's `window`) — not attempted here, and now a
+  real candidate for either this grid's full joint space or just
+  `airline`'s own joint optimum found in v0.28.
 - ~~Extend the window sweep's multi-seed check to `gamma` too (this run only
   tuned `window`, holding `gamma=0.05` fixed throughout — the two
   hyperparameters likely interact).~~ **Done (v0.27):** see "Does gamma

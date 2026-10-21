@@ -703,6 +703,146 @@ def format_online_retraining_comparison(comparison: OnlineRetrainingComparison) 
 
 
 # ---------------------------------------------------------------------------
+# Online retraining cadence sweep (v0.34) -- v0.32's own "What's next" note,
+# left open at the time: does a *finer* retraining cadence than the
+# n_retrains_target=8 default close more of the coverage gap, or has the
+# coarse cadence already captured most of the real benefit? This sweeps
+# `retrain_every` directly (holding the model, seed, gamma, and window
+# fixed, same discipline as `run_window_sweep_comparison`) rather than
+# assuming the answer from the one cadence v0.32 happened to measure.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OnlineRetrainingCadenceSweepResult:
+    retrain_every: int  # smaller = more frequent retraining
+    n_retrains: int  # how many times this cadence actually retrained over the test window
+    adaptive: dict  # evaluate_adaptive_coverage() output for this cadence
+
+
+@dataclass
+class OnlineRetrainingCadenceSweep:
+    dataset: str
+    alpha: float
+    gamma: float
+    window: int | None  # None = unbounded growing buffer (shared by every cadence in the sweep)
+    n_test: int
+    static: dict  # evaluate_coverage() output for static split conformal (reference line)
+    frozen_sliding: dict  # evaluate_adaptive_coverage() output: sliding-pool ACI, model frozen (reference line)
+    results: list[OnlineRetrainingCadenceSweepResult]  # one per swept retrain_every, in the order given
+
+
+def run_online_retraining_cadence_sweep(
+    dataset: str,
+    retrain_every_candidates: list[int],
+    alpha: float = 0.1,
+    gamma: float = 0.05,
+    window: int | None = None,
+    lookback: int | None = None,
+    period: int | None = None,
+    seed: int = 0,
+) -> OnlineRetrainingCadenceSweep:
+    """Sweep `retrain_every` for `RetrainingSlidingWindowAdaptiveConformalForecaster`
+    on one dataset, holding the model architecture/seed/gamma/window fixed
+    across every candidate -- the only thing that differs between rows is how
+    often the point model is refit.
+
+    Unlike `run_window_sweep_comparison` (which fits one model once and
+    reuses it, since `window` has no effect on fitting), `retrain_every`
+    genuinely changes what each run's model sees and when, so each candidate
+    still needs its own initial fit + its own sequence of retrains -- there
+    is no way to share work across cadences the way the window sweep does.
+    `static` and `frozen_sliding` *are* shared across the whole sweep (they
+    don't depend on `retrain_every` at all), computed once as reference
+    lines, same reasoning as every other sweep in this module.
+
+    Honest affordability constraint, same one `RetrainingSlidingWindowAdaptiveConformalForecaster`'s
+    own docstring already discloses: `retrain_every=1` (the literal
+    every-step case) costs one full from-scratch LSTM fit per test-set step.
+    That's cheap on `airline` (30 test steps) and still affordable on
+    `synthetic` (160 steps), but far too slow on `temperature` (730 steps,
+    each fit itself slower since the training set is much larger) in this
+    CPU-constrained sandbox -- callers building the README benchmark choose
+    per-dataset candidate lists accordingly rather than this function
+    silently refusing a slow value.
+    """
+    for retrain_every in retrain_every_candidates:
+        if retrain_every <= 0:
+            raise ValueError("every retrain_every candidate must be a positive integer")
+    if not retrain_every_candidates:
+        raise ValueError("retrain_every_candidates must be non-empty")
+
+    X_train, y_train, X_cal, y_cal, X_test, y_test, normalizer, period = _prepare_split(dataset, lookback, period)
+    n_test = len(X_test)
+
+    static_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    static = SplitConformalForecaster(static_model, alpha=alpha).fit(X_train, y_train, X_cal, y_cal)
+    static_result = evaluate_coverage(static.predict(X_test), y_test)
+
+    frozen_model = DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+    frozen = SlidingWindowAdaptiveConformalForecaster(frozen_model, alpha=alpha, gamma=gamma, window=window).fit(
+        X_train, y_train, X_cal, y_cal
+    )
+    frozen_pred = frozen.predict_sequential(X_test, y_test.reshape(-1))
+    frozen_result = evaluate_adaptive_coverage(frozen_pred, y_test)
+
+    def _model_factory():
+        return DeltaWrapper(LSTMForecaster(hidden_size=32, num_layers=1, seed=seed))
+
+    results = []
+    for retrain_every in retrain_every_candidates:
+        retraining = RetrainingSlidingWindowAdaptiveConformalForecaster(
+            _model_factory, alpha=alpha, gamma=gamma, window=window, retrain_every=retrain_every
+        ).fit(X_train, y_train, X_cal, y_cal)
+        pred = retraining.predict_sequential(X_test, y_test.reshape(-1))
+        results.append(
+            OnlineRetrainingCadenceSweepResult(
+                retrain_every=retrain_every,
+                n_retrains=pred.n_retrains,
+                adaptive=evaluate_adaptive_coverage(pred, y_test),
+            )
+        )
+
+    return OnlineRetrainingCadenceSweep(
+        dataset=dataset,
+        alpha=alpha,
+        gamma=gamma,
+        window=window,
+        n_test=n_test,
+        static=static_result,
+        frozen_sliding=frozen_result,
+        results=results,
+    )
+
+
+def format_online_retraining_cadence_sweep(sweep: OnlineRetrainingCadenceSweep) -> str:
+    nominal_pct = int(round((1 - sweep.alpha) * 100))
+    window_desc = "unbounded (growing buffer)" if sweep.window is None else f"{sweep.window} (sliding)"
+    s, f = sweep.static, sweep.frozen_sliding
+    lines = [
+        f"### {sweep.dataset}: does a finer retraining cadence help further than v0.32's "
+        f"coarse default, or has it already captured most of the benefit? "
+        f"(LSTM (delta), nominal {nominal_pct}%, gamma={sweep.gamma}, window={window_desc}, "
+        f"{sweep.n_test} test steps)",
+        "",
+        "| Cadence | retrain_every | # retrains | Empirical coverage | Coverage gap | Mean interval width |",
+        "|---|---|---|---|---|---|",
+        f"| *static split conformal (reference)* | - | 0 | {s['empirical_coverage'] * 100:.1f}% | "
+        f"{s['coverage_gap'] * 100:+.1f}pp | {s['mean_interval_width']:.3f} |",
+        f"| *sliding-pool ACI, model frozen (reference)* | - | 0 | {f['empirical_coverage'] * 100:.1f}% | "
+        f"{f['coverage_gap'] * 100:+.1f}pp | {f['mean_interval_width']:.3f} |",
+    ]
+    for r in sweep.results:
+        a = r.adaptive
+        label = "every step" if r.retrain_every == 1 else f"every {r.retrain_every} steps"
+        lines.append(
+            f"| {label} | {r.retrain_every} | {r.n_retrains} | {a['empirical_coverage'] * 100:.1f}% | "
+            f"{a['coverage_gap'] * 100:+.1f}pp | {a['mean_interval_width']:.3f} |"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # EnbPI (v0.20) -- the README's/`forecasting.conformal`'s own "What's next"
 # item: a structurally different answer to the exchangeability problem than
 # ACI. Where ACI keeps one fitted model and adapts the significance level

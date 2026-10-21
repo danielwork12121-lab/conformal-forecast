@@ -30,6 +30,12 @@ initial fit (both under sliding-pool ACI):
 
     python -m forecasting.cli online-retraining --dataset airline --plot results/airline_online_retraining.png
 
+Sweep online retraining's own `retrain_every` cadence to see whether a finer
+cadence than v0.32's shipped default closes more of the coverage gap, or
+whether the coarse default already captured most of the benefit:
+
+    python -m forecasting.cli online-retraining-cadence-sweep --dataset airline --retrain-every-candidates 15,5,3,1 --plot results/airline_online_retraining_cadence_sweep.png
+
 Sweep the sliding-pool ACI's `window` size and see how coverage gap responds
 (a bounded window can beat the unbounded growing buffer -- see the README):
 
@@ -176,6 +182,7 @@ from forecasting.experiment import (
     format_nbeats_block_count_sweep_comparison,
     format_nbeats_joint_basis_sweep_comparison,
     format_num_harmonics_sweep_comparison,
+    format_online_retraining_cadence_sweep,
     format_online_retraining_comparison,
     format_results_table,
     format_sliding_window_comparison,
@@ -194,6 +201,7 @@ from forecasting.experiment import (
     run_nbeats_block_count_sweep_comparison,
     run_nbeats_joint_basis_sweep_comparison,
     run_num_harmonics_sweep_comparison,
+    run_online_retraining_cadence_sweep,
     run_online_retraining_comparison,
     run_sliding_window_comparison,
     run_window_gamma_sweep_comparison,
@@ -315,6 +323,50 @@ def _plot_online_retraining(dataset: str, comparison, path: str) -> None:
         fontsize=10,
     )
     ax1.legend(loc="upper left")
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def _plot_online_retraining_cadence_sweep(dataset: str, sweep, path: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    retrain_every = [r.retrain_every for r in sweep.results]
+    gaps = [r.adaptive["coverage_gap"] * 100 for r in sweep.results]
+    # Plot against an evenly-spaced index in sweep order (coarsest -> finest),
+    # not the raw retrain_every value, so unevenly-spaced candidates (e.g.
+    # temperature's 182/91/45/22) don't visually overstate how "far apart"
+    # they are -- same reasoning _plot_window_sweep already uses for
+    # "unbounded".
+    x = range(len(retrain_every))
+    labels = ["every step" if r == 1 else str(r) for r in retrain_every]
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(x, gaps, color="#d62728", linewidth=1.5, marker="o", label="retrained + sliding-pool ACI")
+    ax.axhline(
+        sweep.frozen_sliding["coverage_gap"] * 100,
+        color="#2ca02c",
+        linewidth=1.2,
+        linestyle="--",
+        label="frozen model + sliding-pool ACI (v0.27's variant)",
+    )
+    ax.axhline(
+        sweep.static["coverage_gap"] * 100,
+        color="#888888",
+        linewidth=1.0,
+        linestyle=":",
+        label="static split conformal",
+    )
+    ax.axhline(0.0, color="#222222", linewidth=0.8)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels)
+    ax.set_xlabel("retrain_every (steps between refits; coarser -> finer, left to right)")
+    ax.set_ylabel("coverage gap (pp, closer to 0 is better)")
+    ax.set_title(f"{dataset}: does a finer online-retraining cadence close more of the coverage gap?")
+    ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=140)
     plt.close(fig)
@@ -876,6 +928,31 @@ def main() -> None:
     online_retraining.add_argument("--plot", type=str, default=None, help="save a plot of the residual pool size, marking each retrain, over the test window")
     online_retraining.add_argument("--seed", type=int, default=0)
 
+    retraining_cadence_sweep = sub.add_parser(
+        "online-retraining-cadence-sweep",
+        help="sweep retrain_every for online retraining and compare coverage gap across cadences "
+        "(v0.32's own 'What's next' follow-up: does a finer cadence than the shipped default help further?)",
+    )
+    retraining_cadence_sweep.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    retraining_cadence_sweep.add_argument("--alpha", type=float, default=0.1)
+    retraining_cadence_sweep.add_argument("--gamma", type=float, default=0.05, help="ACI step size")
+    retraining_cadence_sweep.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        help="max residual-pool size (default: unbounded growing buffer)",
+    )
+    retraining_cadence_sweep.add_argument(
+        "--retrain-every-candidates",
+        type=str,
+        default="40,20,10,5,1",
+        help="comma-separated list of retrain_every values to sweep, coarsest to finest "
+        "(pick values affordable for the dataset's own test-window size -- retrain_every=1 on "
+        "temperature's 730-step test window is far too slow in a CPU-constrained sandbox)",
+    )
+    retraining_cadence_sweep.add_argument("--plot", type=str, default=None, help="save a plot of coverage gap vs. cadence")
+    retraining_cadence_sweep.add_argument("--seed", type=int, default=0)
+
     enbpi = sub.add_parser(
         "enbpi",
         help="compare static split conformal, fixed-pool ACI, and EnbPI (bootstrap-ensemble conformal) on the LSTM model",
@@ -1237,6 +1314,21 @@ def main() -> None:
         print()
         if args.plot:
             _plot_online_retraining(args.dataset, comparison, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "online-retraining-cadence-sweep":
+        candidates = [int(v) for v in args.retrain_every_candidates.split(",")]
+        sweep = run_online_retraining_cadence_sweep(
+            args.dataset,
+            candidates,
+            alpha=args.alpha,
+            gamma=args.gamma,
+            window=args.window,
+            seed=args.seed,
+        )
+        print(format_online_retraining_cadence_sweep(sweep))
+        print()
+        if args.plot:
+            _plot_online_retraining_cadence_sweep(args.dataset, sweep, args.plot)
             print(f"Saved plot to {args.plot}")
     elif args.command == "enbpi":
         comparison = run_enbpi_comparison(

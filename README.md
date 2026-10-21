@@ -1669,6 +1669,97 @@ default, both remain independently opt-in exactly as before, and this
 finding only closes the open question of whether to recommend combining
 them (answer: no).
 
+## Is the CV window pick seed-robust? (v0.31)
+
+Every result in the three sections above — the original CV window
+selection (v0.6), `fold_scheme` (v0.7), `auto_folds` (v0.8), and whether
+they compound (v0.9) — was measured at exactly one model training seed
+(`seed=0`). This run's own "What's next" item named the gap directly:
+does `cv-window-select`'s pick actually depend on the calibration data,
+or could it just as easily depend on which random initialization the one
+base LSTM happened to get?
+
+`run_cv_window_selection_seed_robustness` (`forecasting/experiment.py`)
+answers this by reusing the already-tested `run_cv_window_selection`
+unchanged — one full, independent re-run per seed (a different seed
+means a genuinely different fitted model here, not a different reading
+of an existing fit, so unlike the `window`/`gamma` sweeps above there's
+no fit to share across seeds) — and reporting whether every seed's fold
+metric landed on the same window:
+
+    python -m forecasting.cli cv-window-select-seed-check --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --seeds 0,1,2,3,4 --plot results/airline_cv_window_select_seed_check.png
+
+**Real, measured, and not a flattering result: none of the three bundled
+datasets is seed-robust.**
+
+### airline (5 seeds: 0, 1, 2, 3, 4)
+
+| Seed | Selected window | Real test gap |
+|---|---|---|
+| 0 | 5 | -6.7pp |
+| 1 | 20 | -16.7pp |
+| 2 | 7 | -16.7pp |
+| 3 | unbounded | -10.0pp |
+| 4 | 20 | +0.0pp |
+
+4 different windows selected across 5 seeds, and the real-world
+consequence is large and inconsistent: the same selection *method*, run
+on the exact same calibration data, lands anywhere from a perfectly
+calibrated +0.0pp gap (seed 4) to a -16.7pp miss (seeds 1 and 2),
+entirely depending on the base LSTM's random initialization.
+
+### synthetic (5 seeds: 0, 1, 2, 3, 4)
+
+| Seed | Selected window | Real test gap |
+|---|---|---|
+| 0 | 15 | +0.6pp |
+| 1 | unbounded | -1.3pp |
+| 2 | unbounded | -1.9pp |
+| 3 | 30 | +0.6pp |
+| 4 | unbounded | -1.9pp |
+
+3 different windows selected; the real-world consequence is smaller than
+`airline`'s but still real (+0.6pp to -1.9pp) — not a tie.
+
+### temperature (5 seeds: 0, 1, 2, 3, 4)
+
+| Seed | Selected window | Real test gap |
+|---|---|---|
+| 0 | 30 | +0.1pp |
+| 1 | 20 | +0.1pp |
+| 2 | 20 | +0.1pp |
+| 3 | 20 | +0.1pp |
+| 4 | 20 | +0.1pp |
+
+Only 2 different windows selected (20 and 30), and the one genuine bright
+spot: every seed's real test-set gap lands at the same +0.1pp regardless
+of which of those two windows got picked. On this dataset — the one with
+by far the largest calibration set (730 windows) — the selection isn't
+literally seed-robust, but it is *practically* seed-robust: whichever
+window a given seed happens to land on, the real-world outcome barely
+moves.
+
+**Honest takeaway:** calibration-set size is again the dominant factor,
+the same conclusion this repo's own `auto_folds`/`fold_scheme` findings
+and v0.30's basis-hyperparameter CV selection already reached from a
+different angle — but this time the lesson is sharper: `airline`'s small
+calibration set (28 windows) doesn't just make the fold metric noisy
+enough to tie-break badly once (the v0.30 finding); it makes the entire
+selected window swing with the training seed, with real-world
+consequences as large as 16.7 percentage points of coverage gap. Every
+single-seed CV-window-selection result reported earlier in this README
+(v0.6 through v0.9) was real and reproducible *for that seed*, but should
+be read as one sample from a genuinely noisy distribution on the smaller
+datasets, not as the method's one true answer — exactly the caveat this
+section's own measurement now makes concrete rather than hypothetical.
+
+10 new tests (`tests/test_cv_window_selection_seed_robustness.py`,
+264→274): a pure-logic layer for the de-duplication helper
+(`_unique_in_order`) plus real-data integration tests, including a
+single-seed cross-check that this function's own numbers match
+`run_cv_window_selection`'s already-tested output exactly when only one
+seed is given.
+
 ## EnbPI (v0.20): a structurally different answer to the same problem
 
 Everything above — fixed-pool ACI, sliding/growing-pool ACI, and all of the
@@ -2294,8 +2385,9 @@ forecasting/
                  # `auto-window [...]` / `cv-window-select [... --fold-scheme
                  # --auto-folds]` / `nbeats-basis-sweep [--trend-degrees]`
                  # (v0.25) / `num-harmonics-sweep [--num-harmonics-values]`
-                 # (v0.26) / `serve [--host --port --reload]`
-tests/           # 264 tests, including the coverage-tracking statistical checks above
+                 # (v0.26) / `cv-window-select-seed-check [--seeds]` (v0.31)
+                 # / `serve [--host --port --reload]`
+tests/           # 274 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -2305,7 +2397,7 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 264 tests
+python -m pytest                                    # 274 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -2317,6 +2409,7 @@ python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10
 python -m forecasting.cli cv-window-select --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --fold-scheme sliding --plot results/airline_cv_window_select_sliding.png
 python -m forecasting.cli cv-window-select --dataset temperature --candidates 5,7,10,15,20,30,50,unbounded --auto-folds --plot results/temperature_cv_window_select_auto.png
 python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,10,15,20,30,50,unbounded --fold-scheme sliding --auto-folds --plot results/synthetic_cv_window_select_sliding_auto.png
+python -m forecasting.cli cv-window-select-seed-check --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --seeds 0,1,2,3,4 --plot results/airline_cv_window_select_seed_check.png  # v0.31
 ```
 
 ## What's next
@@ -2434,10 +2527,24 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   answered: whether `auto_folds` holds up with more seeds before flipping
   the default (re-checked at 20 seeds — it doesn't hold up as a strict
   "never loses," so the default stays `False`), and whether combining it
-  with `fold_scheme="sliding"` helps further (it doesn't, see above). The
+  with `fold_scheme="sliding"` helps further (it doesn't, see above). ~~The
   natural remaining follow-up in this vein would be checking whether
   candidate window choice (`--candidates`) itself needs a similar
-  seed-robustness re-check, or moving on to one of the items below.
+  seed-robustness re-check.~~ **Done (v0.31):** see "Is the CV window pick
+  seed-robust?" above. Real, not-flattering answer: no dataset is
+  seed-robust. `airline`'s small calibration set swings across 4 different
+  selected windows over 5 seeds with real-world consequences as large as
+  16.7pp of coverage gap; `synthetic` swings across 3 windows with a
+  smaller but still real consequence; `temperature` (the largest
+  calibration set) swings across only 2 windows and — the one genuine
+  bright spot — both land on the same +0.1pp real test-set outcome
+  regardless. The lesson already drawn from `auto_folds`/`fold_scheme`
+  and v0.30's own basis-hyperparameter CV selection — calibration-set size
+  drives how trustworthy this kind of held-out selection is — now has its
+  sharpest confirmation yet: on the smaller datasets, every single-seed CV
+  window-selection number reported earlier in this README is real and
+  reproducible for that one seed, but should be read as one draw from a
+  genuinely noisy distribution, not the method's one true answer.
 - The "dataset handle" endpoint proposed here is now shipped (v0.14):
   `POST /series` / `GET /series/{id}` / `DELETE /series/{id}`, plus
   opportunistic registration from `/forecast` itself — see the API

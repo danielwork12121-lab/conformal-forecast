@@ -74,6 +74,13 @@ actually select better windows:
 
     python -m forecasting.cli cv-window-select --dataset temperature --candidates 5,7,10,15,20,30,50,unbounded --auto-folds --plot results/temperature_cv_window_select_auto.png
 
+Check whether `cv-window-select`'s own pick holds up across different model
+training seeds, rather than only ever having been checked at seed=0 -- each
+seed is a fully independent re-run (a different seed means a different base
+LSTM, not just a different reading of an existing one):
+
+    python -m forecasting.cli cv-window-select-seed-check --dataset airline --candidates 5,7,10,15,20,30,50,unbounded --seeds 0,1,2,3,4 --plot results/airline_cv_window_select_seed_check.png
+
 Compare static split conformal, fixed-pool ACI, and EnbPI (a bootstrap
 ensemble of independently-trained LSTMs, whose online adaptivity comes from
 sliding each member's out-of-bag residuals forward, instead of adapting a
@@ -154,6 +161,7 @@ from forecasting.experiment import (
     format_adaptive_comparison,
     format_auto_window_selection,
     format_cv_window_selection,
+    format_cv_window_selection_seed_robustness,
     format_enbpi_comparison,
     format_enbpi_cv_window_selection,
     format_enbpi_window_sweep_comparison,
@@ -169,6 +177,7 @@ from forecasting.experiment import (
     run_adaptive_comparison,
     run_auto_window_selection,
     run_cv_window_selection,
+    run_cv_window_selection_seed_robustness,
     run_enbpi_comparison,
     run_enbpi_cv_window_selection,
     run_enbpi_window_sweep_comparison,
@@ -682,6 +691,41 @@ def _plot_cv_window_selection(dataset: str, result, path: str) -> None:
     plt.close(fig)
 
 
+def _plot_cv_window_selection_seed_robustness(dataset: str, result, path: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    windows_order = [w for w in result.windows]
+    labels = ["unbounded" if w is None else str(w) for w in windows_order]
+    x = list(range(len(result.per_seed)))
+    picked_idx = [windows_order.index(c.selected_window) for c in result.per_seed]
+    test_gaps = [c.selected_test_gap * 100 for c in result.per_seed]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 6.5), sharex=True)
+    ax1.scatter(x, picked_idx, color="#d62728", marker="D", s=60)
+    ax1.set_yticks(range(len(windows_order)))
+    ax1.set_yticklabels(labels)
+    ax1.set_ylabel("window picked\nby fold metric")
+    ax1.set_title(
+        f"{dataset}: is cv-window-select's pick seed-robust? ({len(result.per_seed)} seeds)\n"
+        + ("robust: every seed picked the same window" if result.is_window_robust else "NOT robust: picks differ by seed"),
+        fontsize=10,
+    )
+
+    ax2.axhline(0.0, color="#222222", linewidth=0.8)
+    ax2.plot(x, test_gaps, color="#2ca02c", linewidth=1.5, marker="s")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels([str(c.seed) for c in result.per_seed])
+    ax2.set_xlabel("model training seed")
+    ax2.set_ylabel("real test-set gap (pp)\nfor that seed's pick")
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
 def _plot_enbpi_cv_window_selection(dataset: str, result, path: str) -> None:
     import matplotlib
 
@@ -1016,6 +1060,32 @@ def main() -> None:
     cv.add_argument("--plot", type=str, default=None, help="save a plot comparing mean fold |gap| vs. real test-set gap by window")
     cv.add_argument("--seed", type=int, default=0)
 
+    cv_seed = sub.add_parser(
+        "cv-window-select-seed-check",
+        help="does cv-window-select's own pick stay the same across different model training seeds?",
+    )
+    cv_seed.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    cv_seed.add_argument("--alpha", type=float, default=0.1)
+    cv_seed.add_argument("--gamma", type=float, default=0.05, help="ACI step size")
+    cv_seed.add_argument(
+        "--candidates",
+        type=str,
+        default="5,7,10,15,20,30,50,unbounded",
+        help="comma-separated list of candidate window sizes to select from; include 'unbounded' for the growing buffer",
+    )
+    cv_seed.add_argument("--n-folds", type=int, default=4)
+    cv_seed.add_argument("--min-initial-frac", type=float, default=0.2)
+    cv_seed.add_argument("--min-fold-frac", type=float, default=0.1)
+    cv_seed.add_argument("--fold-scheme", choices=["expanding", "sliding"], default="expanding")
+    cv_seed.add_argument("--auto-folds", action="store_true")
+    cv_seed.add_argument(
+        "--seeds",
+        type=str,
+        default="0,1,2,3,4",
+        help="comma-separated list of model training seeds to independently re-run cv-window-select at",
+    )
+    cv_seed.add_argument("--plot", type=str, default=None, help="save a plot of each seed's selected window vs. its real test-set gap")
+
     enbpi_cv = sub.add_parser(
         "enbpi-cv-window-select",
         help="select EnbPI's window size via rolling-origin cross-validation over the calibration set (mirrors cv-window-select for ACI)",
@@ -1240,6 +1310,26 @@ def main() -> None:
         print()
         if args.plot:
             _plot_cv_window_selection(args.dataset, result, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "cv-window-select-seed-check":
+        candidates = [None if w.strip().lower() == "unbounded" else int(w) for w in args.candidates.split(",")]
+        seeds = [int(s) for s in args.seeds.split(",")]
+        result = run_cv_window_selection_seed_robustness(
+            args.dataset,
+            windows=candidates,
+            seeds=seeds,
+            alpha=args.alpha,
+            gamma=args.gamma,
+            n_folds=args.n_folds,
+            min_initial_frac=args.min_initial_frac,
+            min_fold_frac=args.min_fold_frac,
+            fold_scheme=args.fold_scheme,
+            auto_folds=args.auto_folds,
+        )
+        print(format_cv_window_selection_seed_robustness(result))
+        print()
+        if args.plot:
+            _plot_cv_window_selection_seed_robustness(args.dataset, result, args.plot)
             print(f"Saved plot to {args.plot}")
     elif args.command == "enbpi-cv-window-select":
         candidates = [None if w.strip().lower() == "unbounded" else int(w) for w in args.candidates.split(",")]

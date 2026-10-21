@@ -1760,6 +1760,77 @@ single-seed cross-check that this function's own numbers match
 `run_cv_window_selection`'s already-tested output exactly when only one
 seed is given.
 
+## Does retraining the model online help, not just adapting the conformal layer? (v0.32)
+
+Every ACI/EnbPI variant above (sliding-pool, window selection, EnbPI's own
+window selection) keeps the **point model** frozen at its initial fit for
+the entire test window — the LSTM that predicted airline passengers for
+January 1960 is the exact same LSTM, with the exact same weights, used for
+December 1960 too. Only the *conformal calibration* layer wrapped around it
+adapts online. This was this README's longest-open "What's next" item:
+what if the model itself also kept learning from newly-revealed test data?
+
+`RetrainingSlidingWindowAdaptiveConformalForecaster` (`forecasting/adaptive.py`)
+answers this directly: on top of the same sliding residual pool the v0.27
+variant already uses, it periodically refits a **fresh** LSTM instance
+(never warm-started from the previous fit's weights, so each refit is the
+same kind of optimization as the very first one — see the class's own
+docstring for why) from everything revealed so far: the original
+train+calibration windows plus every test-set window whose true value is
+already known at that point.
+
+**An honest, disclosed scope choice:** retraining a from-scratch neural
+model at *every* test step would be correct but far too slow for
+`temperature`'s ~650-point test window in a CPU-constrained sandbox, and
+most of those retrains would happen on an almost-unchanged training set
+(one extra point) for no measurable benefit anyway. `retrain_every` is
+instead resolved so roughly 8 retrains happen over the whole test window
+regardless of the dataset's size (`max(1, n_test // n_retrains_target)`) —
+coarse-grained online learning, not continuous, and said so plainly rather
+than quietly approximated as if it were the real thing.
+
+**Measured, not assumed, on all three datasets** (same LSTM (delta), same
+split, same `window=None`/unbounded pool as the v0.27 sliding-pool
+baseline, so the only variable is whether the model itself retrains):
+
+| Dataset | retrain_every (resolved) | # retrains | Frozen+ACI coverage | Retrained+ACI coverage | Frozen+ACI width | Retrained+ACI width |
+|---|---|---|---|---|---|---|
+| airline | 3 | 9 | 80.0% (-10.0pp) | **93.3% (+3.3pp)** | 5.918 | **3.353** |
+| synthetic | 20 | 7 | 86.9% (-3.1pp) | **89.4% (-0.6pp)** | 0.803 | **0.593** |
+| temperature | 91 | 8 | 90.0% (+0.0pp) | 90.0% (+0.0pp) | 1.785 | 1.803 |
+
+**Honest answer: retraining helps, sometimes substantially, and never
+measurably hurts — but the size of the win tracks the same
+"calibration/training-set size" story this README has told repeatedly
+(v0.6 through v0.9, v0.30, v0.31), not a uniform improvement.** On
+`airline` (the smallest, most data-starved dataset here), letting the
+model relearn from the test window it's actually being evaluated on
+closes most of the coverage gap the frozen model's sliding pool was left
+to paper over on its own (80.0% → 93.3%) *and* produces a tighter interval
+doing it (5.918 → 3.353) — a genuine win on both axes, not a coverage
+improvement bought with a wider, less useful interval. `synthetic` shows
+the same direction, more modestly (86.9% → 89.4%, interval 0.803 → 0.593).
+`temperature` — the one dataset with enough data (~1,950 training windows)
+for the LSTM to already fit the series well without needing to adapt
+further — shows no measurable difference either way (90.0% coverage,
+±0.02 on interval width), consistent with every other automated-adaptation
+feature in this README landing as a wash on this particular dataset.
+
+A `python -m forecasting.cli online-retraining --dataset <name> --plot ...`
+command and a matching pool-size-over-time plot (marking each retrain with
+a dotted vertical line) are available, mirroring every other ACI variant's
+own CLI command.
+
+10 new tests (`tests/test_online_retraining.py`,
+`tests/test_online_retraining_experiment.py`, 274→284): hand-verified
+retrain cadence and a direct no-future-leakage check (a retrain at step
+`t` must use `y_test[0:t]` only, never `y_test[t]` itself — checked by
+hand-computing the exact expected mean a trivial fixture model would
+produce), a regression test proving `retrain_every=None` reduces this
+class to byte-identical behavior with the already-shipped frozen
+sliding-pool variant, and real-data integration tests pinning down the
+resolved retrain cadence and pool mechanics on the actual airline dataset.
+
 ## EnbPI (v0.20): a structurally different answer to the same problem
 
 Everything above — fixed-pool ACI, sliding/growing-pool ACI, and all of the
@@ -2386,8 +2457,9 @@ forecasting/
                  # --auto-folds]` / `nbeats-basis-sweep [--trend-degrees]`
                  # (v0.25) / `num-harmonics-sweep [--num-harmonics-values]`
                  # (v0.26) / `cv-window-select-seed-check [--seeds]` (v0.31)
+                 # / `online-retraining [--retrain-every --n-retrains-target]` (v0.32)
                  # / `serve [--host --port --reload]`
-tests/           # 274 tests, including the coverage-tracking statistical checks above
+tests/           # 284 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -2397,11 +2469,12 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 274 tests
+python -m pytest                                    # 284 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
 python -m forecasting.cli sliding-window --dataset airline --plot results/airline_sliding_window.png  # + sliding-pool ACI
+python -m forecasting.cli online-retraining --dataset airline --plot results/airline_online_retraining.png  # + periodic model retraining (v0.32)
 python -m forecasting.cli enbpi --dataset airline --n-bootstrap 20 --window 10 --plot results/airline_enbpi.png  # + EnbPI
 python -m forecasting.cli window-sweep --dataset airline --windows 5,7,10,15,20,30,50,unbounded --plot results/airline_window_sweep.png
 python -m forecasting.cli auto-window --dataset synthetic --candidates 5,7,10,15,20,30,50,unbounded --plot results/synthetic_auto_window.png
@@ -2414,9 +2487,22 @@ python -m forecasting.cli cv-window-select-seed-check --dataset airline --candid
 
 ## What's next
 
-- Apply the sliding/growing-pool idea to a model that *retrains* as new data
-  arrives, not just one that's fit once upfront — right now the LSTM itself
-  is frozen through the whole test window; only the conformal pool adapts.
+- ~~Apply the sliding/growing-pool idea to a model that *retrains* as new
+  data arrives, not just one that's fit once upfront — right now the LSTM
+  itself is frozen through the whole test window; only the conformal pool
+  adapts.~~ **Done (v0.32):** see "Does retraining the model online help,
+  not just adapting the conformal layer?" above. Real, measured answer: yes,
+  sometimes substantially (airline: 80.0%→93.3% coverage *and* a narrower
+  interval; synthetic: a smaller version of the same pattern), and never
+  measurably worse — but temperature (already data-rich enough that the
+  frozen model has little room to improve) shows no difference either way,
+  the same "calibration/training-set size is what actually drives these
+  results" lesson this README keeps reconfirming from different angles.
+  A natural follow-up this run did not attempt: whether a *continuous*
+  (every-step) retraining cadence, if made affordable (e.g. a cheaper
+  model family, or a smaller/faster-converging architecture), would widen
+  this gap further, or whether the coarse 8-retrains-per-run cadence used
+  here is already capturing most of the real benefit.
 - ~~EnbPI (Xu & Xie, 2021), a different time-series-specific conformal
   variant based on a bootstrap ensemble rather than a single model +
   adapting alpha~~ **Done (v0.20)** — see the dedicated section above.

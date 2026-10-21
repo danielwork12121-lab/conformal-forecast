@@ -49,6 +49,15 @@ This module ships two variants:
   to remove the fixed-pool ceiling responsible for the airline shortfall --
   see `forecasting/experiment.py`'s `run_sliding_window_comparison` and the
   README for whether it actually does, measured on real data, not assumed.
+- `RetrainingSlidingWindowAdaptiveConformalForecaster` (new) -- every
+  variant above keeps the point model frozen at its initial fit for the
+  entire test window; only the conformal layer adapts. This variant
+  periodically *retrains* the point model itself from a growing history
+  (original train+calibration windows plus every test-set window whose
+  true value has been revealed so far), on top of the same sliding
+  residual pool. See `forecasting/experiment.py`'s
+  `run_online_retraining_comparison` and the README for whether letting
+  the model itself learn online actually helps, measured on real data.
 
 This module ships `evaluate_adaptive_coverage`, matching the "don't trust
 the guarantee, measure it" discipline of `forecasting/conformal.py`.
@@ -80,6 +89,12 @@ class AdaptiveConformalPrediction:
 @dataclass
 class SlidingWindowAdaptivePrediction(AdaptiveConformalPrediction):
     pool_size: np.ndarray = None  # (n,) -- size of the residual pool used *at* each step
+
+
+@dataclass
+class RetrainingSlidingWindowAdaptivePrediction(SlidingWindowAdaptivePrediction):
+    n_retrains: int = 0  # how many times the point model was actually refit during this test window
+    retrained_at_steps: np.ndarray = None  # (n_retrains,) -- which test-set step indices triggered a refit
 
 
 class AdaptiveConformalForecaster:
@@ -279,6 +294,163 @@ class SlidingWindowAdaptiveConformalForecaster(AdaptiveConformalForecaster):
             gamma=self.gamma,
             errs=errs,
             pool_size=pool_sizes,
+        )
+
+
+class RetrainingSlidingWindowAdaptiveConformalForecaster(SlidingWindowAdaptiveConformalForecaster):
+    """ACI whose point *model* is periodically retrained online, on top of
+    the sliding-pool mechanism `SlidingWindowAdaptiveConformalForecaster`
+    already provides for the residual pool.
+
+    This is the README's long-open "What's next" item: every ACI/EnbPI
+    variant shipped so far adapts *the calibration* to a model that stays
+    frozen at its initial fit for the entire test window (the LSTM that
+    predicted January 1960's airline passengers is the exact same LSTM,
+    with the exact same weights, used for every test step through
+    December 1960). This class instead lets the *model itself* keep
+    learning from newly-revealed test-set truth, not just the conformal
+    layer wrapped around it.
+
+    Honest scope limitation, stated plainly rather than hidden: retraining
+    a from-scratch neural model (Adam + early stopping, up to
+    `max_epochs` epochs) at *every* test step would be correct but far too
+    slow to run on `temperature`'s ~650-point test window in this
+    CPU-constrained sandbox, and would also mean most "retrains" happen on
+    an almost-unchanged training set (one extra point) for no measurable
+    benefit. `retrain_every` instead retrains periodically -- a real,
+    honest design trade-off (coarser-grained online learning, not
+    continuous), not a disguised version of the frozen-model case.
+    `retrain_every=1` *is* the literal "retrain at every step" case for a
+    dataset/budget where that's actually affordable (used by the test
+    suite's small synthetic fixtures); real benchmark runs pick a coarser
+    value (see `forecasting/experiment.py::run_online_retraining_comparison`).
+
+    `model_factory` -- a zero-argument callable returning a *fresh*,
+    unfitted model instance (e.g. `lambda: DeltaWrapper(LSTMForecaster(seed=0))`)
+    -- is required (rather than accepting an already-fitted model instance,
+    as every other class in this module does) because retraining a from-
+    scratch model means constructing a brand new one each time, not
+    calling `.fit()' again on an object that has already-trained weights
+    sitting in it as a (non-guaranteed) starting point; a fresh instance
+    per retrain keeps every retrain's optimization identical in kind to
+    the very first fit, so "did retraining help" isn't entangled with "did
+    warm-starting from old weights help instead."
+
+    Ordering per step, same strictness as the parent class: compute this
+    step's interval from the model/pool *as they stood before this step*,
+    score it against the true y, fold the residual into the pool, and only
+    *after* scoring does a newly-revealed y become eligible to retrain on
+    (so a retrain at step t uses y_test[0:t], never y_test[t] itself).
+    """
+
+    def __init__(
+        self,
+        model_factory,
+        alpha: float = 0.1,
+        gamma: float = 0.05,
+        window: int | None = None,
+        retrain_every: int | None = None,
+    ):
+        if retrain_every is not None and retrain_every <= 0:
+            raise ValueError("retrain_every must be a positive integer, or None to disable retraining entirely")
+        self.model_factory = model_factory
+        self.retrain_every = retrain_every
+        self.n_retrains = 0
+        self._X_history: np.ndarray | None = None
+        self._y_history: np.ndarray | None = None
+        super().__init__(model_factory(), alpha=alpha, gamma=gamma, window=window)
+
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_cal: np.ndarray,
+        y_cal: np.ndarray,
+    ) -> "RetrainingSlidingWindowAdaptiveConformalForecaster":
+        super().fit(X_train, y_train, X_cal, y_cal)
+        # Everything the model is allowed to retrain on at step 0: the
+        # original train+calibration windows. Test-set windows are appended
+        # to this history one at a time, only once their true y is known.
+        self._X_history = np.concatenate([np.asarray(X_train), np.asarray(X_cal)], axis=0)
+        self._y_history = np.concatenate([np.asarray(y_train), np.asarray(y_cal)], axis=0)
+        return self
+
+    def predict_sequential(self, X_test: np.ndarray, y_test: np.ndarray) -> RetrainingSlidingWindowAdaptivePrediction:
+        if self._residuals is None or self._X_history is None:
+            raise RuntimeError(
+                "RetrainingSlidingWindowAdaptiveConformalForecaster.predict_sequential called before fit()"
+            )
+
+        X_test = np.asarray(X_test)
+        y_test_flat = np.asarray(y_test).reshape(-1)
+        n = X_test.shape[0]
+        if n != len(y_test_flat):
+            raise ValueError("X_test and y_test must have the same length")
+        if n == 0:
+            raise ValueError("Need at least one test point to run ACI sequentially")
+        # y_history/y_cal/y_train all have shape (m, horizon); this module
+        # (like the rest of the repo's bundled-dataset path) only ever
+        # exercises horizon=1, so a single test-set column reshapes cleanly
+        # onto the same (m, 1) shape for history concatenation.
+        y_test_col = y_test_flat.reshape(-1, 1)
+
+        residuals = list(self._residuals)
+        if self.window is not None and len(residuals) > self.window:
+            residuals = residuals[-self.window :]
+        pool: list[float] = residuals
+
+        alpha_t = self.alpha
+        alphas = np.empty(n)
+        q_hats = np.empty(n)
+        lower = np.empty(n)
+        upper = np.empty(n)
+        errs = np.empty(n)
+        points = np.empty(n)
+        pool_sizes = np.empty(n, dtype=int)
+        retrained_at_steps: list[int] = []
+
+        for t in range(n):
+            if self.retrain_every is not None and t > 0 and t % self.retrain_every == 0:
+                X_hist = np.concatenate([self._X_history, X_test[:t]], axis=0)
+                y_hist = np.concatenate([self._y_history, y_test_col[:t]], axis=0)
+                self.model = self.model_factory()
+                self.model.fit(X_hist, y_hist)
+                self.n_retrains += 1
+                retrained_at_steps.append(t)
+
+            pool_sizes[t] = len(pool)
+            point_t = float(self.model.predict(X_test[t : t + 1]).reshape(-1)[0])
+            points[t] = point_t
+
+            clipped_alpha = min(max(alpha_t, ALPHA_T_CLIP_LOW), ALPHA_T_CLIP_HIGH)
+            q_hat = SplitConformalForecaster._quantile_with_finite_sample_correction(np.asarray(pool), clipped_alpha)
+            lo, hi = point_t - q_hat, point_t + q_hat
+            err = 0.0 if (lo <= y_test_flat[t] <= hi) else 1.0
+
+            alphas[t] = clipped_alpha
+            q_hats[t] = q_hat
+            lower[t] = lo
+            upper[t] = hi
+            errs[t] = err
+
+            pool.append(float(abs(y_test_flat[t] - point_t)))
+            if self.window is not None and len(pool) > self.window:
+                pool.pop(0)
+
+            alpha_t = min(max(alpha_t + self.gamma * (self.alpha - err), ALPHA_T_CLIP_LOW), ALPHA_T_CLIP_HIGH)
+
+        return RetrainingSlidingWindowAdaptivePrediction(
+            point=points.reshape(-1, 1),
+            lower=lower.reshape(-1, 1),
+            upper=upper.reshape(-1, 1),
+            q_hat=q_hats,
+            alpha_t=alphas,
+            alpha=self.alpha,
+            gamma=self.gamma,
+            errs=errs,
+            pool_size=pool_sizes,
+            n_retrains=self.n_retrains,
+            retrained_at_steps=np.array(retrained_at_steps, dtype=int),
         )
 
 

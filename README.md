@@ -2071,7 +2071,7 @@ The pure fold-boundary/tie-break helpers this reuses
 `tests/test_cv_window_selection.py` against their own inputs and are not
 re-tested here.
 
-## Serving it as an API (v0.11, caching in v0.12, user series in v0.13, dataset handles in v0.14, listing in v0.15, idle-TTL eviction in v0.17, per-entry TTL remaining in v0.18, PATCH-to-refresh in v0.19)
+## Serving it as an API (v0.11, caching in v0.12, user series in v0.13, dataset handles in v0.14, listing in v0.15, idle-TTL eviction in v0.17, per-entry TTL remaining in v0.18, PATCH-to-refresh in v0.19, scoring new points without refitting in v0.33)
 
 Everything above is driven through the CLI, one process invocation at a
 time. `forecasting/api.py` wraps the exact same pipeline — `_prepare_split`
@@ -2112,6 +2112,11 @@ python -m forecasting.cli serve --port 8000
   `/docs`.
 - `GET /cache/stats` / `DELETE /cache` — v0.12: inspect or clear the
   fitted-model cache (below).
+- `POST /series/{series_id}/score` — v0.33: score newly-observed points
+  against a series' already-cached fit, without refitting (below). Body is
+  `{"new_points": [123.4, 125.1], "model": "lstm", "alpha": 0.1}`. 404 if
+  `series_id` isn't (or no longer) registered; 422 if `new_points` is empty
+  or the resolved `lookback` exceeds the registered series' own length.
 
 `tests/test_api.py` checks request validation, response well-formedness
 (interval ordering, `covered` consistency, coverage matching a direct
@@ -2348,6 +2353,86 @@ PATCHing one entry doesn't touch an unrelated sibling's own remaining
 TTL; and the response shape is exactly the three `SeriesListItemResponse`
 fields, no more, no less.
 
+**Scoring newly-arrived points without refitting (v0.33):** every version
+above still required a client to send a *whole* series — the bundled
+dataset name, the inline `series`, or a previously registered `series_id`
+— to get a forecast, and the fit cache (v0.12) only ever helped when the
+exact same combination was requested again, not when a few new real
+observations had arrived since. This repo's own "What's next" named the
+gap directly: "a WebSocket or streaming endpoint for a series that grows
+over time... would need an actual incremental-update story for the fit
+cache, which right now only ever caches one fully-formed fit per key."
+
+`POST /series/{series_id}/score` answers the half of that gap this version
+actually builds: a caller sends only `new_points` — the values actually
+observed since the series was registered, never the whole history again —
+and they're scored against whatever fit already exists for that
+`(series_id, model, seed, lookback, period)` combination. The *first* call
+for a combination still fits it, exactly like `/forecast` would (this
+literally calls the same `_get_or_fit`, not a reimplementation); every
+later call, for however many more points have arrived since, reuses that
+one fit and its one conformal quantile — no refit, ever, for that
+combination. The response's `cache_hit` field says which happened on every
+call, so "this doesn't refit" is something a caller (or a test) can check
+directly rather than take on faith.
+
+**Deliberately, honestly, not the other half of the gap:** this does not
+retrain the point model on the new data. That's a structurally different,
+heavier mechanism — exactly what v0.32's
+`RetrainingSlidingWindowAdaptiveConformalForecaster` already does, in
+`forecasting/adaptive.py`, as its own dedicated CLI path, not this API.
+`/score` is the cheap case: "I already have a calibrated model; evaluate
+what just came in." Conflating the two would either be dishonest about
+what this endpoint costs (implying a retrain that isn't happening) or
+would force every `/score` call to pay a full refit's cost just to answer
+a question that doesn't need one.
+
+**The registered series itself is never mutated.** `new_points` lives only
+in the request/response pair for that one call — `_series_store[series_id]`
+is untouched, so `series_id` keeps meaning exactly what it always has: the
+content hash of one fixed, immutable sequence. A caller that wants its
+growing history durably registered too can still call `POST /series` again
+with the extended sequence whenever it wants a fresh `series_id` for it.
+This was a deliberate design choice, not an oversight: mutating the store
+in place would have broken the existing, already-tested invariant that
+`series_id` is a stable content hash (several existing tests — idempotent
+registration, the cache-key collision guarantee — depend on exactly that),
+for a feature that doesn't actually need it broken to be useful.
+
+**Measured, not just asserted:** an LSTM fit on a 250-point synthetic
+series was fit exactly once (`LSTMForecaster.fit`, call-counted via
+`monkeypatch`, the same technique this README's own caching section above
+already uses) across a first `/score` call with 2 new points, a second
+`/score` call with 3 more, and a `/forecast` call for the identical
+combination afterward — `/score` and `/forecast` share one fit cache, not
+two. A hand-computable case (`model="naive"`, whose `predict` just returns
+a window's own last value) confirms the actual point-forecast math: the
+first new point's forecast is the registered series' own last real value,
+and each subsequent new point's forecast is the previous new point itself
+— never the model's own prior forecast, which would violate the same
+real-past-values-only exchangeability requirement every other part of this
+repo's conformal machinery already relies on. A separate test confirms
+`/score`'s conformal quantile for a given `(series_id, model, alpha)`
+combination agrees *exactly* with what a direct `/forecast` call for that
+same combination reports — both are computed from the identical `(X_cal,
+y_cal)`, so they must, and do.
+
+**Same honest units caveat as every other part of this API (Known issue
+#10):** `summary.mean_interval_width` and `summary.q_hat` are in the
+model's normalized (z-score) units, not the series' original units — this
+matches `/forecast`'s own existing, already-flagged behavior rather than
+introducing a second, different convention for the new endpoint.
+`summary.mae` is correctly denormalized, same as `/forecast`.
+
+8 new tests (284 → 292): unknown-`series_id` and empty-`new_points`
+rejection (404/422), a `lookback`-exceeds-history rejection (422), the
+fit-once/reuse-on-every-later-call regression test described above, a
+registered-series-is-never-mutated test (re-registering the identical
+original series afterward must still produce the same id), the
+hand-computed `naive`-model point-forecast test, the `q_hat`-agrees-with-
+`/forecast` test, and a general response-well-formedness test (interval
+ordering, `covered` consistency, exact response-key set).
+
 ## Installable as a real dependency (v0.16)
 
 Through v0.15, `pyproject.toml` had no `[build-system]` table and no
@@ -2448,7 +2533,11 @@ forecasting/
                  # fit-cache hash (v0.14), now also idle-TTL evicted (v0.17),
                  # independent of capacity, with GET /series reporting each
                  # entry's own TTL remaining (v0.18) and PATCH refreshing that
-                 # same TTL directly, without a throwaway GET (v0.19)
+                 # same TTL directly, without a throwaway GET (v0.19);
+                 # POST /series/{id}/score (v0.33): score newly-observed
+                 # points against an already-cached fit, reusing it (never
+                 # refitting) across however many such calls arrive --
+                 # never mutates the registered series itself
   cli.py         # `python -m forecasting.cli benchmark [...]` /
                  # `sliding-window [...]` / `enbpi [--n-bootstrap --window]` /
                  # `enbpi-window-sweep [...]` / `enbpi-cv-window-select [...
@@ -2459,7 +2548,7 @@ forecasting/
                  # (v0.26) / `cv-window-select-seed-check [--seeds]` (v0.31)
                  # / `online-retraining [--retrain-every --n-retrains-target]` (v0.32)
                  # / `serve [--host --port --reload]`
-tests/           # 284 tests, including the coverage-tracking statistical checks above
+tests/           # 292 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -2469,7 +2558,7 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 284 tests
+python -m pytest                                    # 292 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -2645,10 +2734,23 @@ python -m forecasting.cli cv-window-select-seed-check --dataset airline --candid
   explicitly "touch" (refresh the TTL of) a series it cares about without
   needing to run a real `/forecast` or re-register it — is now shipped too
   (v0.19).
-- A WebSocket or streaming endpoint for a series that grows over time
+- ~~A WebSocket or streaming endpoint for a series that grows over time
   (e.g. one new point per request) instead of always being posted whole —
   would need an actual incremental-update story for the fit cache, which
-  right now only ever caches one fully-formed fit per key.
+  right now only ever caches one fully-formed fit per key.~~ **Done, the
+  "score new points without refitting" half (v0.33):** see
+  `POST /series/{series_id}/score` above — a caller sends only newly
+  observed points, never the whole series again, and they're scored
+  against a fit that's reused (never refit) across however many such calls
+  arrive for the same combination. Deliberately **not** done here: actually
+  *retraining* the point model as new data arrives, which is a different,
+  heavier mechanism this repo already has a dedicated answer for (v0.32's
+  online-retraining ACI variant) rather than something this lightweight
+  scoring endpoint should also try to be. A real WebSocket/streaming
+  *transport* (vs. this version's plain request/response `POST`) remains
+  open if a future need for push-based delivery (rather than a client
+  polling/calling as new points arrive) ever makes one worth the added
+  complexity.
 - This repo is now a real, installable dependency (v0.16) for a second,
   separate project
   ([kalshi-commodity-forecaster](https://github.com/danielwork12121-lab/kalshi-commodity-forecaster))

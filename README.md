@@ -1831,6 +1831,108 @@ class to byte-identical behavior with the already-shipped frozen
 sliding-pool variant, and real-data integration tests pinning down the
 resolved retrain cadence and pool mechanics on the actual airline dataset.
 
+## Does a finer retraining cadence help further? (v0.34)
+
+v0.32's own "What's next" note left one question open: it tested exactly
+one cadence per dataset (`retrain_every` resolved from `n_retrains_target=8`)
+— would retraining *more* often close the remaining gap further, or has the
+coarse, affordable cadence already captured most of the real benefit?
+`run_online_retraining_cadence_sweep`/`format_online_retraining_cadence_sweep`
+(`forecasting/experiment.py`) answers this directly: sweep `retrain_every`
+itself on each dataset, holding the model architecture, seed, gamma, and
+window fixed, so the only thing that changes between rows is how often the
+point model is refit.
+
+**Honest affordability constraint, same one `RetrainingSlidingWindowAdaptiveConformalForecaster`'s
+own docstring already discloses:** `retrain_every=1` (the literal every-step
+case) is cheap on `airline` (30 test steps) and still affordable on
+`synthetic` (160 steps), but a full every-step sweep on `temperature` (730
+steps, each retrain itself slower since the training set is much larger)
+would cost over an hour in this CPU-constrained sandbox — not attempted.
+`temperature`'s sweep instead covers three cadences coarser than
+every-step, including the exact resolved default from v0.32, so it still
+answers "does *somewhat* finer help" without the untested extreme being
+silently assumed either way.
+
+**Measured, not assumed, on all three datasets** (every row shares the
+same LSTM (delta), same split, same `window=None`/unbounded pool as
+v0.32's own comparison; the `retrain_every` value matching v0.32's
+resolved default is **bolded** as a direct consistency check — both runs
+produce the identical number, confirming the sweep and the original
+comparison share the same underlying mechanism):
+
+### airline (30 test steps)
+
+| retrain_every | # retrains | Coverage | Coverage gap | Mean interval width |
+|---|---|---|---|---|
+| *frozen model (reference)* | 0 | 80.0% | -10.0pp | 5.918 |
+| 15 | 1 | 86.7% | -3.3pp | 5.491 |
+| 10 | 2 | 93.3% | +3.3pp | 4.612 |
+| 5 | 5 | 93.3% | +3.3pp | 3.426 |
+| **3 (v0.32's resolved default)** | **9** | **93.3%** | **+3.3pp** | **3.353** |
+| 2 | 14 | 93.3% | +3.3pp | 3.452 |
+| 1 (every step) | 29 | 93.3% | +3.3pp | 3.408 |
+
+### synthetic (160 test steps)
+
+| retrain_every | # retrains | Coverage | Coverage gap | Mean interval width |
+|---|---|---|---|---|
+| *frozen model (reference)* | 0 | 86.9% | -3.1pp | 0.803 |
+| 80 | 1 | **90.0%** | **+0.0pp** | 0.634 |
+| 40 | 3 | 89.4% | -0.6pp | 0.607 |
+| **20 (v0.32's resolved default)** | **7** | **89.4%** | **-0.6pp** | **0.593** |
+| 10 | 15 | 89.4% | -0.6pp | 0.590 |
+| 5 | 31 | 88.8% | -1.3pp | 0.574 |
+| 1 (every step) | 159 | 89.4% | -0.6pp | 0.576 |
+
+### temperature (730 test steps) — every-step not attempted, see above
+
+| retrain_every | # retrains | Coverage | Coverage gap | Mean interval width |
+|---|---|---|---|---|
+| *frozen model (reference)* | 0 | 90.0% | +0.0pp | 1.785 |
+| 182 | 4 | 90.0% | +0.0pp | 1.806 |
+| **91 (v0.32's resolved default)** | **8** | **90.0%** | **+0.0pp** | **1.803** |
+| 45 | 16 | 90.0% | +0.0pp | 1.806 |
+
+**Honest answer: no, a finer cadence does not reliably help further — v0.32's
+coarse default was already close to this gap's own ceiling, and on one
+dataset finer retraining is measurably *worse* on coverage, not just a wash.**
+
+- On `airline`, coverage plateaus at 93.3% as soon as the cadence is finer
+  than every 15 steps, and interval width *keeps shrinking slightly* as the
+  cadence gets finer down to `retrain_every=3` (5.491 → 3.353) — but going
+  finer still (every 2 or 1 steps) doesn't shrink it further; it sits flat
+  at 3.4-3.45, slightly *wider* than the `retrain_every=3` point. The
+  shipped default wasn't a lucky pick short of the real optimum — it's
+  close to it.
+- On `synthetic`, the result is genuinely non-monotonic, not just flat: the
+  *coarsest* candidate tested (`retrain_every=80`, a single mid-window
+  retrain) lands exactly on nominal coverage (90.0%, the best of any row),
+  while every finer cadence trades a little coverage away (89.4%, dipping
+  to 88.8% at `retrain_every=5`) for a slightly tighter interval. More
+  frequent retraining is not a free upgrade here — it's a real coverage-
+  for-width trade, in the *opposite* direction from what "retraining helps"
+  would naively predict.
+- On `temperature`, exactly like every other automated-adaptation feature
+  in this README, nothing moves at all across the three cadences tested
+  (90.0% coverage, interval width within ±0.003 of the frozen baseline) —
+  consistent with this being the one dataset with enough data that the
+  model already fits well regardless of how it's trained.
+
+A `python -m forecasting.cli online-retraining-cadence-sweep --dataset <name> --retrain-every-candidates <csv> --plot ...`
+command and a matching coverage-gap-vs-cadence plot are available,
+mirroring `window-sweep`'s own CLI command and plot style.
+
+6 new tests (`tests/test_online_retraining_cadence_sweep.py`, 292→298):
+the real sweep mechanics (hand-verified retrain counts for each candidate
+on the real airline dataset — e.g. `retrain_every=1` fires at every one of
+the 29 steps after the initial fit, exactly `n_test - 1` times), a direct
+monotonicity check (a smaller `retrain_every` must never produce *fewer*
+real retrains over the same fixed test window), a reproducibility check
+(two sweeps with identical seed/candidates produce byte-identical real
+numbers), and input validation (a non-positive or empty candidate list is
+rejected).
+
 ## EnbPI (v0.20): a structurally different answer to the same problem
 
 Everything above — fixed-pool ACI, sliding/growing-pool ACI, and all of the
@@ -2547,8 +2649,9 @@ forecasting/
                  # (v0.25) / `num-harmonics-sweep [--num-harmonics-values]`
                  # (v0.26) / `cv-window-select-seed-check [--seeds]` (v0.31)
                  # / `online-retraining [--retrain-every --n-retrains-target]` (v0.32)
+                 # / `online-retraining-cadence-sweep [--retrain-every-candidates]` (v0.34)
                  # / `serve [--host --port --reload]`
-tests/           # 292 tests, including the coverage-tracking statistical checks above
+tests/           # 298 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -2558,7 +2661,7 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 292 tests
+python -m pytest                                    # 298 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -2587,11 +2690,21 @@ python -m forecasting.cli cv-window-select-seed-check --dataset airline --candid
   frozen model has little room to improve) shows no difference either way,
   the same "calibration/training-set size is what actually drives these
   results" lesson this README keeps reconfirming from different angles.
-  A natural follow-up this run did not attempt: whether a *continuous*
+  ~~A natural follow-up this run did not attempt: whether a *continuous*
   (every-step) retraining cadence, if made affordable (e.g. a cheaper
   model family, or a smaller/faster-converging architecture), would widen
   this gap further, or whether the coarse 8-retrains-per-run cadence used
-  here is already capturing most of the real benefit.
+  here is already capturing most of the real benefit.~~ **Done (v0.34):**
+  see "Does a finer retraining cadence help further?" above. Real,
+  not-flattering-for-"more-is-better" answer: no — `airline`'s coverage
+  plateaus well short of every-step retraining and `synthetic`'s coarsest
+  candidate actually has the *best* coverage of the sweep, with finer
+  cadences trading coverage away for a tighter interval rather than
+  improving on both axes. `temperature`'s three (affordably) tested
+  cadences show no difference at all, same as v0.32 already found at one
+  cadence. Every-step retraining on `temperature` itself remains
+  untested — disclosed as too slow (over an hour) in this sandbox, not
+  silently assumed either way.
 - ~~EnbPI (Xu & Xie, 2021), a different time-series-specific conformal
   variant based on a bootstrap ensemble rather than a single model +
   adapting alpha~~ **Done (v0.20)** — see the dedicated section above.

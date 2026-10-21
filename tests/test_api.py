@@ -1063,3 +1063,164 @@ def test_patch_series_response_model_matches_list_item_shape(monkeypatch):
     assert set(resp.json().keys()) == {"series_id", "length", "ttl_remaining_seconds"}
 
 
+# --- Scoring newly-arrived points without refitting (v0.33) ----------------
+#
+# POST /series/{series_id}/score answers the README's own long-open
+# "What's next" gap: a series that grows over time shouldn't have to be
+# re-POSTed whole, and scoring what just arrived shouldn't pay a refit
+# either, as long as a fit for this (series_id, model, seed, lookback,
+# period) combination is already cached. These tests check the actual
+# claims the endpoint's docstring makes, not just that it returns 200: it
+# fits once (not on every call), it never mutates the registered series,
+# and its numbers agree with what the existing, already-tested pipeline
+# would produce for the same fit.
+
+
+def test_score_rejects_unknown_series_id():
+    resp = client.post("/series/not-a-real-id/score", json={"new_points": [1.0, 2.0]})
+    assert resp.status_code == 404
+
+
+def test_score_rejects_empty_new_points():
+    series_id = client.post("/series", json={"series": _make_synthetic_series(n=60, seed=70)}).json()["series_id"]
+    resp = client.post(f"/series/{series_id}/score", json={"new_points": []})
+    assert resp.status_code == 422
+
+
+def test_score_422s_when_lookback_exceeds_series_length():
+    series_id = client.post("/series", json={"series": _make_synthetic_series(n=60, seed=71)}).json()["series_id"]
+    resp = client.post(f"/series/{series_id}/score", json={"new_points": [1.0], "lookback": 10_000})
+    assert resp.status_code == 422
+
+
+def test_score_fits_once_and_reuses_the_cached_fit_on_later_calls(monkeypatch):
+    """The actual regression test for v0.33's whole point: the first call
+    for a (series_id, model, seed, lookback, period) combination fits the
+    LSTM; every later call for the same combination -- however many more
+    new points arrive -- must reuse that fit, never refit it."""
+    client.delete("/cache")
+    from forecasting import models as models_module
+
+    calls = {"n": 0}
+    original_fit = models_module.LSTMForecaster.fit
+
+    def counting_fit(self, *args, **kwargs):
+        calls["n"] += 1
+        return original_fit(self, *args, **kwargs)
+
+    monkeypatch.setattr(models_module.LSTMForecaster, "fit", counting_fit)
+
+    series = _make_synthetic_series(n=250, seed=72)
+    series_id = client.post("/series", json={"series": series}).json()["series_id"]
+
+    r1 = client.post(
+        f"/series/{series_id}/score",
+        json={"new_points": [51.0, 52.0], "model": "lstm", "seed": 9, "alpha": 0.1},
+    )
+    assert r1.status_code == 200
+    assert calls["n"] == 1
+    assert r1.json()["cache_hit"] is False
+
+    r2 = client.post(
+        f"/series/{series_id}/score",
+        json={"new_points": [53.0, 54.0, 55.0], "model": "lstm", "seed": 9, "alpha": 0.1},
+    )
+    assert r2.status_code == 200
+    assert calls["n"] == 1, "a second call for the same combination must reuse the fit, not refit"
+    assert r2.json()["cache_hit"] is True
+
+    # A later /forecast call for the exact same combination is itself a
+    # cache hit too -- /score and /forecast share one fit cache, not two.
+    r3 = client.post("/forecast", json={"series_id": series_id, "model": "lstm", "seed": 9, "alpha": 0.1})
+    assert r3.status_code == 200
+    assert calls["n"] == 1
+
+    client.delete("/cache")
+
+
+def test_score_does_not_mutate_the_registered_series():
+    """`new_points` must never be written back into `_series_store` -- the
+    whole point is that `series_id` keeps meaning one fixed, immutable
+    sequence's content hash, exactly as every other series-store test in
+    this file already assumes."""
+    series = _make_synthetic_series(n=60, seed=73)
+    series_id = client.post("/series", json={"series": series}).json()["series_id"]
+    before = client.get(f"/series/{series_id}").json()
+
+    resp = client.post(f"/series/{series_id}/score", json={"new_points": [1.0, 2.0, 3.0], "model": "naive"})
+    assert resp.status_code == 200
+
+    after = client.get(f"/series/{series_id}").json()
+    assert after == before
+    assert after["length"] == len(series)
+
+    # Re-registering the identical original series must still produce the
+    # exact same id -- if scoring had mutated the stored series in place,
+    # this would now disagree.
+    reregistered_id = client.post("/series", json={"series": series}).json()["series_id"]
+    assert reregistered_id == series_id
+
+
+def test_score_naive_model_hand_computed_point_forecasts():
+    """NaiveForecaster.predict just returns the window's own last value, so
+    the expected point forecast for each new point is hand-computable: the
+    raw value immediately preceding it in the combined (registered +
+    already-scored-this-call) history -- the registered series' own last
+    value for the first new point, then each new point in turn for every
+    one after it (never the model's own forecast, matching this repo's
+    exchangeability requirement that conformal calibration only ever sees
+    real past values)."""
+    series = _make_synthetic_series(n=60, seed=74)
+    series_id = client.post("/series", json={"series": series}).json()["series_id"]
+    new_points = [123.0, -45.0, 67.5]
+
+    resp = client.post(f"/series/{series_id}/score", json={"new_points": new_points, "model": "naive", "alpha": 0.1})
+    assert resp.status_code == 200
+    body = resp.json()
+
+    expected_point_forecasts = [series[-1], new_points[0], new_points[1]]
+    actual_point_forecasts = [p["point_forecast"] for p in body["points"]]
+    np.testing.assert_allclose(actual_point_forecasts, expected_point_forecasts, rtol=1e-4)
+
+    # Every point's own reported `actual` must be exactly the new point it
+    # corresponds to, in order -- not reshuffled or off-by-one.
+    assert [p["actual"] for p in body["points"]] == pytest.approx(new_points)
+
+
+def test_score_q_hat_matches_a_direct_forecast_call_for_the_same_fit():
+    """`/score`'s conformal quantile is computed from the exact same
+    (X_cal, y_cal) a `/forecast` call for the same (series_id, model, seed,
+    lookback, period, alpha) would use -- so the two must agree exactly,
+    not just be close. (Same honest units caveat as every other q_hat/
+    mean_interval_width in this repo, Known issue #10: both are in
+    normalized units, matching each other and matching /forecast.)"""
+    series = _make_synthetic_series(n=60, seed=75)
+    series_id = client.post("/series", json={"series": series}).json()["series_id"]
+
+    forecast_body = client.post("/forecast", json={"series_id": series_id, "model": "naive", "alpha": 0.1}).json()
+    score_body = client.post(
+        f"/series/{series_id}/score", json={"new_points": [10.0, 20.0], "model": "naive", "alpha": 0.1}
+    ).json()
+
+    assert score_body["summary"]["q_hat"] == pytest.approx(forecast_body["summary"]["q_hat"], abs=1e-9)
+
+
+def test_score_response_is_well_formed():
+    series = _make_synthetic_series(n=60, seed=76)
+    series_id = client.post("/series", json={"series": series}).json()["series_id"]
+    new_points = [11.0, 22.0, 33.0, 44.0]
+
+    resp = client.post(f"/series/{series_id}/score", json={"new_points": new_points, "model": "naive"})
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert len(body["points"]) == len(new_points) == body["summary"]["n_test"]
+    covered_count = 0
+    for p in body["points"]:
+        assert p["lower"] <= p["point_forecast"] <= p["upper"]
+        assert p["covered"] == (p["lower"] <= p["actual"] <= p["upper"])
+        covered_count += int(p["covered"])
+    assert body["summary"]["empirical_coverage"] == covered_count / len(body["points"])
+    assert set(body.keys()) == {"series_id", "model", "alpha", "seed", "cache_hit", "points", "summary"}
+
+

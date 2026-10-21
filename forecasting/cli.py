@@ -128,6 +128,18 @@ question neither basis-shape sweep could answer (see
 
     python -m forecasting.cli nbeats-block-count-sweep --dataset airline --num-trend-blocks-values 1,2,3,4,5 --num-seasonality-blocks-values 1,2,3,4,5 --plot results/airline_nbeats_block_count_sweep.png
 
+Select the interpretable N-BEATS variant's `trend_degree` AND `num_harmonics`
+via the same rolling-origin cross-validation `cv-window-select` already does
+for ACI's `window` (v0.30) -- every prior basis sweep (v0.25, v0.26, v0.28's
+joint grid) picked its "best" cell by reading the real test set directly;
+this instead scores each `(trend_degree, num_harmonics)` candidate by the
+mean of |coverage gap| across several rolling folds of the calibration set
+only, then, as an honest post-hoc check, reports whether the CV-selected
+cell actually matches the real test set's own best cell (see
+`forecasting/experiment.py`'s `run_nbeats_basis_cv_selection`):
+
+    python -m forecasting.cli nbeats-basis-cv-select --dataset airline --trend-degrees 1,2,3,4,5 --num-harmonics-values 1,2,3,4,5 --plot results/airline_nbeats_basis_cv_select.png
+
 Serve the calibrated forecasts over a minimal REST API (see
 `forecasting/api.py` and the README's "Serving it as an API" section --
 demo-quality, not production: the LSTM refits per request):
@@ -145,6 +157,7 @@ from forecasting.experiment import (
     format_enbpi_comparison,
     format_enbpi_cv_window_selection,
     format_enbpi_window_sweep_comparison,
+    format_nbeats_basis_cv_selection,
     format_nbeats_basis_sweep_comparison,
     format_nbeats_block_count_sweep_comparison,
     format_nbeats_joint_basis_sweep_comparison,
@@ -160,6 +173,7 @@ from forecasting.experiment import (
     run_enbpi_cv_window_selection,
     run_enbpi_window_sweep_comparison,
     run_experiment,
+    run_nbeats_basis_cv_selection,
     run_nbeats_basis_sweep_comparison,
     run_nbeats_block_count_sweep_comparison,
     run_nbeats_joint_basis_sweep_comparison,
@@ -544,6 +558,60 @@ def _plot_nbeats_block_count_sweep(dataset: str, comparison, path: str) -> None:
     plt.close(fig)
 
 
+def _plot_nbeats_basis_cv_selection(dataset: str, result, path: str) -> None:
+    import numpy as np
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    degrees = result.trend_degrees
+    harmonics_values = result.num_harmonics_values
+    fold_grid = np.zeros((len(degrees), len(harmonics_values)))
+    test_grid = np.zeros((len(degrees), len(harmonics_values)))
+    by_key = {(c.trend_degree, c.num_harmonics): c for c in result.candidates}
+    for i, d in enumerate(degrees):
+        for j, h in enumerate(harmonics_values):
+            c = by_key[(d, h)]
+            fold_grid[i, j] = c.mean_abs_fold_gap * 100
+            test_grid[i, j] = abs(c.test_coverage_gap) * 100
+
+    fig, axes = plt.subplots(1, 2, figsize=(2.2 * len(harmonics_values) + 4, 1.1 * len(degrees) + 2))
+    for ax, grid, title in (
+        (axes[0], fold_grid, f"CV: mean |fold gap| (used to select)"),
+        (axes[1], test_grid, "Real test-set |gap| (post-hoc check)"),
+    ):
+        im = ax.imshow(grid, cmap="viridis_r", aspect="auto")
+        ax.set_xticks(range(len(harmonics_values)))
+        ax.set_xticklabels([str(h) for h in harmonics_values])
+        ax.set_yticks(range(len(degrees)))
+        ax.set_yticklabels([str(d) for d in degrees])
+        ax.set_xlabel("num_harmonics")
+        ax.set_ylabel("trend_degree")
+        ax.set_title(title, fontsize=10)
+        for i in range(len(degrees)):
+            for j in range(len(harmonics_values)):
+                ax.text(j, i, f"{grid[i, j]:.1f}", ha="center", va="center", color="white", fontsize=8)
+        fig.colorbar(im, ax=ax, label="|gap| (pp)")
+
+    sel_i, sel_j = degrees.index(result.selected[0]), harmonics_values.index(result.selected[1])
+    axes[0].add_patch(plt.Rectangle((sel_j - 0.5, sel_i - 0.5), 1, 1, fill=False, edgecolor="red", linewidth=2.5))
+    axes[1].add_patch(plt.Rectangle((sel_j - 0.5, sel_i - 0.5), 1, 1, fill=False, edgecolor="red", linewidth=2.5))
+    best_i, best_j = degrees.index(result.best_test[0]), harmonics_values.index(result.best_test[1])
+    axes[1].add_patch(plt.Rectangle((best_j - 0.5, best_i - 0.5), 1, 1, fill=False, edgecolor="orange", linewidth=2.5, linestyle="--"))
+
+    folds_label = f"{result.n_folds} folds, auto" if result.auto_folds else f"{result.n_folds} folds"
+    fig.suptitle(
+        f"{dataset}: trend_degree x num_harmonics CV selection ({result.fold_scheme}, {folds_label})\n"
+        f"red box = selected (trend_degree={result.selected[0]}, num_harmonics={result.selected[1]}); "
+        f"dashed orange = best in hindsight (trend_degree={result.best_test[0]}, num_harmonics={result.best_test[1]})",
+        fontsize=9,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
 def _plot_auto_window_selection(dataset: str, result, path: str) -> None:
     import matplotlib
 
@@ -854,6 +922,44 @@ def main() -> None:
     )
     block_count_sweep.add_argument("--seed", type=int, default=0)
 
+    basis_cv = sub.add_parser(
+        "nbeats-basis-cv-select",
+        help="select the interpretable N-BEATS variant's trend_degree AND num_harmonics via rolling-origin "
+        "cross-validation over the calibration set, instead of v0.28's joint sweep reading its best cell "
+        "off the real test set directly (mirrors cv-window-select for ACI's window)",
+    )
+    basis_cv.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    basis_cv.add_argument("--alpha", type=float, default=0.1)
+    basis_cv.add_argument(
+        "--trend-degrees", type=str, default="1,2,3,4,5", help="comma-separated list of trend_degree values to try"
+    )
+    basis_cv.add_argument(
+        "--num-harmonics-values",
+        type=str,
+        default="1,2,3,4,5",
+        help="comma-separated list of num_harmonics values to try",
+    )
+    basis_cv.add_argument("--n-folds", type=int, default=4, help="requested number of rolling-origin folds (may be fewer if the calibration set is small)")
+    basis_cv.add_argument("--min-initial-frac", type=float, default=0.2, help="fraction of the calibration set reserved as the first fold's seed")
+    basis_cv.add_argument("--min-fold-frac", type=float, default=0.1, help="minimum fraction of the calibration set each fold's validation chunk must have")
+    basis_cv.add_argument(
+        "--fold-scheme",
+        choices=["expanding", "sliding"],
+        default="expanding",
+        help="'expanding' (default): every fold's seed grows from the start of the calibration set. "
+        "'sliding': each fold's seed is capped at the most recent min-initial-frac residuals",
+    )
+    basis_cv.add_argument(
+        "--auto-folds",
+        action="store_true",
+        help="pick n-folds/min-initial-frac/min-fold-frac automatically from the calibration set's size "
+        "instead of the fixed defaults above (which are then ignored)",
+    )
+    basis_cv.add_argument(
+        "--plot", type=str, default=None, help="save a trend_degree x num_harmonics heatmap pair (CV fold gap vs. real test gap)"
+    )
+    basis_cv.add_argument("--seed", type=int, default=0)
+
     auto = sub.add_parser(
         "auto-window",
         help="automatically select the sliding-pool ACI's window size from a held-out calibration slice",
@@ -1080,6 +1186,26 @@ def main() -> None:
         print()
         if args.plot:
             _plot_nbeats_block_count_sweep(args.dataset, comparison, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "nbeats-basis-cv-select":
+        trend_degrees = [int(d) for d in args.trend_degrees.split(",")]
+        num_harmonics_values = [int(h) for h in args.num_harmonics_values.split(",")]
+        result = run_nbeats_basis_cv_selection(
+            args.dataset,
+            trend_degrees=trend_degrees,
+            num_harmonics_values=num_harmonics_values,
+            alpha=args.alpha,
+            n_folds=args.n_folds,
+            min_initial_frac=args.min_initial_frac,
+            min_fold_frac=args.min_fold_frac,
+            fold_scheme=args.fold_scheme,
+            auto_folds=args.auto_folds,
+            seed=args.seed,
+        )
+        print(format_nbeats_basis_cv_selection(result))
+        print()
+        if args.plot:
+            _plot_nbeats_basis_cv_selection(args.dataset, result, args.plot)
             print(f"Saved plot to {args.plot}")
     elif args.command == "auto-window":
         candidates = [None if w.strip().lower() == "unbounded" else int(w) for w in args.candidates.split(",")]

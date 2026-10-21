@@ -24,6 +24,12 @@ over the test window:
 
     python -m forecasting.cli sliding-window --dataset airline --plot results/airline_sliding_window.png
 
+Check whether periodically retraining the point model itself (not just the
+conformal layer) during the test window helps, versus a model frozen at its
+initial fit (both under sliding-pool ACI):
+
+    python -m forecasting.cli online-retraining --dataset airline --plot results/airline_online_retraining.png
+
 Sweep the sliding-pool ACI's `window` size and see how coverage gap responds
 (a bounded window can beat the unbounded growing buffer -- see the README):
 
@@ -170,6 +176,7 @@ from forecasting.experiment import (
     format_nbeats_block_count_sweep_comparison,
     format_nbeats_joint_basis_sweep_comparison,
     format_num_harmonics_sweep_comparison,
+    format_online_retraining_comparison,
     format_results_table,
     format_sliding_window_comparison,
     format_window_gamma_sweep_comparison,
@@ -187,6 +194,7 @@ from forecasting.experiment import (
     run_nbeats_block_count_sweep_comparison,
     run_nbeats_joint_basis_sweep_comparison,
     run_num_harmonics_sweep_comparison,
+    run_online_retraining_comparison,
     run_sliding_window_comparison,
     run_window_gamma_sweep_comparison,
     run_window_sweep_comparison,
@@ -273,6 +281,37 @@ def _plot_sliding_window(dataset: str, comparison, path: str) -> None:
         f"{dataset}: sliding-pool ACI's residual pool size over the test window (window={window_desc})\n"
         f"coverage -- static {s['empirical_coverage'] * 100:.1f}%, fixed-pool ACI {f['empirical_coverage'] * 100:.1f}%, "
         f"sliding-pool ACI {w['empirical_coverage'] * 100:.1f}% (nominal {int(round((1 - comparison.alpha) * 100))}%)",
+        fontsize=10,
+    )
+    ax1.legend(loc="upper left")
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def _plot_online_retraining(dataset: str, comparison, path: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pool_size = comparison.pool_size
+    x = range(len(pool_size))
+
+    fig, ax1 = plt.subplots(figsize=(9, 4.5))
+    ax1.plot(x, pool_size, color="#8c564b", linewidth=1.3, label="residual pool size")
+    for step in comparison.retrained_at_steps:
+        ax1.axvline(int(step), color="#8c564b", linewidth=0.6, linestyle=":", alpha=0.5)
+    ax1.set_xlabel("test-set time step")
+    ax1.set_ylabel("pool size (# residuals)", color="#8c564b")
+    ax1.tick_params(axis="y", labelcolor="#8c564b")
+    window_desc = "unbounded" if comparison.window is None else str(comparison.window)
+    s, f, r = comparison.static, comparison.frozen_sliding, comparison.retraining
+    ax1.set_title(
+        f"{dataset}: does online retraining help, under sliding-pool ACI? (window={window_desc}, "
+        f"retrain_every={comparison.retrain_every}, {comparison.n_retrains} retrains)\n"
+        f"coverage -- static {s['empirical_coverage'] * 100:.1f}%, frozen+ACI {f['empirical_coverage'] * 100:.1f}%, "
+        f"retrained+ACI {r['empirical_coverage'] * 100:.1f}% (nominal {int(round((1 - comparison.alpha) * 100))}%)",
         fontsize=10,
     )
     ax1.legend(loc="upper left")
@@ -809,6 +848,34 @@ def main() -> None:
     sliding.add_argument("--plot", type=str, default=None, help="save a plot of the residual pool size over the test window")
     sliding.add_argument("--seed", type=int, default=0)
 
+    online_retraining = sub.add_parser(
+        "online-retraining",
+        help="compare static split conformal, sliding-pool ACI with a frozen model, and sliding-pool ACI with the model periodically retrained online",
+    )
+    online_retraining.add_argument("--dataset", choices=["airline", "temperature", "synthetic"], default="airline")
+    online_retraining.add_argument("--alpha", type=float, default=0.1)
+    online_retraining.add_argument("--gamma", type=float, default=0.05, help="ACI step size")
+    online_retraining.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        help="max residual-pool size shared by both ACI variants (default: unbounded growing buffer)",
+    )
+    online_retraining.add_argument(
+        "--retrain-every",
+        type=int,
+        default=None,
+        help="retrain the model every N test steps (default: resolved from --n-retrains-target)",
+    )
+    online_retraining.add_argument(
+        "--n-retrains-target",
+        type=int,
+        default=8,
+        help="if --retrain-every is not given, resolve it so roughly this many retrains happen over the test window",
+    )
+    online_retraining.add_argument("--plot", type=str, default=None, help="save a plot of the residual pool size, marking each retrain, over the test window")
+    online_retraining.add_argument("--seed", type=int, default=0)
+
     enbpi = sub.add_parser(
         "enbpi",
         help="compare static split conformal, fixed-pool ACI, and EnbPI (bootstrap-ensemble conformal) on the LSTM model",
@@ -1155,6 +1222,21 @@ def main() -> None:
         print()
         if args.plot:
             _plot_sliding_window(args.dataset, comparison, args.plot)
+            print(f"Saved plot to {args.plot}")
+    elif args.command == "online-retraining":
+        comparison = run_online_retraining_comparison(
+            args.dataset,
+            alpha=args.alpha,
+            gamma=args.gamma,
+            window=args.window,
+            retrain_every=args.retrain_every,
+            n_retrains_target=args.n_retrains_target,
+            seed=args.seed,
+        )
+        print(format_online_retraining_comparison(comparison))
+        print()
+        if args.plot:
+            _plot_online_retraining(args.dataset, comparison, args.plot)
             print(f"Saved plot to {args.plot}")
     elif args.command == "enbpi":
         comparison = run_enbpi_comparison(

@@ -819,6 +819,103 @@ than hard-coded wrong; and the formatted table includes every cell, the
 generic reference line, the shipped-default marker, and the best-cell
 marker. Full suite verified: **253/253 passed.**
 
+## Can `trend_degree`/`num_harmonics` be picked without the test set? A CV selection method (v0.30)
+
+Every basis-shape sweep above (v0.25, v0.26, v0.28's joint grid) reports its
+"best" `(trend_degree, num_harmonics)` cell by reading the real test set
+directly — honest for describing the hyperparameters' effect, but not a
+deployable selection method: a real user calibrating a model doesn't have
+the test set. This repeats the same move `cv-window-select` already made
+for ACI's `window` (v0.6): select the hyperparameters using
+rolling-origin cross-validation over the calibration set only, then, as an
+honest post-hoc check, report whether the CV-selected cell actually matches
+the real test set's own best cell — which v0.28's already-published joint
+grid gives known ground truth to check against, on all three datasets.
+
+**Method:** for each `(trend_degree, num_harmonics)` candidate, fit
+`NBEATSInterpretableForecaster` once on the training split (unavoidable —
+these hyperparameters change the model's own architecture, same as every
+other basis sweep). Partition the calibration set into rolling folds
+(`_make_rolling_folds`, the identical fold machinery `cv-window-select`
+already uses and already tests); for each fold, compute `q_hat` (the same
+finite-sample-corrected quantile `SplitConformalForecaster` itself uses)
+from that fold's seed residuals only, and score the candidate by |coverage
+gap| on that fold's own held-out validation chunk. The per-candidate score
+is the mean of |gap| across folds (not signed — a candidate that swings
+over- then under-covered across folds shouldn't look artificially
+well-calibrated on average), and the smallest-mean-|gap| candidate is
+selected. X_test plays no role in the selection; it's used only afterward
+to check whether the CV pick generalized.
+
+**Real, measured answer — mixed, not a clean "CV works" or "CV fails":**
+
+| Dataset | CV-selected (trend_degree, num_harmonics) | Selected real test gap | Best-in-hindsight (test set) | Best test gap |
+|---|---|---|---|---|
+| airline | (1, 1) | -20.0pp | (1, 3) | +3.3pp |
+| synthetic | (2, 3) | -5.0pp | (2, 1) | -0.6pp |
+| temperature | (5, 1) | +1.6pp | (2, 5) | +1.1pp |
+
+- **`airline` (n_cal=28): CV picks badly here.** The 4-fold cross-validated
+  score for `(1, 1)` (8.6pp mean |fold gap|) ties exactly with `(2, 2)`
+  (also 8.6pp) and `(3, 3)` (also 8.6pp) — `(1, 1)` wins the tie-break only
+  because it has the smallest mean fold width among the tied candidates —
+  but its real test-set gap (-20.0pp) is far worse than the oracle's `(1,
+  3)` (+3.3pp, the actual best cell in the whole 25-cell grid). With only
+  28 calibration points split into 4 folds of ~5-7 points each, individual
+  fold scores are extremely noisy, and several genuinely different
+  `(trend_degree, num_harmonics)` combinations end up with near-identical
+  fold scores by chance — exactly the small-calibration-set problem this
+  repo's README has flagged before (e.g. the original window-selection
+  ties on this same dataset). This is a real, honestly-reported failure
+  case for the method, not swept under the rug.
+- **`synthetic` (n_cal=160): a near miss, not a win or a clean loss.** CV
+  selects `(2, 3)` (-5.0pp real test gap) against the oracle's `(2, 1)`
+  (-0.6pp) — CV correctly identifies `trend_degree=2` as the right choice
+  (matching v0.28's own already-published joint optimum), but picks the
+  wrong `num_harmonics` value. -5.0pp is a real, usable interval (well
+  within the range every other basis choice on this dataset produces) even
+  if it isn't the single best cell in the grid.
+- **`temperature` (n_cal=730, 4 folds of ~146 points each): CV's pick is
+  close to the oracle and the whole grid barely moves anyway.** `(5, 1)`
+  at +1.6pp real test gap vs. the oracle `(2, 5)` at +1.1pp — both inside
+  this dataset's already-documented narrow +0.7pp to +3.6pp range for this
+  hyperparameter family. With a much larger calibration set, individual
+  fold scores are far less noisy (the 2.0pp-to-10.6pp mean-|fold-gap|
+  spread here is much tighter than the shape sweeps' own fold variance),
+  and the method's selection quality is correspondingly closer to the
+  oracle — though on this dataset, nearly any reasonable choice already
+  lands within noise of nominal.
+
+**Honest conclusion:** this held-out-data selection method is not a
+reliable substitute for reading the real test set — on the smallest
+calibration set (`airline`) it picks a clearly suboptimal cell, on the
+mid-sized one (`synthetic`) it gets the right `trend_degree` but the wrong
+`num_harmonics`, and only on the largest (`temperature`) does its pick
+land close to the oracle — but that's also the dataset where almost any
+choice in this hyperparameter family already performs similarly, so "close
+to the oracle" there is a weaker claim than it sounds. The practical
+takeaway mirrors this repo's own `auto_folds`/`fold_scheme` findings for
+ACI's window: a principled CV-based selection method is a genuinely
+different thing from a method that's been *shown* to outperform eyeballing
+a sweep plot, and a small calibration set is the dominant factor working
+against it here, not a flaw specific to this particular selection rule.
+
+11 new tests (253 → 264): `_select_best_cell`'s own tie-break logic (argmin
+|gap|, then width, then total `trend_degree + num_harmonics` as a
+last-resort "simpler model" rule) is tested directly and fast, separately
+from the slow integration path; a direct regression guard confirms
+`selected` is actually computed from the fold columns and never from
+`test_coverage_gap` (which would silently let the selection peek at the
+test set); every cell in a requested grid is confirmed to get its own
+independent fit (varying either hyperparameter alone changes the mean fold
+width); `fold_scheme`/`auto_folds` pass through correctly; a too-small
+calibration set raises, same configuration the ACI-window case already
+uses; and a single-cell grid's post-hoc test result is confirmed to
+numerically match `run_nbeats_joint_basis_sweep_comparison`'s own
+already-tested cell exactly, confirming the post-hoc check reuses that
+real, already-verified machinery rather than recomputing it differently.
+Full suite verified: **264/264 passed.**
+
 ## Adaptive Conformal Inference: does it actually fix the LSTM's under-coverage?
 
 The three LSTM rows above all share a cause: the model's own error grows
@@ -2198,7 +2295,7 @@ forecasting/
                  # --auto-folds]` / `nbeats-basis-sweep [--trend-degrees]`
                  # (v0.25) / `num-harmonics-sweep [--num-harmonics-values]`
                  # (v0.26) / `serve [--host --port --reload]`
-tests/           # 253 tests, including the coverage-tracking statistical checks above
+tests/           # 264 tests, including the coverage-tracking statistical checks above
 data/            # bundled real datasets (airline, temperature) — no network needed
 results/         # generated plots (checked in so the README renders without rerunning)
 ```
@@ -2208,7 +2305,7 @@ results/         # generated plots (checked in so the README renders without rer
 ```bash
 pip install -r requirements.txt       # from a checkout
 # or: pip install -e ".[dev,api]"     # editable install with build-tested packaging (v0.16)
-python -m pytest                                    # 253 tests
+python -m pytest                                    # 264 tests
 python -m forecasting.cli benchmark                  # all 3 datasets, static split conformal
 python -m forecasting.cli benchmark --dataset airline --plot results/airline_forecast.png
 python -m forecasting.cli adaptive --dataset airline --plot results/airline_adaptive.png  # static vs. fixed-pool ACI
@@ -2308,12 +2405,22 @@ python -m forecasting.cli cv-window-select --dataset synthetic --candidates 5,7,
   coverage gap swings 20+ points between adjacent cells with no visible
   trend), while `synthetic` and `temperature` both reconfirm the shipped
   default `(2, 2)` is already safe and near-optimal on depth too, the same
-  conclusion already reached on shape. A more principled next step than
+  conclusion already reached on shape. ~~A more principled next step than
   reading an answer off the test set directly would be a held-out-data
   selection method for `trend_degree`/`num_harmonics` (mirroring
-  `cv-window-select` for ACI's `window`) — not attempted here, and now a
-  real candidate for either this grid's full joint space or just
-  `airline`'s own joint optimum found in v0.28.
+  `cv-window-select` for ACI's `window`).~~ **Done (v0.30):** see "Can
+  `trend_degree`/`num_harmonics` be picked without the test set? A CV
+  selection method" above. Real, mixed answer: on the smallest calibration
+  set (`airline`, n_cal=28) the CV method picks a clearly suboptimal cell
+  (-20.0pp real gap vs. the oracle's +3.3pp) — fold scores are too noisy
+  at that size to distinguish genuinely different cells; on `synthetic`
+  (n_cal=160) it gets `trend_degree` right but `num_harmonics` wrong, a
+  near miss (-5.0pp vs. the oracle's -0.6pp); on `temperature` (n_cal=730)
+  its pick lands close to the oracle (+1.6pp vs. +1.1pp), though that's
+  also the dataset where nearly any choice already performs similarly.
+  Calibration-set size, not a flaw specific to this selection rule, is the
+  dominant factor working against the method here — consistent with this
+  repo's own earlier `auto_folds`/`fold_scheme` findings for ACI's window.
 - ~~Extend the window sweep's multi-seed check to `gamma` too (this run only
   tuned `window`, holding `gamma=0.05` fixed throughout — the two
   hyperparameters likely interact).~~ **Done (v0.27):** see "Does gamma

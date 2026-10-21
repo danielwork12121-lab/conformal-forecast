@@ -1630,6 +1630,162 @@ def format_cv_window_selection(result: CVWindowSelectionResult) -> str:
 
 
 # ---------------------------------------------------------------------------
+# CV window selection: seed robustness (v0.31) -- the README's own "What's
+# next" named this open question directly: `run_cv_window_selection` (v0.6
+# through v0.9) has only ever been run at a single seed (seed=0). Does the
+# fold-selection metric's pick stay the same if the one base LSTM it trains
+# happens to land on a different random initialization, or can the "best"
+# window itself be an artifact of which seed got used?
+
+
+def _unique_in_order(values: list) -> list:
+    """Pure helper, no model/data involved: the distinct values in `values`, in
+    first-seen order, de-duplicated. Factored out from
+    `run_cv_window_selection_seed_robustness` so its own bookkeeping (did every
+    seed pick the same window?) can be tested directly and fast, same two-layer
+    split (`_make_rolling_folds` is the precedent) as the rest of this module.
+    """
+    seen: list = []
+    for v in values:
+        if v not in seen:
+            seen.append(v)
+    return seen
+
+
+@dataclass
+class CVWindowSeedRobustnessCandidate:
+    """One seed's own full, independent run of `run_cv_window_selection`."""
+
+    seed: int
+    selected_window: int | None  # this seed's own fold-metric pick
+    selected_test_gap: float  # real test-set signed coverage gap for that pick
+    best_test_window: int | None  # this seed's own oracle (hindsight-best), for reference only
+
+
+@dataclass
+class CVWindowSeedRobustnessResult:
+    dataset: str
+    alpha: float
+    gamma: float
+    fold_scheme: str
+    auto_folds: bool
+    windows: list[int | None]
+    seeds: list[int]
+    per_seed: list[CVWindowSeedRobustnessCandidate]  # one per seed, in seed order
+    unique_selected_windows: list[int | None]  # distinct windows chosen, first-seen order
+    is_window_robust: bool  # True iff every seed's fold metric picked the same window
+
+
+def run_cv_window_selection_seed_robustness(
+    dataset: str,
+    windows: list[int | None],
+    seeds: list[int],
+    alpha: float = 0.1,
+    gamma: float = 0.05,
+    n_folds: int = 4,
+    min_initial_frac: float = 0.2,
+    min_fold_frac: float = 0.1,
+    fold_scheme: str = "expanding",
+    auto_folds: bool = False,
+    lookback: int | None = None,
+    period: int | None = None,
+) -> CVWindowSeedRobustnessResult:
+    """Does `run_cv_window_selection`'s pick stay the same across different model
+    training seeds?
+
+    Training-cost note, the opposite case from `run_window_gamma_sweep_comparison`'s
+    own docstring: there, `window`/`gamma` are read-time-only settings, so one fit
+    is reused across the whole grid for each seed. Here, the thing being varied
+    IS the seed that trains `run_cv_window_selection`'s own one base LSTM -- a
+    different seed is a genuinely different model fit, not a different way of
+    reading an existing one. So this reruns the full, already-tested
+    `run_cv_window_selection` once per seed (one independent LSTM training each),
+    exactly the training-cost tradeoff this repo's own process notes already
+    describe for a hyperparameter that changes the fitted model itself.
+
+    Every per-seed number here is `run_cv_window_selection`'s own already-tested
+    output, read back verbatim -- this function adds no new scoring logic of its
+    own, only the seed loop and the robustness verdict.
+    """
+    if not seeds:
+        raise ValueError("seeds must be a non-empty list")
+
+    per_seed = []
+    for seed in seeds:
+        result = run_cv_window_selection(
+            dataset,
+            windows=windows,
+            alpha=alpha,
+            gamma=gamma,
+            n_folds=n_folds,
+            min_initial_frac=min_initial_frac,
+            min_fold_frac=min_fold_frac,
+            fold_scheme=fold_scheme,
+            auto_folds=auto_folds,
+            lookback=lookback,
+            period=period,
+            seed=seed,
+        )
+        per_seed.append(
+            CVWindowSeedRobustnessCandidate(
+                seed=seed,
+                selected_window=result.selected_window,
+                selected_test_gap=result.selected_test_result["coverage_gap"],
+                best_test_window=result.best_test_window,
+            )
+        )
+
+    unique_selected_windows = _unique_in_order([c.selected_window for c in per_seed])
+
+    return CVWindowSeedRobustnessResult(
+        dataset=dataset,
+        alpha=alpha,
+        gamma=gamma,
+        fold_scheme=fold_scheme,
+        auto_folds=auto_folds,
+        windows=list(windows),
+        seeds=list(seeds),
+        per_seed=per_seed,
+        unique_selected_windows=unique_selected_windows,
+        is_window_robust=len(unique_selected_windows) == 1,
+    )
+
+
+def format_cv_window_selection_seed_robustness(result: CVWindowSeedRobustnessResult) -> str:
+    nominal_pct = int(round((1 - result.alpha) * 100))
+    folds_label = "auto folds" if result.auto_folds else "fixed folds"
+    lines = [
+        f"### {result.dataset}: is the CV window pick seed-robust? "
+        f"(LSTM (delta), nominal {nominal_pct}%, gamma={result.gamma}, fold_scheme={result.fold_scheme}, "
+        f"{folds_label}, {len(result.seeds)} seeds: {result.seeds})",
+        "",
+        "| Seed | Selected window (fold metric) | Real test gap for that pick | Best window in hindsight (this seed) |",
+        "|---|---|---|---|",
+    ]
+    for c in result.per_seed:
+        wlabel = "unbounded" if c.selected_window is None else str(c.selected_window)
+        blabel = "unbounded" if c.best_test_window is None else str(c.best_test_window)
+        marker = " *(matches hindsight-best)*" if c.selected_window == c.best_test_window else ""
+        lines.append(f"| {c.seed} | {wlabel}{marker} | {c.selected_test_gap * 100:+.1f}pp | {blabel} |")
+    lines.append("")
+    if result.is_window_robust:
+        picked = result.unique_selected_windows[0]
+        lines.append(
+            f"**Robust: all {len(result.seeds)} seeds selected the same window "
+            f"({'unbounded' if picked is None else picked})** -- the fold-selection metric's pick does not "
+            "depend on the base LSTM's random training seed here."
+        )
+    else:
+        labels = ", ".join("unbounded" if w is None else str(w) for w in result.unique_selected_windows)
+        lines.append(
+            f"**Not robust: {len(result.unique_selected_windows)} different windows were selected across "
+            f"{len(result.seeds)} seeds ({labels})** -- the fold-selection metric's pick depends on which "
+            "random initialization the base LSTM happened to get, not on the calibration data alone."
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # N-BEATS interpretable basis sweep (v0.25) -- the follow-up v0.24's own
 # README "What's next" named but did not attempt: "sweeping
 # trend_degree/num_harmonics rather than using the paper's own defaults

@@ -2873,6 +2873,8 @@ python -m forecasting.cli cv-window-select-seed-check --dataset airline --candid
   thing again: add a stable public wrapper, don't ask the downstream
   project to work around it.
 
+- A second related project, [easyconform](https://github.com/danielwork12121-lab/easyconform), applies the same split-conformal-calibration idea to general scikit-learn-style regressors (i.i.d. tabular data, not a time series) — a one-line `Conformalize(model).fit(...)` wrapper with its own real, measured coverage check on a public dataset. This repo exists for the harder, non-stationary case; `easyconform` is the simple tool for the common one.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

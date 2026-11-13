@@ -1,6 +1,6 @@
 # conformal-forecast
 
-Time-series forecasting with calibrated prediction intervals, built from scratch in PyTorch + NumPy, with empirical coverage checked rather than assumed.
+Time-series forecasting with calibrated prediction intervals, built on PyTorch + NumPy with the calibration layer written from scratch, and empirical coverage checked rather than assumed.
 
 | Airline passengers, nominal 90% intervals (30-point test window) | Empirical coverage |
 |---|---|
@@ -24,7 +24,7 @@ The textbook guarantee for split conformal assumes calibration and test residual
 
 ## Components
 
-- **Point models** (`forecasting/models.py`, shared `fit`/`predict` interface): `Naive`, `SeasonalNaive`, a from-scratch `LSTM`, `Transformer` encoder, generic `N-BEATS` (Oreshkin et al. 2020), and an "interpretable" N-BEATS with fixed trend (polynomial) and seasonality (Fourier) bases. Neural models share one training recipe (Adam, MSE, early stopping), so comparisons isolate architecture.
+- **Point models** (`forecasting/models.py`, shared `fit`/`predict` interface): `Naive`, `SeasonalNaive`, an `LSTM` and a `Transformer` encoder (both wrapping stock `torch.nn` modules), and generic plus "interpretable" `N-BEATS` (Oreshkin et al. 2020) whose blocks — including the fixed polynomial-trend and Fourier-seasonality bases — are implemented by hand. Neural models share one training recipe (Adam, MSE, early stopping), so comparisons isolate architecture.
 - **`DeltaWrapper`**: predicts the change from the last observation instead of the level, the neural analogue of differencing. A small LSTM cannot extrapolate a trend whose level it never saw in training.
 - **Split conformal** (`conformal.py`): finite-sample-corrected quantile (Lei et al. 2018, Vovk et al. 2005).
 - **Adaptive Conformal Inference** (`adaptive.py`, Gibbs & Candes 2021): fixed-pool and sliding/growing-pool variants, plus a variant that periodically retrains the model.
@@ -172,7 +172,7 @@ python -m forecasting.cli online-retraining --dataset airline
 - Coverage figures come from small test windows (airline: 30 points, 28 calibration windows). One miss is 3.3pp, and several differences reported above are within that noise.
 - Conformal guarantees assume exchangeability, which fails for the drifting-error cases shown here. The adaptive methods repair coverage empirically, usually by widening intervals.
 - Hyperparameters (`window`, retrain cadence, N-BEATS basis) are dataset-dependent and measured on three datasets, mostly at one seed. Single-seed selection results are noisy.
-- Neural models are small, from-scratch, and lightly tuned; the benchmark says nothing about what tuned or large models would do.
+- Neural models are small and lightly tuned; the benchmark says nothing about what tuned or large models would do. The LSTM and Transformer use stock `torch.nn` layers; only the N-BEATS blocks and the entire conformal/calibration layer are written from scratch.
 - Interval widths are reported in normalized units.
 
 ## Changelog
@@ -183,6 +183,21 @@ python -m forecasting.cli online-retraining --dataset airline
 - 0.25-0.30: N-BEATS basis and depth sweeps; CV selection of basis hyperparameters.
 - 0.31: seed-robustness check of CV window selection.
 - 0.32-0.34: online retraining, `/series/{id}/score`, retraining-cadence sweep.
+
+## How this was built
+
+This project was built with substantial AI assistance. Most commits carry a
+`Co-Authored-By: Claude` trailer and much of the history was produced by a
+scheduled coding agent, which is why the commit cadence looks machine-paced.
+That is accurate, not an artifact, and the trailers were left in deliberately
+rather than squashed out.
+
+What that does not change: the measurements in this README are real and
+reproducible from the code. `pytest` runs the suite, every number above comes
+from the scripts in `forecasting/`, and the negative results — the LSTM losing
+to a seasonal baseline, CV selection failing to beat the oracle, the coverage
+figures resting on a 30-point window — are reported as measured rather than
+quietly dropped.
 
 ## License
 
